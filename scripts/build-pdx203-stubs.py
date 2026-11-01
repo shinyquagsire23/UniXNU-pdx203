@@ -5,6 +5,7 @@
   BootWatchdogPolicy.c   sheng's launchd policy writer (disabled.plist on Data before launchd), called from
                          load_init_program by patches/xnu/zzzzzzzzza-launch-policy.patch (bsd flags: it uses the
                          syscall argument structures)
+  Pdx203FaultLog.c       the crash detail the fork's exit log appends for a signal exit (osfmk flags)
 
 the defconfig names the archive in CONFIG_XNU_EXTRA_LD_ARCHIVES, the base link script appends it as is.
 """
@@ -21,6 +22,8 @@ UNITS = [
     ('Pdx203Stubs.c', 'osfmk/DEVELOPMENT/startup.o.json', ['-Wall', '-Wextra', '-Werror']),
     # carried unchanged from sheng, so it is held to the kernel's own warning set rather than -Wextra
     ('BootWatchdogPolicy.c', 'bsd/DEVELOPMENT/kern_exec.o.json', ['-Werror=implicit-function-declaration']),
+    # the crash detail of the exit log (saved user state, shared-region slide): osfmk-private types
+    ('Pdx203FaultLog.c', 'osfmk/DEVELOPMENT/startup.o.json', ['-Wall', '-Werror']),
 ]
 
 
