@@ -173,6 +173,10 @@ chip_id = "207"
 # ios-sweet ran xnu on this phone) and leaves ~950 MiB of it to the firmware's own top-down allocations
 owned_memory_size = "0xc0000000"
 root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"   # the OS volume of the 21H461 ipad7,1 image, as on sheng
+# mount(8) phase 1 names /private/preboot/<hash> from /chosen/boot-manifest-hash, launchd's mount[3] exited with
+# status 66 without it (2026-11-01, uke saw the same). there is no apple personalization manifest here, so this is an
+# explicit bring-up boot-set identity in uke's form: SHA-384 of "Pdx203Bringup.BootSet.v1\0", not apple data
+boot_manifest_hash = "1d0d00ef77a4c50547b2d7fbfd56aeeb40c17eda7e79c8ca5154b8c334ec3699b0dfaae2fd1cae411831855ab1451d6b"
 cpu_regs = "0,0x100,0x200,0x300,0x400,0x500,0x600,0x700"   # mpidr aff1 numbering, verified by ios-sweet with cpus=8
 psci_method = "smc"
 packed_data_ramdisk = true
