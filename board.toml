@@ -150,8 +150,9 @@ kernel_args = [
   "-v",
   # amfi panics "No PMGR?" without the published original ApplePMGRNub (CONFIG_XNU_SHENG_PMGR)
   "sheng-pmgr=2",
-  # the uke video console patch of the unixnu fork, kprintf reaches the panel only on the text console
-  "-uketextconsole",
+  # -uketextconsole (the uke video console patch of the fork: kprintf on the panel through the text console) is off since
+  # the lock screen (2026-11-01): the log drew over the ui, and the qcom-usb-debug log below carries all of it. put it back
+  # for a boot that has to be read off the panel (a usb log that does not come up)
   "serial=3",
   "debug=0x14e",
   # development kernels keep kprintf quiet unless this is set, and with no uart the framebuffer console
