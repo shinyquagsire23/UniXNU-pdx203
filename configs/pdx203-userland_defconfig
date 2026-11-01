@@ -8,8 +8,14 @@
 # the cache mount build without OWNER_ROOT_TRUST, drivers/NativeUfs supplies the two authorization helpers
 # kern_exec.c calls (only under native-ufs-allow-unverified=1) and the unixnu fork carries uke's root auth
 # bypass patch. OWNER_CACHE_MOUNT mounts the SystemOS volume (8846FE78-2910-4297-AF97-D59BB6F8FC16) read-only,
-# UNION_SYSTEMOS puts it over / as a native union, CACHE_STARTUP sets dyld's no-ignition flag. the Data
-# volume (OWNER_DATA_MOUNT, NATIVE_RAM_BLOCK and a seed) is the next step.
+# UNION_SYSTEMOS puts it over / as a native union, CACHE_STARTUP sets dyld's no-ignition flag.
+#
+# Data: with the cache union launchd ran its boot tasks and panicked "mount[3] exited ... exit status 66" (no Data
+# volume for /private/var). OWNER_DATA_MOUNT mounts the payload's Data seed writable at /private/var through the
+# NativeRamBlock IOMedia (alioth measured that APFS refuses the bare /dev/md0). the seed is the original
+# private/var of the OS image (scripts/prepare-owner-data-fixture.py, 39 files, packed with DarwinBoot's
+# packed_ramdisk.py), passed with --data-ramdisk, and OWNER_DATA_VOLUME_UUID is that seed's volume uuid. it lives in
+# ram, nothing is written back to the phone.
 CONFIG_XNU_BUILD_ARCHIVES=y
 CONFIG_XNU_BRINGUP_OWNER_CACHE=y
 CONFIG_XNU_SOURCE_CORECRYPTO14=y
@@ -31,14 +37,15 @@ CONFIG_XNU_EXTRA_LD_ARCHIVES="{tree}/build/pdx203-stubs/libPdx203Stubs.a"
 
 # CONFIG_XNU_NATIVE_LEGACY_DISPLAY is not set
 # CONFIG_XNU_NATIVE_VIRTIO_BLOCK is not set
-# CONFIG_XNU_NATIVE_RAM_BLOCK is not set
+CONFIG_XNU_NATIVE_RAM_BLOCK=y
 # CONFIG_XNU_VERIFIED_ROOT_PROBE is not set
 # CONFIG_XNU_OWNER_ROOT_AUDIT is not set
 # CONFIG_XNU_OWNER_ROOT_TRUST is not set
 CONFIG_XNU_OWNER_CACHE_MOUNT=y
 CONFIG_XNU_OWNER_CACHE_STARTUP=y
 # CONFIG_XNU_OWNER_BOOT_MANIFEST is not set
-# CONFIG_XNU_OWNER_DATA_MOUNT is not set
+CONFIG_XNU_OWNER_DATA_MOUNT=y
+CONFIG_XNU_OWNER_DATA_VOLUME_UUID="098C9EBC-6911-4BEA-94C8-1775B4B33D87"
 CONFIG_XNU_OWNER_UNION_SYSTEMOS=y
 # CONFIG_XNU_BOOT_PROGRESS is not set
 # CONFIG_XNU_NATIVE_ADRENO is not set

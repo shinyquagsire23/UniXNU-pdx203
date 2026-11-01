@@ -37,8 +37,12 @@ def main():
     if on('NATIVE_VIRTIO_BLOCK'):
         steps += [['build-arm-driver.py', 'NativeVirtioBlock'], ['build-native-virtio-bindings.py', '--component', 'NativeVirtioBlock']]
     if on('NATIVE_RAM_BLOCK'):
+        # the Data seed's IOMedia. bound like NativeUfs, to the original IOBlockStorageDevice of the prelinked candidate
+        # (uke's binder): build-native-virtio-bindings.py needs build/storage-abi/interface-audit.json, which only a
+        # live guest snapshot produces
         steps += [['build-arm-driver.py', 'NativeRamBlock'],
-                  ['build-native-virtio-bindings.py', '--component', 'NativeRamBlock', '--directory', 'build/native-ram-block']]
+                  ['build-ufs-original-bindings.py', '--component', 'NativeRamBlock',
+                   '--candidate', 'build/native-prelink/native-defaults-candidate.macho']]
     if on('SOURCE_MOCKFS'):
         steps.append(['build-mockfs-fixture.py'])
     if on('SHENG_PMGR'):
