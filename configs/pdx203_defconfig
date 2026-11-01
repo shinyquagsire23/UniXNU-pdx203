@@ -19,7 +19,10 @@ CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
 # kernel without the sheng display archive needs the weak stub (package/Pdx203Stubs.c, built by the dispatcher)
 CONFIG_XNU_EXTRA_LD_ARCHIVES="{tree}/build/pdx203-stubs/libPdx203Stubs.a"
 
-# CONFIG_XNU_SOURCE_PTHREAD is not set
+# bsd_init calls pthread_init() before the root mount and panics "pthread kernel extension not loaded
+# (function table is NULL)" without a registered pthread component (seen on the phone), so the first console
+# needs it too. it builds from the pinned libpthread alone, no prelinked candidate
+CONFIG_XNU_SOURCE_PTHREAD=y
 # CONFIG_XNU_SOURCE_MOCKFS is not set
 # CONFIG_XNU_NATIVE_UFS is not set
 # CONFIG_XNU_NATIVE_AES is not set
