@@ -235,7 +235,9 @@ kernel_args = [
   "sheng-data-persist=2",
   # the adreno 650, alioth's board probe (package/GpuProbe.cpp) raised one mode at a time (1 to 12, as alioth did). 1 only reads: the
   # gcc/gpucc/smmu windows. its rows print as GPUROW <n> on the usb log
-  "pipa-gpu=7",
+  "pipa-gpu=8",
+  "pipa-gpu-perf=5",
+  "pipa-ddr-vote=0",
 ]
 # Fixups of signed text, applied by the kernel after signature validation and only where the original bytes match
 # (patches/xnu/native-text-fixup.patch). They reach it as /chosen/text-fixups, not on the command line. Each is
