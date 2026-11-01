@@ -169,6 +169,13 @@ kernel_args = [
   # all eight cores through psci (cpu_regs below), as ios-sweet ran this phone. verified 2026-11-01: boots and settles
   # into the same userland once NativeRamBlock waits for the Data volume media (the race smp exposed)
   "sheng-smp=1",
+  # IPIs: ArmCpu records that ICC_SGI1R_EL1 generates nothing on this SoC, so an SGI never reaches another core.
+  # armcpu-spi-ipi=1 sends IPIs as software-pended SPIs (1008 + core) routed to that core, and armcpu-self-ipi=1 has every
+  # core take one at start (XNU enables a core's IPI only after it took one); alioth's pair for the same SoC. without them a
+  # stackshot's cross-call never held the other cores and the kernel panicked in stackshot_thread_turnstileinfo
+  # (2026-11-01, persistent Data boot)
+  "armcpu-spi-ipi=1",
+  "armcpu-self-ipi=1",
   # the GOP display of pdx203-userland_defconfig (scripts/build-pdx203-legacy-display.py), sheng's set of 2026-10-22 without
   # its hid, key event and gpu keys: bsd_init registers the board probe, which starts NativeLegacyDisplay on the
   # darwinboot framebuffer once IOSurface is up (phase 4, as a /arm-io display-subsystem child) with cpu presentation,
