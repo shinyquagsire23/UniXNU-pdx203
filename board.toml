@@ -165,6 +165,9 @@ kernel_args = [
   # volume has no role). kern_exit.c's panic_on_crash_disabled tunable stops proc_should_trigger_panic() before that
   # branch. the bring-up answer: it suppresses every job's crash panic, launchd included
   "panic_on_crash_disabled=1",
+  # all eight cores through psci (cpu_regs below), as ios-sweet ran this phone. verified 2026-11-01: boots and settles
+  # into the same userland once NativeRamBlock waits for the Data volume media (the race smp exposed)
+  "sheng-smp=1",
   "ml-timeout-lock-panic-scale=40",
 ]
 
