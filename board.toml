@@ -168,6 +168,21 @@ kernel_args = [
   # all eight cores through psci (cpu_regs below), as ios-sweet ran this phone. verified 2026-11-01: boots and settles
   # into the same userland once NativeRamBlock waits for the Data volume media (the race smp exposed)
   "sheng-smp=1",
+  # the GOP display of pdx203-userland_defconfig (scripts/build-pdx203-legacy-display.py), sheng's set of 2026-10-22 without
+  # its hid, key event and gpu keys: bsd_init registers the board probe, which starts NativeLegacyDisplay on the
+  # darwinboot framebuffer once IOSurface is up (phase 4, as a /arm-io display-subsystem child) with cpu presentation,
+  # and the mobile graphics family is loaded for its clients. a kernel without the display archive only reaches the stub
+  "offline-legacy-register=1",
+  "offline-legacy-gop=1",
+  "offline-legacy-unit-scale=2",
+  "offline-legacy-pm=1",
+  "offline-legacy-validate=1",
+  "offline-legacy-transfer=1",
+  "offline-legacy-cpu-present=1",
+  "offline-legacy-phase=4",
+  "offline-mobile-graphics-client=1",
+  "offline-mobile-graphics-load=1",
+  "sheng-vsync=60",
   "ml-timeout-lock-panic-scale=40",
 ]
 

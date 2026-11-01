@@ -24,9 +24,9 @@ def main():
         ['build-arm-driver.py', 'ArmDTPlatform'],
         ['build-arm-driver.py', 'ArmCpu'],
     ]
-    if not on('NATIVE_LEGACY_DISPLAY'):
-        # the base bsd_init references native_legacy_display_probe() whatever the display flag says
-        steps.append(['build-pdx203-stubs.py'])
+    # the weak fallbacks: the base bsd_init references native_legacy_display_probe() whatever the display flag says, and the
+    # display probe imports the boot progress layer weakly. the defconfigs link the archive through CONFIG_XNU_EXTRA_LD_ARCHIVES
+    steps.append(['build-pdx203-stubs.py'])
     if on('NATIVE_AES'):
         steps += [['build-arm-driver.py', 'NativeAES'], ['build-native-aes-bindings.py']]
     if on('NATIVE_UFS'):
@@ -47,6 +47,10 @@ def main():
         steps.append(['build-mockfs-fixture.py'])
     if on('SHENG_PMGR'):
         steps.append(['build-pdx203-platform-power.py'])
+    if on('NATIVE_LEGACY_DISPLAY'):
+        # the GOP display (NativeLegacyDisplay bound to the original IOMobileFramebufferLegacy, the board probe and
+        # NativeGOPPresenter), linked by the base build as build/native-legacy-display/libNativeLegacyDisplay.late.a
+        steps.append(['build-pdx203-legacy-display.py'])
     if on('SOURCE_PTHREAD'):
         steps.append(['build-libpthread-kernel.py'])
     for index, step in enumerate(steps, 1):

@@ -16,6 +16,11 @@
 # private/var of the OS image (scripts/prepare-owner-data-fixture.py, 39 files, packed with DarwinBoot's
 # packed_ramdisk.py), passed with --data-ramdisk, and OWNER_DATA_VOLUME_UUID is that seed's volume uuid. it lives in
 # ram, nothing is written back to the phone.
+#
+# display: with Data, SpringBoard launched and crashed in a loop, there was no framebuffer service.
+# NATIVE_LEGACY_DISPLAY links the GOP display (scripts/build-pdx203-legacy-display.py): NativeLegacyDisplay, the owned
+# backend of the unchanged IOMobileFramebufferLegacy, on the framebuffer darwinboot hands over, started by the board probe
+# once IOSurface is up (offline-legacy-* in board.toml, sheng's set of 2026-10-22).
 CONFIG_XNU_BUILD_ARCHIVES=y
 CONFIG_XNU_BRINGUP_OWNER_CACHE=y
 CONFIG_XNU_SOURCE_CORECRYPTO14=y
@@ -35,7 +40,7 @@ CONFIG_XNU_NATIVE_PAN=y
 CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
 CONFIG_XNU_EXTRA_LD_ARCHIVES="{tree}/build/pdx203-stubs/libPdx203Stubs.a"
 
-# CONFIG_XNU_NATIVE_LEGACY_DISPLAY is not set
+CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y
 # CONFIG_XNU_NATIVE_VIRTIO_BLOCK is not set
 CONFIG_XNU_NATIVE_RAM_BLOCK=y
 # CONFIG_XNU_VERIFIED_ROOT_PROBE is not set
