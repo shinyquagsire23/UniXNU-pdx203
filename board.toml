@@ -213,6 +213,10 @@ kernel_args = [
   # answers "no passcode, nothing locked". alioth: add sheng-aks-sls=3 only if the prompt survives
   "offline-key-events=1",
   "sheng-aks=1",
+  # RAM asked for as Device memory is mapped Normal non-cacheable (the fork's zzzzzzzzzc-pmap-ram-wc.patch): backboardd's
+  # software renderer clears display surfaces with bzero, whose DC ZVA alignment-faults on Device memory (SIGBUS in
+  # CA::OGL::SWContext::set_surface after Get Started, 2026-11-01). real MMIO is not affected
+  "pmap-ram-wc=1",
 ]
 # Fixups of signed text, applied by the kernel after signature validation and only where the original bytes match
 # (patches/xnu/native-text-fixup.patch). They reach it as /chosen/text-fixups, not on the command line. Each is
