@@ -235,7 +235,7 @@ kernel_args = [
   "sheng-data-persist=2",
   # the adreno 650, alioth's board probe (package/GpuProbe.cpp) raised one mode at a time (1 to 12, as alioth did). 1 only reads: the
   # gcc/gpucc/smmu windows. its rows print as GPUROW <n> on the usb log
-  "pipa-gpu=9",
+  "pipa-gpu=10",
   "pipa-gpu-perf=5",
   "pipa-ddr-vote=0",
   "pipa-gpu-pool=256",
