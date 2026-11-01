@@ -160,6 +160,11 @@ kernel_args = [
   "kt_fixed_zones=120",
   "armcpu-diagnostics=1",
   "-no_slto_panic",
+  # watchdogd hits a BRK (exit namespace 2 subcode 0x5) and its plist sets _PanicOnCrash, so one crash panicked the
+  # kernel (2026-11-01, as on UniXNU-alioth: watchdogd wants a Data volume in the root volume group and the seed's
+  # volume has no role). kern_exit.c's panic_on_crash_disabled tunable stops proc_should_trigger_panic() before that
+  # branch. the bring-up answer: it suppresses every job's crash panic, launchd included
+  "panic_on_crash_disabled=1",
   "ml-timeout-lock-panic-scale=40",
 ]
 
