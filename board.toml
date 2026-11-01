@@ -231,6 +231,12 @@ text_fixups = [
   # BTAudioHALPlugin's factory returns NULL, so audiomxd skips it instead of reconnecting to the missing Bluetooth audio
   # service thousands of times a second.
   "BTAudioHALPlugin,38bec,ffc300d1f44f01a9,000080d2c0035fd6",
+  # CoreImage _CIGLIsUsable (0x1975c8df8, .07 + 0x2d00df8) answers false. With no Metal device, -[CIContext initWithOptions:]
+  # falls back to an OpenGL ES context because EAGL reports itself usable, and CI::GLContext::init then calls through
+  # GetMacroContext's dispatch table, which is all zero without a GPU driver: SpringBoard died at pc 0 (glDisable) styling an
+  # SF symbol image through +[CUIShapeEffectStack sharedCIContext] after Setup, 15 times (2026-11-01, logs/usb-11/usb-12).
+  # Answering false sends initWithOptions: down its own "no renderer" path, which returns nil instead.
+  "dyld_shared_cache_arm64.07,2d00df8,fd7bbfa9fd030091,00008052c0035fd6",
 ]
 
 [payload.adt]
