@@ -162,7 +162,10 @@ kernel_args = [
 [payload.adt]
 tool = "scripts/make-pdx203-adt.py"
 chip_id = "207"
-owned_memory_size = "0x40000000"   # 1 GiB window request, lower it to 0x10000000 if darwinboot finds no run that large
+# 512 MiB window request. 1 GiB found no run on the phone ("NO WINDOW 40000000 BIG RUN 2DE00000 @ C0000000"):
+# Pdx203BootMemoryDxe adds at most 1 GiB of dram in total (ADD_LIMIT), all below 4 GiB and split around the reserved
+# regions, so its biggest piece is 0xc0000000+0x2de00000. a larger window needs that limit raised in the firmware first
+owned_memory_size = "0x20000000"
 root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"   # the OS volume of the 21H461 ipad7,1 image, as on sheng
 cpu_regs = "0,0x100,0x200,0x300,0x400,0x500,0x600,0x700"   # mpidr aff1 numbering, verified by ios-sweet with cpus=8
 psci_method = "smc"
