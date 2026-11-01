@@ -491,8 +491,11 @@ extern "C" bool pdx203_touch_start(void);
 extern "C" void native_keystore_probe(void);
 // the cpu clocks (package/CpuFreqProbe.cpp, alioth's epss voter; sheng-cpufreq=<mode>): first, so the rest of the boot runs faster
 extern "C" void pdx203_cpufreq_start(void);
+// the adreno 650 (package/GpuProbe.cpp, alioth's; pipa-gpu=<mode>, nothing without it): before the display part, as alioth
+extern "C" void pdx203_gpu_start(void);
 void native_legacy_display_late_probe(void) {
     pdx203_cpufreq_start();
+    pdx203_gpu_start();
     native_keystore_probe();
     (void)native_hid_input_probe();
     unsigned touch=0;

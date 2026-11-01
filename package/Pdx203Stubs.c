@@ -81,3 +81,18 @@ native_buttons_set_sink(void (*sink)(void *, uint32_t), void *context)
 {
 	(void)sink; (void)context;
 }
+
+/* drivers/NativeAdreno's publisher hands the render server's pipeline caches to the board's boot log export (alioth's BootLog.c,
+ * part of the boot-progress layer this board runs without). Nothing stores them here. */
+__attribute__((weak)) int
+boot_log_export_put(uint32_t generation, uint32_t total, uint32_t offset, const void *data, uint32_t size)
+{
+	(void)generation; (void)total; (void)offset; (void)data; (void)size;
+	return 0;
+}
+
+/* the late probe starts the adreno probe (package/GpuProbe.cpp, linked with CONFIG_XNU_NATIVE_ADRENO); without it, nothing */
+__attribute__((weak)) void
+pdx203_gpu_start(void)
+{
+}

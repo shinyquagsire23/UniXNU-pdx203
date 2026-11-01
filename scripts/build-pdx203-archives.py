@@ -51,6 +51,10 @@ def main():
         # the GOP display (NativeLegacyDisplay bound to the original IOMobileFramebufferLegacy, the board probe and
         # NativeGOPPresenter), linked by the base build as build/native-legacy-display/libNativeLegacyDisplay.late.a
         steps.append(['build-pdx203-legacy-display.py'])
+    if on('NATIVE_ADRENO'):
+        # the Adreno 650 (drivers/NativeAdreno = FFT-infra/Adreno650, the kits, the board probe and its firmware), force-loaded
+        # by the base build as build/native-adreno/libNativeAdreno.a
+        steps.append(['build-pdx203-adreno.py'])
     if on('QCOM_USB_DEBUG'):
         # the CDC-ACM kernel log over the DWC3 (drivers/QcomXnuUsbDebug, sm8250 profile), linked through
         # CONFIG_XNU_EXTRA_LD_ARCHIVES as build/qcom-usb-debug/libQcomXnuUsbDebug.a
