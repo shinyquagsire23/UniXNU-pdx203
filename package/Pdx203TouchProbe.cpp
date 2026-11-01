@@ -24,6 +24,7 @@
 #include <pexpert/pexpert.h>
 #include <libkern/c++/OSSharedPtr.h>
 #include <sys/errno.h>
+#include <libkern/libkern.h>
 
 // The seqlock NativeHidInput reads (it increments native_touch_hid_reports itself). Coordinates are in the HID layer's fixed
 // space, X 0..30479 across the panel's width and Y 0..20319 along its height, as alioth's probe publishes them.
@@ -144,14 +145,14 @@ bool clocks(void)
 		// DFS on: level 0 must already be the XO with divider 1, the table is not changed
 		uint32_t level0 = rd(gGcc, kSeRcg + 0x1c);
 		if ((level0 & 0x371f) != 1) {
-			IOLog("PDX203 TOUCH: se5 clock source in dfs mode, level 0 0x%x is not the xo\n", level0);
+			printf("PDX203 TOUCH: se5 clock source in dfs mode, level 0 0x%x is not the xo\n", level0);
 			return false;
 		}
 	} else {
 		wr(gGcc, kSeRcg + 4, (cfg & ~(0x371fu | (1u << 20))) | 1);
 		wr(gGcc, kSeRcg, rd(gGcc, kSeRcg) | 1);
 		if (!waitBits(gGcc, kSeRcg, 1, 0, 5000)) {
-			IOLog("PDX203 TOUCH: se5 clock source update did not complete\n");
+			printf("PDX203 TOUCH: se5 clock source update did not complete\n");
 			return false;
 		}
 	}
@@ -162,7 +163,7 @@ bool clocks(void)
 			halted |= 1u << i;
 		}
 	}
-	IOLog("PDX203 TOUCH: clocks voted, rcg cfg 0x%x dfs %u, halted branches 0x%x\n", rd(gGcc, kSeRcg + 4), dfs & 1, halted);
+	printf("PDX203 TOUCH: clocks voted, rcg cfg 0x%x dfs %u, halted branches 0x%x\n", rd(gGcc, kSeRcg + 4), dfs & 1, halted);
 	return true;
 }
 
@@ -171,11 +172,11 @@ bool seSetup(void)
 	uint32_t fw = rd(gSe, SE_FW_REVISION), tx = rd(gSe, SE_HW_PARAM_0), rx = rd(gSe, SE_HW_PARAM_1);
 	if (((fw >> 8) & 0xff) != 3 || (rd(gSe, SE_IF_DISABLE) & 1) || ((tx >> 24) & 0x3f) != 32 || ((rx >> 24) & 0x3f) != 32 ||
 	    ((tx >> 16) & 0x3f) < 2 || ((rx >> 16) & 0x3f) < 2) {
-		IOLog("PDX203 TOUCH: se13 is not an i2c engine with fifos (fw 0x%x tx 0x%x rx 0x%x)\n", fw, tx, rx);
+		printf("PDX203 TOUCH: se13 is not an i2c engine with fifos (fw 0x%x tx 0x%x rx 0x%x)\n", fw, tx, rx);
 		return false;
 	}
 	if (rd(gSe, SE_STATUS) & 0x1001) {
-		IOLog("PDX203 TOUCH: se13 busy at setup (status 0x%x)\n", rd(gSe, SE_STATUS));
+		printf("PDX203 TOUCH: se13 busy at setup (status 0x%x)\n", rd(gSe, SE_STATUS));
 		return false;
 	}
 	gRxDepth = (rx >> 16) & 0x3f;
@@ -202,14 +203,14 @@ bool seSetup(void)
 	wr(gSe, SE_RX_RFR_WATERMARK, gRxDepth - 1);
 	wr(gSe, SE_M_IRQ_EN, 0x7f00363f);                       // latches status only; nothing routes it to the gic
 	if (rd(gSe, SE_TX_PACK0) != 0x0007f8fe || rd(gSe, SE_RX_PACK1) != 0x000ffefe || rd(gSe, SE_BYTE_GRAN) != 0) {
-		IOLog("PDX203 TOUCH: se13 packing did not read back\n");
+		printf("PDX203 TOUCH: se13 packing did not read back\n");
 		return false;
 	}
 	if ((rd(gSe, SE_TX_FIFO_STATUS) & 0x0fffffff) || (rd(gSe, SE_RX_FIFO_STATUS) & 0x01ffffff)) {
-		IOLog("PDX203 TOUCH: se13 has inherited fifo data\n");
+		printf("PDX203 TOUCH: se13 has inherited fifo data\n");
 		return false;
 	}
-	IOLog("PDX203 TOUCH: se13 i2c fw 0x%x, fifo depth tx %u rx %u\n", fw, (tx >> 16) & 0x3f, gRxDepth);
+	printf("PDX203 TOUCH: se13 i2c fw 0x%x, fifo depth tx %u rx %u\n", fw, (tx >> 16) & 0x3f, gRxDepth);
 	return true;
 }
 
@@ -223,7 +224,7 @@ void abortCommand(void)
 	wr(gSe, SE_M_IRQ_CLEAR, 0xffffffff);
 	if (!ok || (rd(gSe, SE_TX_FIFO_STATUS) & 0x0fffffff)) {
 		gDead = true;
-		IOLog("PDX203 TOUCH: se13 abort failed, engine left alone\n");
+		printf("PDX203 TOUCH: se13 abort failed, engine left alone\n");
 	}
 }
 
@@ -235,7 +236,7 @@ int message(uint32_t op, const uint8_t *txb, unsigned nt, uint8_t *rxb, unsigned
 	}
 	if (!waitBits(gSe, SE_STATUS, 1, 0, 5000)) {
 		gDead = true;
-		IOLog("PDX203 TOUCH: se13 stayed busy, engine left alone\n");
+		printf("PDX203 TOUCH: se13 stayed busy, engine left alone\n");
 		return EBUSY;
 	}
 	wr(gSe, SE_M_IRQ_CLEAR, 0xffffffff);
@@ -395,7 +396,7 @@ bool handleEvent(const uint8_t *e)
 		if (stype == 2 && e[1] == 0x00 && e[2] == 0x20) {
 			// the IC rebooted (its own watchdog): everything lifted, sense on again
 			statAdd(7);
-			IOLog("PDX203 TOUCH: sec_ts rebooted, sense on again\n");
+			printf("PDX203 TOUCH: sec_ts rebooted, sense on again\n");
 			releaseAll();
 			(void)senseOn();
 		} else if (stype == 1 && e[1] == 0x01) {
@@ -430,7 +431,7 @@ bool start(void)
 		booted = (e[0] & 3) == 1 && (stype == 2 || stype == 7) && e[1] == 0x00;
 	}
 	if (!booted) {
-		IOLog("PDX203 TOUCH: no boot-complete event from the sec_ts, continuing\n");
+		printf("PDX203 TOUCH: no boot-complete event from the sec_ts, continuing\n");
 	}
 	uint8_t boot = 0, id[5] = {};
 	int error = tsRead(TS_READ_BOOT_STATUS, &boot, 1);
@@ -438,17 +439,17 @@ bool start(void)
 		error = tsRead(TS_READ_DEVICE_ID, id, sizeof(id));
 	}
 	pdx203_touch_stats[1] = boot;
-	IOLog("PDX203 TOUCH: sec_ts boot status 0x%02x id %02x %02x %02x %02x %02x (error %d)\n", boot, id[0], id[1], id[2], id[3], id[4],
+	printf("PDX203 TOUCH: sec_ts boot status 0x%02x id %02x %02x %02x %02x %02x (error %d)\n", boot, id[0], id[1], id[2], id[3], id[4],
 	    error);
 	if (error || boot != TS_STATUS_APP_MODE) {
 		return false;
 	}
 	const uint8_t func[3] = {TS_SET_TOUCHFUNC, TS_FUNC_DEFAULT, 0x00};
 	if ((error = tsWrite(func, 3))) {
-		IOLog("PDX203 TOUCH: set touch function failed (%d), continuing\n", error);
+		printf("PDX203 TOUCH: set touch function failed (%d), continuing\n", error);
 	}
 	if ((error = senseOn())) {
-		IOLog("PDX203 TOUCH: sense on failed (%d)\n", error);
+		printf("PDX203 TOUCH: sense on failed (%d)\n", error);
 		return false;
 	}
 	return true;
@@ -479,7 +480,7 @@ void touchThread(void *, wait_result_t)
 		return;
 	}
 	pdx203_touch_stats[0] = 5;
-	IOLog("PDX203 TOUCH: running, %ux%u\n", kMaxX, kMaxY);
+	printf("PDX203 TOUCH: running, %ux%u\n", kMaxX, kMaxY);
 	unsigned failures = 0;
 	while (!gDead) {
 		statAdd(9);
@@ -501,7 +502,7 @@ void touchThread(void *, wait_result_t)
 		}
 		if (failed) {
 			if ((statAdd(5) % 100) == 0) {
-				IOLog("PDX203 TOUCH: event read failed (%d so far)\n", pdx203_touch_stats[5] + 1);
+				printf("PDX203 TOUCH: event read failed (%d so far)\n", pdx203_touch_stats[5] + 1);
 			}
 			if (++failures == 10) {
 				releaseAll();
@@ -516,7 +517,7 @@ void touchThread(void *, wait_result_t)
 	}
 	releaseAll();
 	pdx203_touch_stats[0] = -5;
-	IOLog("PDX203 TOUCH: stopped, the engine is left alone\n");
+	printf("PDX203 TOUCH: stopped, the engine is left alone\n");
 }
 
 } // namespace
@@ -532,7 +533,7 @@ extern "C" bool pdx203_touch_start(void)
 	pdx203_touch_stats[0] = 1;
 	if (!mapRegion(kGccBase, kGccSize, gGcc) || !mapRegion(kTlmmBase, kTlmmSize, gTlmm) || !mapRegion(kSeBase, kSeSize, gSe)) {
 		pdx203_touch_stats[0] = -1;
-		IOLog("PDX203 TOUCH: mapping the gcc, tlmm or se13 window failed\n");
+		printf("PDX203 TOUCH: mapping the gcc, tlmm or se13 window failed\n");
 		return false;
 	}
 	thread_t thread;

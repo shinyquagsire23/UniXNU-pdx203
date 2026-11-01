@@ -486,7 +486,11 @@ void native_legacy_display_late_probe(void);
 // display is pending, as alioth orders them.
 extern "C" int native_hid_input_probe(void);
 extern "C" bool pdx203_touch_start(void);
+// the AppleKeyStore stand-in (package/KeyStoreProbe.cpp, drivers/NativeKeyStoreEvents; offline-key-events=1, sheng-aks=1):
+// with no SEP, it answers backboardd and SpringBoard's state queries as "no passcode, nothing locked"
+extern "C" void native_keystore_probe(void);
 void native_legacy_display_late_probe(void) {
+    native_keystore_probe();
     (void)native_hid_input_probe();
     unsigned touch=0;
     if(PE_parse_boot_argn("pdx203-touch",&touch,sizeof(touch)) && touch==1)(void)pdx203_touch_start();

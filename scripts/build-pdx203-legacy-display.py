@@ -6,7 +6,8 @@ drivers/NativeMobileDisplay), cut to the display: the generated ABI of the origi
 NativeLegacyDisplay bound to it, the board probe (package/LegacyDisplayProbe.cpp, the late probe without sheng's board
 probes) and NativeGOPPresenter. The input side is this board's: the HID start-up (package/HidInputProbe.cpp, alioth's),
 the sec_ts touch probe (package/Pdx203TouchProbe.cpp) and NativeHidInput with its original bindings
-(scripts/build-native-hid-input.py). sheng's keystore, boot log/reset/trace, cpufreq, gpu power, wifi, buttons and
+(scripts/build-native-hid-input.py), and the AppleKeyStore stand-in (package/KeyStoreProbe.cpp,
+drivers/NativeKeyStoreEvents). sheng's boot log/reset/trace, cpufreq, gpu power, wifi, buttons and
 backlight objects are not built. build-xnu-4k-baseline.sh links the archive with CONFIG_XNU_NATIVE_LEGACY_DISPLAY and
 checks it against build-report.json.
 """
@@ -228,10 +229,20 @@ hid_src,hid_probe=board_cpp('HidInputProbe.cpp')
 touch_src,touch_probe=board_cpp('Pdx203TouchProbe.cpp')
 print(run(['python3',ROOT/'scripts/build-native-hid-input.py'],text=True),end='')
 hid=ROOT/'build/native-hid-input'
+# the AppleKeyStore stand-in, as sheng builds it: an owned IOService (no original ABI to bind) whose static initialiser is
+# globalised so KeyStoreProbe.cpp can register the class itself
+keystore_src,keystore_probe=board_cpp('KeyStoreProbe.cpp')
+print(run(['python3',ROOT/'scripts/build-arm-driver.py','NativeKeyStoreEvents'],text=True),end='')
+keyevents=ROOT/'build/native-keystore-events';keyevents_late=keyevents/'NativeKeyStoreEvents.late.o'
+run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_NativeKeyStoreEvents.cpp',
+     keyevents/'NativeKeyStoreEvents.o',keyevents_late])
+require(code((keyevents/'NativeKeyStoreEvents.o').read_bytes(),macho((keyevents/'NativeKeyStoreEvents.o').read_bytes()))==
+        code(keyevents_late.read_bytes(),macho(keyevents_late.read_bytes())),'Owned keystore instructions unchanged by late init staging')
 archive=OUT/'libNativeLegacyDisplay.late.a';archive.unlink(missing_ok=True)
-run(['xcrun','ar','rcs',archive,late,OUT/'original-bindings.o',probe,hid_probe,touch_probe,hid/'NativeHidInput.late.o',hid/'hid-original-bindings.o'])
+run(['xcrun','ar','rcs',archive,late,OUT/'original-bindings.o',probe,hid_probe,touch_probe,hid/'NativeHidInput.late.o',hid/'hid-original-bindings.o',
+     keystore_probe,keyevents_late])
 sources=[ROOT/'drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp',ROOT/'drivers/NativeMobileDisplay/NativeLegacyRequest.h',source,
-         hid_src,touch_src,ROOT/'drivers/NativeHidInput/NativeHidInput.cpp']
+         hid_src,touch_src,ROOT/'drivers/NativeHidInput/NativeHidInput.cpp',keystore_src,ROOT/'drivers/NativeKeyStoreEvents/NativeKeyStoreEvents.cpp']
 print(run(['python3',ROOT/'scripts/build-arm-driver.py','NativeGOPPresenter'],text=True),end='')
 gop=ROOT/'build/native-gop-presenter';gop_late=gop/'NativeGOPPresenter.late.o'
 run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_NativeGOPPresenter.cpp',
@@ -247,4 +258,4 @@ sources.extend([ROOT/'drivers/NativeMobileDisplay/NativeGOPPresenter.cpp',ROOT/'
     bindings={n:hex(v) for n,v in bindings.items()},virtual_entries=358,owned_entries=owned,inherited_native_entries=native,
     guarded_backend_leaves=[i for i in pure if i not in (213,337)],original_instructions_modified=False,driver_initialized=False,display_presented=False,desktop=False),indent=2)+'\n')
 print('pdx203: built the GOP legacy display archive (NativeLegacyDisplay, its original bindings, the board probe, NativeGOPPresenter,'
-      ' the HID start-up, the sec_ts touch probe, NativeHidInput)')
+      ' the HID start-up, the sec_ts touch probe, NativeHidInput, the AppleKeyStore stand-in)')
