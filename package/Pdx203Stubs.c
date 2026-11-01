@@ -66,3 +66,18 @@ boot_reset_bootloader(char *text, unsigned size)
 	}
 	return 1;
 }
+
+/* drivers/NativeHidInput imports these. it records what each report returned (no diagnostic page here to show it), and it
+ * registers a sink for the hardware buttons, which have no kernel driver on this board yet; a static link refuses an undefined
+ * weak_import, so both are weak definitions. */
+__attribute__((weak)) void
+native_hid_input_observed(unsigned what, int result)
+{
+	(void)what; (void)result;
+}
+
+__attribute__((weak)) void
+native_buttons_set_sink(void (*sink)(void *, uint32_t), void *context)
+{
+	(void)sink; (void)context;
+}

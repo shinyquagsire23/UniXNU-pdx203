@@ -481,8 +481,15 @@ void native_legacy_display_probe(void) {
 }
 void native_legacy_display_late_probe(void);
 // pdx203: sheng's late probe also starts its board probes here (keystore, cpufreq, gpu power, touch, wifi, buttons,
-// backlight, hid input). none of them exists for this phone yet, so only the display part remains.
+// backlight, hid input). this board has the hid input device (package/HidInputProbe.cpp, offline-hid-input=1) and the sec_ts
+// touch probe (package/Pdx203TouchProbe.cpp, pdx203-touch=1); both start before the display part, which returns early when no
+// display is pending, as alioth orders them.
+extern "C" int native_hid_input_probe(void);
+extern "C" bool pdx203_touch_start(void);
 void native_legacy_display_late_probe(void) {
+    (void)native_hid_input_probe();
+    unsigned touch=0;
+    if(PE_parse_boot_argn("pdx203-touch",&touch,sizeof(touch)) && touch==1)(void)pdx203_touch_start();
     IOService *display=pendingLegacyDisplay;if(!display)return;pendingLegacyDisplay=nullptr;
     native_legacy_surface_status=OSKextLoadKextWithIdentifier("com.apple.iokit.IOSurface");
     OSDictionary *matching=IOService::nameMatching("IOCoreSurfaceRoot");

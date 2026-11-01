@@ -4,7 +4,9 @@
 UniXNU-sheng scripts/build-native-legacy-display.py at 978e3f7 (2026-10-22, the revision that matches the unixnu fork's
 drivers/NativeMobileDisplay), cut to the display: the generated ABI of the original IOMobileFramebufferLegacy, the owned
 NativeLegacyDisplay bound to it, the board probe (package/LegacyDisplayProbe.cpp, the late probe without sheng's board
-probes) and NativeGOPPresenter. sheng's hid, keystore, boot log/reset/trace, touch, cpufreq, gpu power, wifi, buttons and
+probes) and NativeGOPPresenter. The input side is this board's: the HID start-up (package/HidInputProbe.cpp, alioth's),
+the sec_ts touch probe (package/Pdx203TouchProbe.cpp) and NativeHidInput with its original bindings
+(scripts/build-native-hid-input.py). sheng's keystore, boot log/reset/trace, cpufreq, gpu power, wifi, buttons and
 backlight objects are not built. build-xnu-4k-baseline.sh links the archive with CONFIG_XNU_NATIVE_LEGACY_DISPLAY and
 checks it against build-report.json.
 """
@@ -204,20 +206,32 @@ def code(data,info):
     sec=next(s for g in info['segments'] for s in g['sections'] if s['name']=='__text');return data[sec['fileoff']:sec['fileoff']+sec['size']]
 require(code(raw,image)==code(late.read_bytes(),macho(late.read_bytes())),'Only owned initializer section registration changes')
 r=json.loads((ROOT/'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json').read_text().strip().rstrip(','))
-cmd=[];args=r['arguments'];i=0;source=ROOT/'kits/pdx203/LegacyDisplayProbe.cpp'
-while i<len(args):
-    value=args[i]
-    if value==r['file']:cmd.append(str(source))
-    elif value=='-o':cmd+=['-o',str(OUT/'LegacyDisplayProbe.o')];i+=1
-    elif value=='-Xclang' and args[i+1].startswith('-W'):i+=1
-    elif not value.startswith('-W'):cmd.append(value)
-    i+=1
-cmd+=['-Wall','-Wextra','-Werror','-Wno-unused-parameter','-Wno-unnecessary-virtual-specifier','-Wno-c99-designator','-Wno-reorder-init-list',
-      '-Wno-deprecated-enum-enum-conversion','-I',str(ROOT/'.cache/xnu-work/osfmk')]
-run(cmd,cwd=r['directory'])
+def board_cpp(name):
+    """compile a board C++ source of kits/pdx203 with the kernel's IOKit C++ line into OUT/<stem>.o"""
+    cmd=[];args=r['arguments'];i=0;src=ROOT/'kits/pdx203'/name;obj=OUT/(Path(name).stem+'.o')
+    while i<len(args):
+        value=args[i]
+        if value==r['file']:cmd.append(str(src))
+        elif value=='-o':cmd+=['-o',str(obj)];i+=1
+        elif value=='-Xclang' and args[i+1].startswith('-W'):i+=1
+        elif not value.startswith('-W'):cmd.append(value)
+        i+=1
+    cmd+=['-Wall','-Wextra','-Werror','-Wno-unused-parameter','-Wno-unnecessary-virtual-specifier','-Wno-c99-designator','-Wno-reorder-init-list',
+          '-Wno-deprecated-enum-enum-conversion','-Wno-missing-designated-field-initializers','-I',str(ROOT/'.cache/xnu-work/osfmk')]
+    run(cmd,cwd=r['directory'])
+    return src,obj
+source,probe=board_cpp('LegacyDisplayProbe.cpp')
+# the input side, started from the late probe: alioth's HID start-up (offline-hid-input=1) and the sec_ts touch probe
+# (pdx203-touch=1). NativeHidInput is a class nothing references by symbol, so its late object has to sit in this force-loaded
+# archive with them (alioth boot-usb70: in a plain archive the linker dropped it and no IOHIDDevice existed).
+hid_src,hid_probe=board_cpp('HidInputProbe.cpp')
+touch_src,touch_probe=board_cpp('Pdx203TouchProbe.cpp')
+print(run(['python3',ROOT/'scripts/build-native-hid-input.py'],text=True),end='')
+hid=ROOT/'build/native-hid-input'
 archive=OUT/'libNativeLegacyDisplay.late.a';archive.unlink(missing_ok=True)
-run(['xcrun','ar','rcs',archive,late,OUT/'original-bindings.o',OUT/'LegacyDisplayProbe.o'])
-sources=[ROOT/'drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp',ROOT/'drivers/NativeMobileDisplay/NativeLegacyRequest.h',source]
+run(['xcrun','ar','rcs',archive,late,OUT/'original-bindings.o',probe,hid_probe,touch_probe,hid/'NativeHidInput.late.o',hid/'hid-original-bindings.o'])
+sources=[ROOT/'drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp',ROOT/'drivers/NativeMobileDisplay/NativeLegacyRequest.h',source,
+         hid_src,touch_src,ROOT/'drivers/NativeHidInput/NativeHidInput.cpp']
 print(run(['python3',ROOT/'scripts/build-arm-driver.py','NativeGOPPresenter'],text=True),end='')
 gop=ROOT/'build/native-gop-presenter';gop_late=gop/'NativeGOPPresenter.late.o'
 run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_NativeGOPPresenter.cpp',
@@ -232,4 +246,5 @@ sources.extend([ROOT/'drivers/NativeMobileDisplay/NativeGOPPresenter.cpp',ROOT/'
     compiled_object_sha256=sha(obj),late_object_sha256=sha(late),archive_sha256=sha(archive),
     bindings={n:hex(v) for n,v in bindings.items()},virtual_entries=358,owned_entries=owned,inherited_native_entries=native,
     guarded_backend_leaves=[i for i in pure if i not in (213,337)],original_instructions_modified=False,driver_initialized=False,display_presented=False,desktop=False),indent=2)+'\n')
-print('pdx203: built the GOP legacy display archive (NativeLegacyDisplay, its original bindings, the board probe, NativeGOPPresenter)')
+print('pdx203: built the GOP legacy display archive (NativeLegacyDisplay, its original bindings, the board probe, NativeGOPPresenter,'
+      ' the HID start-up, the sec_ts touch probe, NativeHidInput)')

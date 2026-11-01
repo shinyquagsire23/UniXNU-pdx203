@@ -200,6 +200,14 @@ kernel_args = [
   "sheng-disable-watchdogd=1",
   "sheng-lite=1",
   "sheng-disable-jobs=com.apple.liveactivitiesd,com.apple.cryptexd,com.apple.routined",
+  # touch. offline-hid-input=1 has the late probe load IOHIDFamily and IOHIDEventDriver and start NativeHidInput on
+  # IOHIDResource (package/HidInputProbe.cpp, alioth's); sheng-touch-hid=1 gives that device the ten-finger digitizer and
+  # registers its sink; pdx203-touch=1 starts the sec_ts probe (package/Pdx203TouchProbe.cpp: GENI I2C 0x48 on SE13 as
+  # ios-sweet drives it on this phone), which publishes contacts through the native_touch_* seqlock. its log lines start
+  # "PDX203 TOUCH" on the usb log
+  "offline-hid-input=1",
+  "sheng-touch-hid=1",
+  "pdx203-touch=1",
 ]
 # Fixups of signed text, applied by the kernel after signature validation and only where the original bytes match
 # (patches/xnu/native-text-fixup.patch). They reach it as /chosen/text-fixups, not on the command line. Each is
