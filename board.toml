@@ -221,6 +221,11 @@ kernel_args = [
   # windows at 0x18591000/2000/3000). the usb log carries "PDX203 CPUFREQ" rows with each domain's level before and after the
   # vote. sheng-cpufreq=1 only reads; sheng-cpufreq-cap=<MHz> caps the vote
   "sheng-cpufreq=3",
+  # persistent Data: NativeRamBlock keeps the Data seed's changed pages in a store window at the end of userdata (NativeUfs
+  # store, the only path that writes; clear of the root image and a 1 GiB reserve), so iPadOS keeps Setup, settings and its
+  # first-boot work across boots. 2 reads and writes, 1 only reads the store. a seed over 2 GiB (local/owner-data-64g.dbr, built
+  # with seed-data-grow.py --gib 64) is served from the store instead of RAM. a different seed size starts Data over
+  "sheng-data-persist=2",
 ]
 # Fixups of signed text, applied by the kernel after signature validation and only where the original bytes match
 # (patches/xnu/native-text-fixup.patch). They reach it as /chosen/text-fixups, not on the command line. Each is
@@ -248,6 +253,8 @@ text_fixups = [
 ]
 
 [payload.adt]
+# Data keeps its writes (sheng-data-persist=2): no /chosen/ephemeral-storage, so datamigrator and keybagd treat it as real storage
+persistent_data = true
 tool = "scripts/make-pdx203-adt.py"
 chip_id = "207"
 # 3 GiB window. it needs the uefi-pdx203 Pdx203BootMemoryDxe that adds the upper bank (no 1 GiB / below-4 GiB cap
