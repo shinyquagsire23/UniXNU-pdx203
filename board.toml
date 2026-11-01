@@ -190,6 +190,15 @@ kernel_args = [
   # "pdx203 persist[..]: QCOM USB REFUSED error=.." on the console instead.
   "qcom-usb-debug=1",
   "qcom-usb-ctl=1",
+  # sheng's launchd policy (package/BootWatchdogPolicy.c, called from load_init_program by the fork's
+  # zzzzzzzzza-launch-policy.patch): disabled.plist on the fresh Data volume before launchd reads it. measured 2026-11-01
+  # with the EXITLOG patch (logs/usb-04): watchdogd and liveactivitiesd crash-looped on SIGTRAP (16 each in ~5 min),
+  # bluetoothd and fairplayd.A2 respawned 69 times each. sheng-lite is sheng's list of jobs with nothing to do on a board
+  # with no radios or accounts (bluetoothd, fairplayd.A2, locationd, CommCenter, ...); the three named jobs are alioth's
+  # (same soc and os), where liveactivitiesd traps in CalendarUIKit
+  "sheng-disable-watchdogd=1",
+  "sheng-lite=1",
+  "sheng-disable-jobs=com.apple.liveactivitiesd,com.apple.cryptexd,com.apple.routined",
 ]
 # Fixups of signed text, applied by the kernel after signature validation and only where the original bytes match
 # (patches/xnu/native-text-fixup.patch). They reach it as /chosen/text-fixups, not on the command line. Each is
