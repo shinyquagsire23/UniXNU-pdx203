@@ -32,6 +32,7 @@ TIMEBASE = 19200000                # the virtual timer is ppi 27, what ArmCpu en
 UFS_HC, UFS_HC_SIZE = 0x1d84000, 0x3000
 UFS_ICE, UFS_ICE_SIZE = 0x1d90000, 0x8000
 UFS_PHY, UFS_PHY_SIZE = 0x1d87000, 0x1000
+UFS_SID, UFS_SID_2 = 0xe0, 0x4e0          # apps smmu stream ids of the ufs host (mainline sm8250.dtsi)
 # splash framebuffer abl leaves at cont_splash_region, 1096x2560 a8r8g8b8 stride 4384 (verified), the
 # command mode panel refreshes it once the uefi port kicks pingpong autorefresh
 FB_BASE, FB_SIZE = 0x9c000000, 0x2300000
@@ -162,11 +163,15 @@ def build(args, seed=None):
         node('intc', [('compatible', cstr('arm,gic-v3')),
                       ('reg', u64(io(GICD), GICD_SIZE, io(GICR), GICR_SIZE)),
                       ('redistributor-stride', u64(GICR_STRIDE))]),
-        # ufs host, ice and phy windows. the stock kona dtb gives the host no apps smmu stream (mainline
-        # sm8250 says 0xe0) and ios-sweet's driver did dma above 4 GiB without touching the smmu, so no
-        # iommus here: drivers/NativeUfs skips the stream plan when the property is absent.
+        # ufs host, ice and phy windows, and the host's two apps smmu streams (mainline sm8250.dtsi, the same
+        # pair UniXNU-alioth passes on sm8250). measured on the phone 2026-11-01: without them the first
+        # command's dma reset the whole phone ~10 s later, no panic, from the bootloader's list page and from a
+        # kernel buffer alike. alioth recorded why on the same soc: after hand-off the apps smmu faults
+        # unmatched streams (USFCFG) and has no match entry for the ufs host. drivers/NativeUfs gives each
+        # listed stream a bypass context bank before the first doorbell.
         node('ufshc', [('compatible', cstr('qcom,sm8250-ufshc', 'qcom,ufshc')),
-                       ('reg', u64(io(UFS_HC), UFS_HC_SIZE, io(UFS_ICE), UFS_ICE_SIZE, io(UFS_PHY), UFS_PHY_SIZE))]),
+                       ('reg', u64(io(UFS_HC), UFS_HC_SIZE, io(UFS_ICE), UFS_ICE_SIZE, io(UFS_PHY), UFS_PHY_SIZE)),
+                       ('iommus', u32(UFS_SID, 0x0, UFS_SID_2, 0x0))]),
         # the display processor and the splash buffer. IOMobileFramebuffer counts arm-io children with this
         # device_type, the display driver (not written) reads the panel geometry from here.
         node('disp0', [('device_type', cstr('display-subsystem')),

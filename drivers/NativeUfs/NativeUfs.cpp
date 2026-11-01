@@ -282,22 +282,32 @@ static void zero32 (void *start, size_t length)
 // (arm_smmu_write_sme). ARM IHI 0062D.c table 3-1 additionally requires VA64=1
 // for inputs above 32 bits even with SCTLR.M=0. Storage DMA path only; this
 // is physical pass-through, not a page-table or Adreno 4 KiB qualification.
-// pdx203: the stock kona dtb gives the ufs host no apps smmu stream (mainline sm8250 says 0xe0) and the
-// ios-sweet driver did its dma on this phone without touching the smmu, so the stream is read from the ufshc
-// node's iommus (<sid mask> pairs, the first sid) and the plan is skipped when the node has none.
-static bool ufsSmmuStream (uint16_t *stream)
+// pdx203: the streams come from the ufshc node's iommus (<sid mask> pairs). sm8250 routes the ufs host through
+// two, 0xe0 and 0x4e0 (mainline sm8250.dtsi, UniXNU-alioth), and an unmatched one faults, which took the phone
+// down without a panic on 2026-11-01, so every listed sid gets a route. the plan is skipped when there are none.
+static const unsigned kUfsMaxStreams = 2;
+
+static unsigned ufsSmmuStreams (uint16_t *streams, unsigned max)
 {
   IORegistryEntry *ufs = IORegistryEntry::fromPath ("/arm-io/ufshc", gIODTPlane);
-  if (!ufs) return false;
+  if (!ufs) return 0;
   OSData *iommus = OSDynamicCast (OSData, ufs->getProperty ("iommus"));
-  const bool found = iommus != nullptr && iommus->getLength () >= 8;
-  if (found) {
-    uint32_t sid = 0;
-    memcpy (&sid, iommus->getBytesNoCopy (), sizeof (sid));
-    *stream = static_cast<uint16_t> (sid & 0x7fff);
+  unsigned count = 0;
+  if (iommus) {
+    const uint8_t *bytes = static_cast<const uint8_t *> (iommus->getBytesNoCopy ());
+    for (unsigned offset = 0; offset + 8 <= iommus->getLength () && count < max; offset += 8) {
+      uint32_t sid = 0;
+      memcpy (&sid, bytes + offset, sizeof (sid));
+      streams[count++] = static_cast<uint16_t> (sid & 0x7fff);
+    }
   }
   ufs->release ();
-  return found;
+  return count;
+}
+
+static bool ufsSmmuStream (uint16_t *stream)
+{
+  return ufsSmmuStreams (stream, 1) == 1;
 }
 
 static void smmuBypassStream (uint16_t stream, OSSharedPtr<IOMemoryMap> &keep, uint32_t *report,
@@ -389,8 +399,12 @@ void NativeUfs::adoptAndRead (unsigned level)
   unsigned stopLoops = 10000;
   while ((read32 (hc, 0x60) & 1) && stopLoops--) IODelay (10);
   if (read32 (hc, 0x60) & 1) panic ("NATIVE_UFS adopt: request list did not stop");
-  uint16_t stream = 0;
-  if (ufsSmmuStream (&stream)) smmuBypassStream (stream, smmuMap, smmuReport, phys, 16384);
+  uint16_t streams[kUfsMaxStreams] = {};
+  const unsigned streamCount = ufsSmmuStreams (streams, kUfsMaxStreams);
+  for (unsigned index = streamCount; index-- > 0;) {
+    // the first stream last, so smmuReport describes it
+    smmuBypassStream (streams[index], smmuMap, smmuReport, phys, 16384);
+  }
   write32 (hc, 0x50, static_cast<uint32_t> (phys));
   write32 (hc, 0x54, static_cast<uint32_t> (phys >> 32));
   write32 (hc, 0x20, 0xffffffffU);  // clear stale status
@@ -952,9 +966,17 @@ static bool hostBringUp (const char **why)
   uint32_t report[3] = { 0, 0, 0 };
   gRootDiagnostic.stage = "SMMU and request list";
   if (!hostStopQueue (why)) return false;
-  uint16_t stream = 0;
-  if (ufsSmmuStream (&stream)) {
-    smmuBypassStream (stream, gHost.smmuMap, report, gHost.phys, kDmaBytes);
+  uint16_t streams[kUfsMaxStreams] = {};
+  const unsigned streamCount = ufsSmmuStreams (streams, kUfsMaxStreams);
+  for (unsigned index = 1; index < streamCount; index++) {
+    // the extra streams get their own bypass bank (the planner moves down from the top bank), the routes stay
+    // programmed after the temporary mapping goes
+    OSSharedPtr<IOMemoryMap> extraMap;
+    uint32_t extraReport[3] = { 0, 0, 0 };
+    smmuBypassStream (streams[index], extraMap, extraReport, gHost.phys, kDmaBytes);
+  }
+  if (streamCount) {
+    smmuBypassStream (streams[0], gHost.smmuMap, report, gHost.phys, kDmaBytes);
     gHost.smmu = gHost.smmuMap->getVirtualAddress ();
     uint32_t idr1 = read32 (gHost.smmu, 0x24);
     gHost.cb = gHost.smmu + ((1U << (((idr1 >> 28) & 7) + 1)) + (report[0] >> 16)) * 4096;

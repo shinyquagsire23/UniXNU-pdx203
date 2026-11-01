@@ -114,7 +114,7 @@ class AdtTests(unittest.TestCase):
         self.assertEqual(struct.unpack('<I', tree['/arm-io/gpu-smmu']['#iommu-cells'])[0], 2)
         self.assertEqual(struct.unpack('<4I', tree['/arm-io/gpu']['iommus'])[::2], (0x0, 0x2))
         self.assertEqual(struct.unpack('<4I', tree['/arm-io/gmu']['iommus'])[::2], (0x4, 0x5))
-        self.assertNotIn('iommus', tree['/arm-io/ufshc'])
+        self.assertEqual(struct.unpack('<4I', tree['/arm-io/ufshc']['iommus']), (0xe0, 0x0, 0x4e0, 0x0))
         self.assertIn(b'qcom,sm8250-ufshc\0', tree['/arm-io/ufshc']['compatible'])
 
     def test_darwinboot_placeholders_and_identity(self):
