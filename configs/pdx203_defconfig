@@ -29,7 +29,10 @@ CONFIG_XNU_SOURCE_PTHREAD=y
 # CONFIG_XNU_NATIVE_RAM_BLOCK is not set
 # CONFIG_XNU_NATIVE_VIRTIO_BLOCK is not set
 # CONFIG_XNU_NATIVE_VIRTIO_CONSOLE is not set
-# CONFIG_XNU_SHENG_PMGR is not set
+# the prelinked amfi panics "AMFI: No PMGR?" (ConfigurationSettings.cpp:235) without an ApplePMGRNub, seen on the
+# phone right after pthread, so the first console publishes the original one too (sheng-pmgr=2 in board.toml).
+# its builder reads a prelinked candidate, the first-console kernel.macho copied to build/native-prelink
+CONFIG_XNU_SHENG_PMGR=y
 # CONFIG_XNU_NATIVE_LEGACY_DISPLAY is not set
 # CONFIG_XNU_NATIVE_ADRENO is not set
 # CONFIG_XNU_ZONE_PGZ_ALIGNMENT_PROBE is not set

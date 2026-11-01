@@ -144,10 +144,14 @@ trust_cache_sha256 = [
   "7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7",
   "8900d6a93d7a59ce1a872a5c081e559f4240a218f97e12d44d22dda46644d68f",
 ]
-# the first-console set. stage 6 adds native-ufs-root=1 and sheng-pmgr=2 with --kernel-arg (docs/bring-up.md),
-# they need the pdx203-full kernel and the payload step refuses them on the first-console one.
+# the first-console set. stage 6 adds native-ufs-root=1 with --kernel-arg (docs/bring-up.md), it needs the
+# pdx203-full kernel and the payload step refuses it on the first-console one.
 kernel_args = [
   "-v",
+  # amfi panics "No PMGR?" without the published original ApplePMGRNub (CONFIG_XNU_SHENG_PMGR)
+  "sheng-pmgr=2",
+  # the uke video console patch of the unixnu fork, kprintf reaches the panel only on the text console
+  "-uketextconsole",
   "serial=3",
   "debug=0x14e",
   # development kernels keep kprintf quiet unless this is set, and with no uart the framebuffer console
