@@ -185,6 +185,24 @@ kernel_args = [
   "sheng-vsync=60",
   "ml-timeout-lock-panic-scale=40",
 ]
+# Fixups of signed text, applied by the kernel after signature validation and only where the original bytes match
+# (patches/xnu/native-text-fixup.patch). They reach it as /chosen/text-fixups, not on the command line. Each is
+# <file name>,<file offset>,<original>,<replacement>, in hex. sheng's list for the same 21H461 build; the original bytes
+# were checked against this tree's 044-76034-038 (SystemOS cryptex) and 044-76040-038 (OS) images.
+text_fixups = [
+  # +[AWAttentionAwarenessConfiguration initialize] only forces +[AWClientPreferences initialize] and deadlocks SpringBoard
+  # startup against it (ABBA between the main thread and Siri's SASMyriadController), so the boot stays on the Apple logo
+  # (2026-11-01 here). It returns at once instead.
+  "dyld_shared_cache_arm64.15,421e8bc,28ad1bb0008544f9,c0035fd6008544f9",
+  # PosterBoardServices: PRSPosterPathURLResourceValues and PRSPosterPathFileAttributes require NSFileProtectionNone, which a
+  # Data volume without data protection never reports, so no poster and no wallpaper is ever made. Both dictionaries keep
+  # only their first entry.
+  "dyld_shared_cache_arm64.13,1b05bec,44008052,24008052",
+  "dyld_shared_cache_arm64.13,1b05b08,44008052,24008052",
+  # BTAudioHALPlugin's factory returns NULL, so audiomxd skips it instead of reconnecting to the missing Bluetooth audio
+  # service thousands of times a second.
+  "BTAudioHALPlugin,38bec,ffc300d1f44f01a9,000080d2c0035fd6",
+]
 
 [payload.adt]
 tool = "scripts/make-pdx203-adt.py"
