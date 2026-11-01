@@ -42,3 +42,27 @@ boot_progress_stage(const char *text)
 {
 	(void)text;
 }
+
+/* drivers/QcomXnuUsbDebug imports these two weakly. without the boot progress page the refusal line (which precondition the
+ * inherited controller failed: power domain, clocks, reset, role, smmu) goes to the message buffer, which the verbose console
+ * shows, so one photograph still names it. there is no board reset to the bootloader yet: refusing makes the module issue
+ * its own psci reset. */
+extern int printf(const char *, ...);
+
+__attribute__((weak)) void
+boot_progress_persist(const char *text, uint32_t slot)
+{
+	printf("pdx203 persist[%u]: %s\n", slot, text ? text : "");
+}
+
+__attribute__((weak)) int
+boot_reset_bootloader(char *text, unsigned size)
+{
+	static const char why[] = "no board reset on pdx203";
+	if (text && size) {
+		unsigned i = 0;
+		for (; i + 1 < size && why[i]; ++i) text[i] = why[i];
+		text[i] = 0;
+	}
+	return 1;
+}

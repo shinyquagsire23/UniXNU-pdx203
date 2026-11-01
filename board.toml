@@ -184,6 +184,12 @@ kernel_args = [
   "offline-mobile-graphics-load=1",
   "sheng-vsync=60",
   "ml-timeout-lock-panic-scale=40",
+  # the CDC-ACM kernel log (drivers/QcomXnuUsbDebug, CONFIG_XNU_QCOM_USB_DEBUG): printf, IOLog, kprintf and the panic drain
+  # are teed onto a USB serial port, 1209:316d "QcomXnuUsbDebug". uefi-pdx203's Pdx203UsbDxe leaves the controller clocked
+  # with the HS PHY up. qcom-usb-ctl=1 adds the control channel (status, reboot). a refused takeover prints
+  # "pdx203 persist[..]: QCOM USB REFUSED error=.." on the console instead.
+  "qcom-usb-debug=1",
+  "qcom-usb-ctl=1",
 ]
 # Fixups of signed text, applied by the kernel after signature validation and only where the original bytes match
 # (patches/xnu/native-text-fixup.patch). They reach it as /chosen/text-fixups, not on the command line. Each is

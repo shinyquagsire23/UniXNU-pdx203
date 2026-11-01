@@ -51,6 +51,10 @@ def main():
         # the GOP display (NativeLegacyDisplay bound to the original IOMobileFramebufferLegacy, the board probe and
         # NativeGOPPresenter), linked by the base build as build/native-legacy-display/libNativeLegacyDisplay.late.a
         steps.append(['build-pdx203-legacy-display.py'])
+    if on('QCOM_USB_DEBUG'):
+        # the CDC-ACM kernel log over the DWC3 (drivers/QcomXnuUsbDebug, sm8250 profile), linked through
+        # CONFIG_XNU_EXTRA_LD_ARCHIVES as build/qcom-usb-debug/libQcomXnuUsbDebug.a
+        steps.append(['build-pdx203-usb-debug.py'])
     if on('SOURCE_PTHREAD'):
         steps.append(['build-libpthread-kernel.py'])
     for index, step in enumerate(steps, 1):

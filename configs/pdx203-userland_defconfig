@@ -38,7 +38,12 @@ CONFIG_XNU_ZONE_PGZ_ALIGNMENT_PROBE=y
 CONFIG_XNU_NATIVE_ARCH_TIMER=y
 CONFIG_XNU_NATIVE_PAN=y
 CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
-CONFIG_XNU_EXTRA_LD_ARCHIVES="{tree}/build/pdx203-stubs/libPdx203Stubs.a"
+CONFIG_XNU_EXTRA_LD_ARCHIVES="{tree}/build/pdx203-stubs/libPdx203Stubs.a {tree}/build/qcom-usb-debug/libQcomXnuUsbDebug.a"
+# the CDC-ACM kernel log over the DWC3 (drivers/QcomXnuUsbDebug in the device repository). the base build script gives the
+# six hook units -DXNU_QCOM_USB_DEBUG=1 and the module include path; the archive is the second extra link input above.
+# it takes over a controller the firmware left powered and in device mode (Pdx203UsbDxe in uefi-pdx203), and it
+# starts on qcom-usb-debug=1.
+CONFIG_XNU_QCOM_USB_DEBUG=y
 
 CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y
 # CONFIG_XNU_NATIVE_VIRTIO_BLOCK is not set
