@@ -489,7 +489,10 @@ extern "C" bool pdx203_touch_start(void);
 // the AppleKeyStore stand-in (package/KeyStoreProbe.cpp, drivers/NativeKeyStoreEvents; offline-key-events=1, sheng-aks=1):
 // with no SEP, it answers backboardd and SpringBoard's state queries as "no passcode, nothing locked"
 extern "C" void native_keystore_probe(void);
+// the cpu clocks (package/CpuFreqProbe.cpp, alioth's epss voter; sheng-cpufreq=<mode>): first, so the rest of the boot runs faster
+extern "C" void pdx203_cpufreq_start(void);
 void native_legacy_display_late_probe(void) {
+    pdx203_cpufreq_start();
     native_keystore_probe();
     (void)native_hid_input_probe();
     unsigned touch=0;

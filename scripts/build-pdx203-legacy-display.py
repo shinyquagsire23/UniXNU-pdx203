@@ -232,6 +232,7 @@ hid=ROOT/'build/native-hid-input'
 # the AppleKeyStore stand-in, as sheng builds it: an owned IOService (no original ABI to bind) whose static initialiser is
 # globalised so KeyStoreProbe.cpp can register the class itself
 keystore_src,keystore_probe=board_cpp('KeyStoreProbe.cpp')
+cpufreq_src,cpufreq_probe=board_cpp('CpuFreqProbe.cpp')
 print(run(['python3',ROOT/'scripts/build-arm-driver.py','NativeKeyStoreEvents'],text=True),end='')
 keyevents=ROOT/'build/native-keystore-events';keyevents_late=keyevents/'NativeKeyStoreEvents.late.o'
 run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_NativeKeyStoreEvents.cpp',
@@ -240,9 +241,9 @@ require(code((keyevents/'NativeKeyStoreEvents.o').read_bytes(),macho((keyevents/
         code(keyevents_late.read_bytes(),macho(keyevents_late.read_bytes())),'Owned keystore instructions unchanged by late init staging')
 archive=OUT/'libNativeLegacyDisplay.late.a';archive.unlink(missing_ok=True)
 run(['xcrun','ar','rcs',archive,late,OUT/'original-bindings.o',probe,hid_probe,touch_probe,hid/'NativeHidInput.late.o',hid/'hid-original-bindings.o',
-     keystore_probe,keyevents_late])
+     keystore_probe,keyevents_late,cpufreq_probe])
 sources=[ROOT/'drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp',ROOT/'drivers/NativeMobileDisplay/NativeLegacyRequest.h',source,
-         hid_src,touch_src,ROOT/'drivers/NativeHidInput/NativeHidInput.cpp',keystore_src,ROOT/'drivers/NativeKeyStoreEvents/NativeKeyStoreEvents.cpp']
+         hid_src,touch_src,ROOT/'drivers/NativeHidInput/NativeHidInput.cpp',keystore_src,ROOT/'drivers/NativeKeyStoreEvents/NativeKeyStoreEvents.cpp',cpufreq_src]
 print(run(['python3',ROOT/'scripts/build-arm-driver.py','NativeGOPPresenter'],text=True),end='')
 gop=ROOT/'build/native-gop-presenter';gop_late=gop/'NativeGOPPresenter.late.o'
 run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_NativeGOPPresenter.cpp',
