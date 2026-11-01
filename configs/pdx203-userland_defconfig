@@ -1,0 +1,46 @@
+# userland bring-up of pdx203 (stage 7 start): the stage 6 kernel (pdx203-full_defconfig) plus the SystemOS
+# owner-cache union, so launchd's dyld finds the shared cache. measured on the phone 2026-11-01 with the
+# stage 6 kernel: the OS volume mounts as root and launchd execs, then initproc dies with "Library not loaded:
+# /usr/lib/libSystem.B.dylib ... (no such file, no dyld cache)". on 21H461 the cache (System/Library/Caches/
+# com.apple.dyld) is only on Cryptex1,SystemOS, never on the OS volume.
+#
+# the uke route (UniXNU-uke uke-userland_defconfig), not the signed owner-root one: BRINGUP_OWNER_CACHE lets
+# the cache mount build without OWNER_ROOT_TRUST, drivers/NativeUfs supplies the two authorization helpers
+# kern_exec.c calls (only under native-ufs-allow-unverified=1) and the unixnu fork carries uke's root auth
+# bypass patch. OWNER_CACHE_MOUNT mounts the SystemOS volume (8846FE78-2910-4297-AF97-D59BB6F8FC16) read-only,
+# UNION_SYSTEMOS puts it over / as a native union, CACHE_STARTUP sets dyld's no-ignition flag. the Data
+# volume (OWNER_DATA_MOUNT, NATIVE_RAM_BLOCK and a seed) is the next step.
+CONFIG_XNU_BUILD_ARCHIVES=y
+CONFIG_XNU_BRINGUP_OWNER_CACHE=y
+CONFIG_XNU_SOURCE_CORECRYPTO14=y
+CONFIG_XNU_SOURCE_PTHREAD=y
+CONFIG_XNU_ARM_DT_PLATFORM=y
+CONFIG_XNU_ARMCPU=y
+CONFIG_XNU_NATIVE_UFS=y
+CONFIG_XNU_NATIVE_AES=y
+CONFIG_XNU_TRUST_CACHE_RUNTIME=y
+CONFIG_XNU_SOURCE_MOCKFS=y
+CONFIG_XNU_NATIVE_CS_HASH_CACHE=y
+CONFIG_XNU_SHENG_PMGR=y
+CONFIG_XNU_DT_PANIC_REGION=y
+CONFIG_XNU_ZONE_PGZ_ALIGNMENT_PROBE=y
+CONFIG_XNU_NATIVE_ARCH_TIMER=y
+CONFIG_XNU_NATIVE_PAN=y
+CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
+CONFIG_XNU_EXTRA_LD_ARCHIVES="{tree}/build/pdx203-stubs/libPdx203Stubs.a"
+
+# CONFIG_XNU_NATIVE_LEGACY_DISPLAY is not set
+# CONFIG_XNU_NATIVE_VIRTIO_BLOCK is not set
+# CONFIG_XNU_NATIVE_RAM_BLOCK is not set
+# CONFIG_XNU_VERIFIED_ROOT_PROBE is not set
+# CONFIG_XNU_OWNER_ROOT_AUDIT is not set
+# CONFIG_XNU_OWNER_ROOT_TRUST is not set
+CONFIG_XNU_OWNER_CACHE_MOUNT=y
+CONFIG_XNU_OWNER_CACHE_STARTUP=y
+# CONFIG_XNU_OWNER_BOOT_MANIFEST is not set
+# CONFIG_XNU_OWNER_DATA_MOUNT is not set
+CONFIG_XNU_OWNER_UNION_SYSTEMOS=y
+# CONFIG_XNU_BOOT_PROGRESS is not set
+# CONFIG_XNU_NATIVE_ADRENO is not set
+CONFIG_XNU_NATIVE_MOBILE_DISPLAY=n
+CONFIG_XNU_ARMVIRT_PLATFORM=n
