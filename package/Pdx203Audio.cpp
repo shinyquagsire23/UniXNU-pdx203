@@ -10,7 +10,7 @@
 //
 // Boot argument pdx203-audio (bits): 1 reads the amplifiers' identity over I2C; 2 opens the audio DSP's APR channel "apr_audio_svc"
 // over GLINK (needs pdx203-adsp=2); 4 (with 1 and 2) plays test beeps pdx203-audio-delay seconds (default 40) after the probe starts:
-// pdx203-audio-beeps (default 5) beeps of 1 s of 750 Hz at -20 dBFS, 2 s apart, through AFE port SENARY_MI2S_RX, an ADM COPP and an
+// pdx203-audio-beeps (default 6) beeps of 1 s of 750 Hz at -20 dBFS (left only, right only, both, repeating), 2 s apart, through AFE port SENARY_MI2S_RX, an ADM COPP and an
 // ASM stream (/tmp/kmdconn/q6-playback-spec.md), with the CS35L41s set up to play ASP RX1 without their DSP
 // (/tmp/kmdconn/cs35l41-init-spec.md) at pdx203-audio-vol (AMP_DIG_VOL_CTRL, default 0xbe80 = -6 dB) and pdx203-audio-gain
 // (AMP_GAIN_CTRL, default 0 = 0.5 dB). Rows print as "PDX203 ADSP", "QRTR", "AUDIO", "APR" and "PLAY" on the console.
@@ -543,16 +543,18 @@ bool asmWrite(uint32_t slot) {   // no answer on success; the buffer comes back 
     return true;
 }
 
-// 750 Hz is exactly 64 samples at 48 kHz, so every 10 ms period (480 frames) holds the same 7.5 cycles. -20 dBFS.
+// 750 Hz is exactly 64 samples at 48 kHz; a period (480 frames) holds 7.5 cycles, so the phase carries over from period to period
+// (restarting it each period made a 100 Hz croak, usb-74). -20 dBFS.
 const int16_t kSine64[64] = {0, 321, 639, 951, 1254, 1545, 1821, 2079, 2317, 2533, 2725, 2890, 3028, 3136, 3214, 3261, 3277, 3261, 3214,
     3136, 3028, 2890, 2725, 2533, 2317, 2079, 1821, 1545, 1254, 951, 639, 321, 0, -321, -639, -951, -1254, -1545, -1821, -2079, -2317,
     -2533, -2725, -2890, -3028, -3136, -3214, -3261, -3277, -3261, -3214, -3136, -3028, -2890, -2725, -2533, -2317, -2079, -1821, -1545,
     -1254, -951, -639, -321};
-void fillSlot(uint32_t slot, bool tone) {
+// channels: bit 0 left, bit 1 right (0: silence); period: the stream's period number, for the phase.
+void fillSlot(uint32_t slot, unsigned channels, uint32_t period) {
     volatile uint32_t *frames = reinterpret_cast<volatile uint32_t *>(gBuf.va + slot * kSlotBytes);
     for (uint32_t i = 0; i < kPeriodFrames; ++i) {
-        const uint16_t s = tone ? (uint16_t)kSine64[i % 64] : 0;
-        frames[i] = (uint32_t)s | (uint32_t)s << 16;   // left and right
+        const uint16_t s = (uint16_t)kSine64[(period * kPeriodFrames + i) % 64];
+        frames[i] = ((channels & 1) ? (uint32_t)s : 0) | ((channels & 2) ? (uint32_t)s << 16 : 0);
     }
     __asm__ volatile("dsb sy" ::: "memory");
 }
@@ -582,7 +584,7 @@ void playBeeps(unsigned beeps) {
     step(1);
     if (!smmuPassThrough()) {failed(2, -1); return;}
     if (!mapRegion(kBufPhys, kBufSize, gBuf)) {failed(2, -12); return;}
-    for (uint32_t s = 0; s < kSlots; ++s) fillSlot(s, false);
+    for (uint32_t s = 0; s < kSlots; ++s) fillSlot(s, 0, 0);
     step(2);
     if ((rc = afeVote(3, &macro))) {failed(3, rc); return;}
     gPlay[2] = macro;
@@ -610,7 +612,8 @@ void playBeeps(unsigned beeps) {
     step(12);
     printPlay("running");
     {
-        // Periods in order: each beep is 100 tone periods then 200 silent ones. Four are kept queued at the DSP.
+        // Periods in order: each beep is 100 tone periods then 200 silent ones, left only, right only, then both, repeating. Four are
+        // kept queued at the DSP.
         const uint32_t total = beeps * 300;
         uint32_t sent = 0, done0 = __atomic_load_n(&gWritesDone, __ATOMIC_ACQUIRE);
         uint64_t stall;
@@ -619,7 +622,7 @@ void playBeeps(unsigned beeps) {
             const uint32_t done = __atomic_load_n(&gWritesDone, __ATOMIC_ACQUIRE) - done0;
             while (sent < total && sent - done < 4) {
                 const uint32_t slot = sent % kSlots;
-                fillSlot(slot, (sent % 300) < 100);
+                fillSlot(slot, (sent % 300) < 100 ? 1u + (sent / 300) % 3 : 0u, sent);
                 if (!asmWrite(slot)) break;
                 if (sent % 300 == 0) gPlay[13] = gPlay[13] + 1;
                 ++sent;
@@ -683,7 +686,7 @@ void printRows() {
 
 void audioThread(void *, wait_result_t) {
     thread_set_thread_name(current_thread(), "pdx203-audio");
-    unsigned mode = 0, delay = 40, beeps = 5;
+    unsigned mode = 0, delay = 40, beeps = 6;
     PE_parse_boot_argn("pdx203-audio", &mode, sizeof mode);
     PE_parse_boot_argn("pdx203-audio-delay", &delay, sizeof delay);
     PE_parse_boot_argn("pdx203-audio-beeps", &beeps, sizeof beeps);
