@@ -1606,6 +1606,7 @@ extern volatile uint32_t native_adreno_client_stats[5][6] __attribute__((weak_im
 extern volatile uint64_t native_adreno_import_diag[10] __attribute__((weak_import));
 }
 extern "C" void pdx203_dpu_dump(void) __attribute__((weak_import));
+extern volatile uint32_t pdx203_gpu_idle_stats[4];   // defined below, with pdx203_gpu_wait_idle
 namespace {
 char gPrinted[kRows][120];
 char gMetalPrinted[48][96], gMetalLine[4][200], gClientPrinted[8][96], gTextPrinted[4][2][64];
@@ -1665,10 +1666,10 @@ void metalRows() {
     }
 }
 char gAddonPrinted[120];
-char gDisplayPrinted[220];
+char gDisplayPrinted[280];
 void displayRow() {
     if (!&native_legacy_transfer_calls || !&native_legacy_copy_n) return;
-    char row[220];
+    char row[280];
     const volatile uint32_t *flip = &native_legacy_flip_stats ? native_legacy_flip_stats : nullptr;
     snprintf(row, sizeof row, "DISPLAY validate %u ok %u rej %u | transfer %u status %x | copies %llu last %llu us max %llu us | gpufb %u | retire %u gen %u/%u | flip %u n %u wait %u to %u max %u us shown %u",
              native_legacy_swap_validation_calls, native_legacy_swap_accepted_count, native_legacy_swap_rejected_count,
@@ -1676,6 +1677,11 @@ void displayRow() {
              (unsigned long long)(native_legacy_copy_last / 19), (unsigned long long)(native_legacy_copy_max / 19),
              native_legacy_gpu_fallbacks, native_legacy_retirement_calls, native_legacy_retired_generation, native_legacy_presented_generation,
              flip ? flip[0] : 99, flip ? flip[1] : 0, flip ? flip[2] : 0, flip ? flip[3] : 0, flip ? flip[4] : 0, flip ? flip[5] : 0);
+    {
+        const size_t used = strlen(row);
+        snprintf(row + used, sizeof row - used, " | gpuidle %u wait %u to %u max %u us", pdx203_gpu_idle_stats[0], pdx203_gpu_idle_stats[1],
+                 pdx203_gpu_idle_stats[2], pdx203_gpu_idle_stats[3]);
+    }
     // the counters move every frame: print at most every 5 s (the caller's cadence decides), and only when something changed
     if (strncmp(row, gDisplayPrinted, sizeof row)) {strlcpy(gDisplayPrinted, row, sizeof gDisplayPrinted); printf("%s\n", row);}
     static uint32_t lastTimeouts = ~0u;
@@ -1722,6 +1728,30 @@ void gpuReportThread(void *, wait_result_t)
     }
 }
 }  // namespace
+
+// pdx203: wait until the GPU has completed every submission on ring 0 (the render server's) issued so far. The display calls it before
+// it copies a swapped surface (LegacyDisplayProbe.cpp native_legacy_flip_target): a swap arrives as soon as the render server committed
+// the frame's GPU work, and the copy read surfaces the GPU was still drawing (the background over the icons, edged where the GPU had got
+// to, once frames came faster than the copy, usb-41..44). Original displays wait for the GPU the same way. observeFence reads the
+// fence memory only. pdx203_gpu_idle_stats: [0] calls, [1] calls that had to wait, [2] timeouts, [3] longest wait (us).
+volatile uint32_t pdx203_gpu_idle_stats[4];
+extern "C" uint32_t pdx203_gpu_wait_idle(uint32_t timeout_us) {
+    if (!gRing) return 0;
+    const uint32_t last = gRing->lastSubmitted();
+    if (!last) return 1;
+    pdx203_gpu_idle_stats[0] = pdx203_gpu_idle_stats[0] + 1;
+    const uint64_t start = gClock.now_us ? gClock.now_us(gClock.cookie) : 0;
+    uint32_t observed = 0;
+    NativeAdrenoRingFence done = gRing->observeFence(last, nullptr, 0, &observed);   // complete already?
+    if (done == NativeAdrenoRingFenceTimeout) {
+        pdx203_gpu_idle_stats[1] = pdx203_gpu_idle_stats[1] + 1;
+        done = gRing->observeFence(last, &gClock, timeout_us, &observed);
+        const uint64_t now = gClock.now_us ? gClock.now_us(gClock.cookie) : start;
+        if (uint32_t(now - start) > pdx203_gpu_idle_stats[3]) pdx203_gpu_idle_stats[3] = uint32_t(now - start);
+        if (done == NativeAdrenoRingFenceTimeout) pdx203_gpu_idle_stats[2] = pdx203_gpu_idle_stats[2] + 1;
+    }
+    return done == NativeAdrenoRingFenceComplete;
+}
 
 extern "C" void pdx203_gpu_start(void) {
     static bool started;

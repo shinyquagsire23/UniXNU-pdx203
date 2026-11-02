@@ -745,7 +745,10 @@ bool flipReady() {
     return true;
 }
 }  // namespace
+extern "C" uint32_t pdx203_gpu_wait_idle(uint32_t timeout_us) __attribute__((weak_import));
 extern "C" volatile void *native_legacy_flip_target(uint64_t *bytes) {
+    // the frame about to be copied must be finished: wait for the render server's GPU work (package/GpuProbe.cpp), at most 50 ms
+    if (&pdx203_gpu_wait_idle) pdx203_gpu_wait_idle(50000);
     if (!flipReady()) return nullptr;
     for (int i = 0; i < 3; ++i)
         if (i != gFlipShown && i != gFlipPending) {gFlipBack = i; break;}
