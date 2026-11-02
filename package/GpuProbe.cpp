@@ -1615,6 +1615,16 @@ char gMetalPrinted[48][96], gMetalLine[4][200], gClientPrinted[8][96], gTextPrin
 void printIfChanged(char *last, size_t cap, const char *now) {
     if (strncmp(last, now, cap)) {strlcpy(last, now, cap); printf("%s\n", now);}
 }
+// Each process's two text lines, printed as they change; called every round (0.5 s), as a line is overwritten by the next one but one.
+void clientText() {
+    if (!&native_adreno_client_text) return;
+    for (unsigned i = 0; i < 4; ++i) for (unsigned k = 0; k < 2; ++k) {
+        const Pdx203ClientText &t = native_adreno_client_text[i];
+        if (!t.name[0] || !t.text[k][0] || !strncmp(gTextPrinted[i][k], t.text[k], 64)) continue;
+        strlcpy(gTextPrinted[i][k], t.text[k], 64);
+        printf("METALTXT %.19s %.63s\n", t.name, t.text[k]);
+    }
+}
 void metalRows() {
     if (!&native_adreno_metal_diag) return;
     const Pdx203MetalDiag &d = native_adreno_metal_diag;
@@ -1634,12 +1644,7 @@ void metalRows() {
                  c.closes, c.slot, c.peak_mib, c.last_refusal);
         printIfChanged(gClientPrinted[i], sizeof gClientPrinted[i], line);
     }
-    if (&native_adreno_client_text) for (unsigned i = 0; i < 4; ++i) for (unsigned k = 0; k < 2; ++k) {
-        const Pdx203ClientText &t = native_adreno_client_text[i];
-        if (!t.name[0] || !t.text[k][0] || !strncmp(gTextPrinted[i][k], t.text[k], 64)) continue;
-        strlcpy(gTextPrinted[i][k], t.text[k], 64);
-        printf("METALTXT %.19s %.63s\n", t.name, t.text[k]);
-    }
+    clientText();
     if (&native_adreno_method_stats) {
         int n = snprintf(line, sizeof line, "METHODS failed:");
         for (unsigned m = 1; m < 20 && n > 0 && size_t(n) < sizeof line; ++m)
@@ -1719,6 +1724,7 @@ void gpuReportThread(void *, wait_result_t)
         addonRow();
         if (round % 10 == 0) displayRow();   // every 5 s for the first ten minutes, every 50 s after
         if (round % 20 == 5) metalRows();    // every 10 s, then every 100 s
+        else clientText();
         if (round == 6 && &pdx203_dpu_dump) pdx203_dpu_dump();   // package/LegacyDisplayProbe.cpp, once
         uint32_t now = native_gpu_changes;
         if (now != seen) {
