@@ -292,6 +292,26 @@ void buttonsThread(void *, wait_result_t) {
 }
 }  // namespace
 
+// pdx203: one byte of any PMIC peripheral through the arbiter the button thread mapped, for the battery (Pdx203Battery.cpp).
+// ppid = sid << 8 | (peripheral address >> 8). Reads go through the observer channel, so any mapped APID will do. -1 until the
+// button thread has mapped the arbiter, -2 when no APID serves ppid; otherwise the transfer's result (0 on success).
+extern "C" int pdx203_spmi_read(uint32_t ppid, uint8_t addr, uint8_t *value) {
+    if (native_buttons_stats[0] < 2 || !gObs.va || !gCore.va) return -1;
+    static struct {uint32_t ppid; int apid;} cache[8];
+    static unsigned cached;
+    int apid = -2;
+    for (unsigned i = 0; i < cached; ++i) if (cache[i].ppid == ppid) apid = cache[i].apid;
+    if (apid == -2) {
+        for (uint32_t i = 0; i < gApids && apid < 0; ++i) {
+            const uint32_t map = gCore.va[(gApidMap + 4 * i) / 4];
+            if (map && ((map >> 8) & 0xfff) == ppid) apid = (int)i;
+        }
+        if (apid < 0) return -2;
+        if (cached < 8) {cache[cached].ppid = ppid; cache[cached].apid = apid; cached++;}
+    }
+    return observe(apid, addr, value);
+}
+
 extern "C" void native_buttons_set_sink(void (*sink)(void *, uint32_t), void *context) {
     gSinkContext = context;
     __atomic_store_n(&gSink, sink, __ATOMIC_RELEASE);

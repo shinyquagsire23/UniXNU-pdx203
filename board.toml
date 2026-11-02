@@ -219,6 +219,9 @@ kernel_args = [
   # volume down (Sony kona-edo-common.dtsi), over the SPMI arbiter v5 and PDC pin 1 as alioth; 3 arms the interrupts and feeds
   # the hid input device's report 2 (2 reads once, 1 only finds the APIDs). BUTTONS rows on the console.
   "pdx203-bt=3",
+  # the battery (package/Pdx203Battery.cpp): an IOPMPowerSource with the PM8150B fuel gauge's monotonic SOC, the charger status
+  # and USB presence read over SPMI through the buttons' arbiter mapping (needs pdx203-bt). BATTERY rows on the console.
+  "pdx203-battery=1",
   # the AppleKeyStore stand-in (package/KeyStoreProbe.cpp + drivers/NativeKeyStoreEvents, alioth's pair). without a SEP and
   # its keybag the lock screen asks for a passcode nothing can satisfy (2026-11-01, touch boot); this owned AppleKeyStore
   # answers "no passcode, nothing locked". alioth: add sheng-aks-sls=3 only if the prompt survives

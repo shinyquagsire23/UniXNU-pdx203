@@ -515,12 +515,16 @@ extern "C" void pdx203_gpu_start(void);
 // the power and volume buttons (package/ButtonProbe.cpp, alioth's with this board's keys; pdx203-bt=<mode>): their own thread,
 // which waits for the interrupt controller, and they feed the hid input device's report 2
 extern "C" void pdx203_buttons_probe(void);
+// the battery as an IOPMPowerSource (package/Pdx203Battery.cpp; pdx203-battery=1): PM8150B fuel gauge and charger over the
+// arbiter the button thread maps
+extern "C" void pdx203_battery_probe(void);
 void native_legacy_display_late_probe(void) {
     pdx203_cpufreq_start();
     pdx203_gpu_start();
     native_keystore_probe();
     (void)native_hid_input_probe();
     pdx203_buttons_probe();
+    pdx203_battery_probe();
     unsigned touch=0;
     if(PE_parse_boot_argn("pdx203-touch",&touch,sizeof(touch)) && touch==1)(void)pdx203_touch_start();
     IOService *display=pendingLegacyDisplay;if(!display)return;pendingLegacyDisplay=nullptr;

@@ -237,6 +237,13 @@ keystore_src,keystore_probe=board_cpp('KeyStoreProbe.cpp')
 cpufreq_src,cpufreq_probe=board_cpp('CpuFreqProbe.cpp')
 # the power, volume and camera keys over SPMI (pdx203-bt=<mode>), started from the late probe
 buttons_src,buttons_probe=board_cpp('ButtonProbe.cpp')
+# the battery: the IOPMPowerSource class (static initializer globalised, registered by its probe) and the probe
+battery_src,battery_obj=board_cpp('Pdx203Battery.cpp')
+battery_probe_src,battery_probe=board_cpp('Pdx203BatteryProbe.cpp')
+battery_late=OUT/'Pdx203Battery.late.o'
+run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_Pdx203Battery.cpp',battery_obj,battery_late])
+require(code(battery_obj.read_bytes(),macho(battery_obj.read_bytes()))==code(battery_late.read_bytes(),macho(battery_late.read_bytes())),
+        'Owned battery instructions unchanged by late init staging')
 print(run(['python3',ROOT/'scripts/build-arm-driver.py','NativeKeyStoreEvents'],text=True),end='')
 keyevents=ROOT/'build/native-keystore-events';keyevents_late=keyevents/'NativeKeyStoreEvents.late.o'
 run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_NativeKeyStoreEvents.cpp',
@@ -245,10 +252,10 @@ require(code((keyevents/'NativeKeyStoreEvents.o').read_bytes(),macho((keyevents/
         code(keyevents_late.read_bytes(),macho(keyevents_late.read_bytes())),'Owned keystore instructions unchanged by late init staging')
 archive=OUT/'libNativeLegacyDisplay.late.a';archive.unlink(missing_ok=True)
 run(['xcrun','ar','rcs',archive,late,OUT/'original-bindings.o',probe,hid_probe,touch_probe,hid/'NativeHidInput.late.o',hid/'hid-original-bindings.o',
-     keystore_probe,keyevents_late,cpufreq_probe,buttons_probe])
+     keystore_probe,keyevents_late,cpufreq_probe,buttons_probe,battery_late,battery_probe])
 sources=[ROOT/'drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp',ROOT/'drivers/NativeMobileDisplay/NativeLegacyRequest.h',source,
          hid_src,touch_src,ROOT/'drivers/NativeHidInput/NativeHidInput.cpp',keystore_src,ROOT/'drivers/NativeKeyStoreEvents/NativeKeyStoreEvents.cpp',cpufreq_src,buttons_src,
-         ROOT/'kits/pdx203/ButtonsCore.h']
+         ROOT/'kits/pdx203/ButtonsCore.h',battery_src,battery_probe_src]
 print(run(['python3',ROOT/'scripts/build-arm-driver.py','NativeGOPPresenter'],text=True),end='')
 gop=ROOT/'build/native-gop-presenter';gop_late=gop/'NativeGOPPresenter.late.o'
 run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_NativeGOPPresenter.cpp',
