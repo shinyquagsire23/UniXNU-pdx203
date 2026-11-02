@@ -152,6 +152,22 @@ static void recordRejectedSwap(unsigned reason,const void *request,const void *s
         const OSMetaClass *meta=object->getMetaClass();const char *cls=meta?meta->getClassName():nullptr;
         if(cls)strlcpy(name,cls,sizeof(name));}
     memcpy(native_legacy_rej_class,name,sizeof(name));
+    // pdx203: this board has no boot-progress page to show the record, so the first eight refusals and every 512th after go to the
+    // console (and the USB log) as GPUREJ. The surface fields are those NativeLegacyDisplay reported for this request (reason 4).
+    const uint32_t count=native_legacy_swap_rejected_count;
+    if(count<=8 || !(count%512)) {
+        printf("GPUREJ n %u reason %u class %s size %ux%u rect %u,%u,%u,%u %u,%u,%u,%u state %x/%x/%x opt %x/%x/%x"
+               " | surf %llux%llu fmt %08llx planes %llu stride %llu alloc %llu desc %llu\n",
+               count,reason,name[0]?name:"-",native_legacy_rej_size[0],native_legacy_rej_size[1],
+               native_legacy_rej_rects[0][0],native_legacy_rej_rects[0][1],native_legacy_rej_rects[0][2],native_legacy_rej_rects[0][3],
+               native_legacy_rej_rects[1][0],native_legacy_rej_rects[1][1],native_legacy_rej_rects[1][2],native_legacy_rej_rects[1][3],
+               native_legacy_rej_state[0],native_legacy_rej_state[1],native_legacy_rej_state[2],
+               native_legacy_rej_options[0],native_legacy_rej_options[1],native_legacy_rej_options[2],
+               (unsigned long long)native_legacy_rej_surface[0],(unsigned long long)native_legacy_rej_surface[1],
+               (unsigned long long)native_legacy_rej_surface[2],(unsigned long long)native_legacy_rej_surface[3],
+               (unsigned long long)native_legacy_rej_surface[4],(unsigned long long)native_legacy_rej_surface[5],
+               (unsigned long long)native_legacy_rej_surface[6]);
+    }
 }
 // Content statistics of presented frames (copy = kind 0, blank fill = kind 1): the first 32 are kept, with the time
 // in seconds since the first frame. A per-frame record shows the animation cadence and when the OS blanks the panel.
@@ -230,6 +246,9 @@ extern "C" unsigned native_legacy_prepare_report(char *out,unsigned cap) {
 void native_legacy_swap_validation_observed(bool accepted,unsigned reason,const void *request,const void *surface) {
     if(accepted)native_legacy_swap_stage(0);
     if(accepted)native_legacy_swap_accepted_count=native_legacy_swap_accepted_count+1;
+    // pdx203: the first accepted swap and every 4096th, with the refusals so far (GPUREJ prints those)
+    if(accepted && (native_legacy_swap_accepted_count==1 || !(native_legacy_swap_accepted_count%4096)))
+        printf("GPUSWAP accepted %u reason %u rejected %u\n",native_legacy_swap_accepted_count,reason,native_legacy_swap_rejected_count);
     else {native_legacy_swap_rejected_count=native_legacy_swap_rejected_count+1;recordRejectedSwap(reason,request,surface);}
     native_legacy_swap_validation_calls=native_legacy_swap_validation_calls+1;
     native_legacy_swap_validation_result=accepted;native_legacy_swap_validation_reason=reason;
