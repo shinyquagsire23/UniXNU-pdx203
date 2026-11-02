@@ -11,6 +11,7 @@
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOService.h>
 #include <kern/thread.h>
+#include <kern/clock.h>
 #include <pexpert/pexpert.h>
 #include "ButtonsCore.h"
 
@@ -306,25 +307,49 @@ extern "C" {extern void (*volatile native_board_halt_restart)(int reboot);}
 namespace {
 Window gPsHold;
 int gPonWrite = -1;
+// Spins (no scheduling: this runs on the halt path) so the USB console can send the line before the next step.
+void haltSpin(uint32_t us) {
+    uint64_t deadline = 0;
+    nanoseconds_to_absolutetime((uint64_t)us * 1000, &deadline);
+    deadline += mach_absolute_time();
+    while (mach_absolute_time() < deadline) {}
+}
+void haltStep(const char *what, int rc) {printf("BOARD halt: %s rc %d\n", what, rc); haltSpin(50000);}
+// PSCI with no answer expected: SYSTEM_OFF 0x84000008, SYSTEM_RESET 0x84000009 (alioth found RESET unsupported here; tried
+// last, after PS_HOLD, in case this firmware differs).
+uint64_t psci(uint64_t function) {
+    register uint64_t x0 __asm__("x0") = function;
+    register uint64_t x1 __asm__("x1") = 0, x2 __asm__("x2") = 0, x3 __asm__("x3") = 0;
+    __asm__ volatile("smc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3) : "memory");
+    return x0;
+}
 void haltRestart(int reboot) {
     const uint8_t type = reboot ? 0x7 : 0x4;
     uint8_t ctl = 0, ctl2 = 0;
-    int rc = 0;
+    printf("BOARD %s: PON apid %d, type %x\n", reboot ? "restart" : "shutdown", gPonWrite, type);
+    haltSpin(50000);
     if (gPonWrite >= 0) {
-        rc |= read8(gPonWrite, 0x5B, &ctl2);
-        rc |= write8(gPonWrite, 0x5B, (uint8_t)(ctl2 & ~0x80));
-        IODelay(500);
-        rc |= read8(gPonWrite, 0x5A, &ctl);
-        rc |= write8(gPonWrite, 0x5A, (uint8_t)((ctl & ~0x0f) | type));
-        rc |= write8(gPonWrite, 0x5B, (uint8_t)(ctl2 | 0x80));
+        int rc = read8(gPonWrite, 0x5B, &ctl2); haltStep("read ctl2", rc);
+        rc = read8(gPonWrite, 0x5A, &ctl); haltStep("read ctl", rc);
+        rc = write8(gPonWrite, 0x5B, (uint8_t)(ctl2 & ~0x80)); haltStep("ctl2 reset-enable off", rc);
+        haltSpin(500);
+        rc = write8(gPonWrite, 0x5A, (uint8_t)((ctl & ~0x0f) | type)); haltStep("ctl type", rc);
+        rc = write8(gPonWrite, 0x5B, (uint8_t)(ctl2 | 0x80)); haltStep("ctl2 reset-enable on", rc);
+        uint8_t check = 0;
+        rc = read8(gPonWrite, 0x5A, &check); printf("BOARD halt: ctl now %02x (was %02x, ctl2 was %02x) rc %d\n", check, ctl, ctl2, rc);
+        haltSpin(50000);
     }
-    printf("BOARD %s: PON apid %d ps_hold type %x (was %02x, ctl2 %02x) rc %d, dropping PS_HOLD\n", reboot ? "restart" : "shutdown",
-        gPonWrite, type, ctl, ctl2, rc);
-    IODelay(1000);
+    printf("BOARD halt: dropping PS_HOLD\n");
+    haltSpin(50000);
     if (gPsHold.va) {
         gPsHold.va[0] = 0;
         __asm__ volatile("dsb sy" ::: "memory");
     }
+    haltSpin(2000000);
+    printf("BOARD halt: still running 2 s after PS_HOLD; PSCI %s\n", reboot ? "SYSTEM_RESET" : "SYSTEM_OFF");
+    haltSpin(50000);
+    const uint64_t r = psci(reboot ? 0x84000009 : 0x84000008);
+    printf("BOARD halt: PSCI returned %llx\n", (unsigned long long)r);
     for (;;) __asm__ volatile("wfe");
 }
 // The PON APID whose channel this EE may write: owner EE 0 in the ownership table.
