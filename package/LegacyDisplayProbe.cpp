@@ -607,10 +607,16 @@ void native_legacy_display_late_probe(void) {
 // scripts/build-pdx203-legacy-display.py binds the original getter as native_legacy_surface_stride_raw.
 extern "C" uint64_t native_legacy_surface_stride_raw(OSObject *), native_legacy_surface_allocation(OSObject *),
     native_legacy_surface_height(OSObject *);
+extern "C" uint32_t native_legacy_surface_format(OSObject *), native_legacy_surface_planes(OSObject *);
 extern "C" uint64_t native_legacy_surface_stride(OSObject *surface) {
     const uint64_t stride = native_legacy_surface_stride_raw(surface);
     const uint64_t allocation = native_legacy_surface_allocation(surface);
     const uint64_t height = native_legacy_surface_height(surface);
+    // 'b3a8' (the render server's deep framebuffer, two planes): the field is plane 1's (alpha bytes) row pitch, and plane 0 (the
+    // color words the display narrows, NativeLegacyRequest.h native_legacy_copy_xr10) fills the rest of each row's share of the
+    // allocation. usb-31: stride 1152, allocation 14254080, height 2560 -> plane 0 at 4416 bytes a row (1096 x 4, rounded to 64).
+    if (native_legacy_surface_format(surface) == 0x62336138U && native_legacy_surface_planes(surface) == 2 && stride && height &&
+        !(allocation % height) && allocation / height > stride) return allocation / height - stride;
     if (stride && allocation && height && stride <= allocation / height / 4) return stride * 4;
     return stride;
 }
