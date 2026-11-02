@@ -54,6 +54,8 @@ volatile uint32_t gEvents;
 void (*volatile gSink)(void *, uint32_t);
 void *volatile gSinkContext;
 unsigned gMode;
+bool gPolled;
+constexpr unsigned kPollMs = 30;
 
 bool mapWindow(Window &w, uint64_t base, uint64_t size) {
     IODeviceMemory *memory = IODeviceMemory::withRange(base, size);
@@ -84,17 +86,39 @@ int transfer(int apid, uint8_t addr, uint8_t *value, bool write) {
     }
     return 1;
 }
-int read8(int apid, uint8_t addr, uint8_t *value) {return transfer(apid, addr, value, false);}
+// pdx203: reads go through the observer channel, the read-only window every APID has (spmi-pmic-arb.c v5 reads through
+// rd_base = obsrvr too); only writes need the APID's own channel, which the arbiter refuses to an EE that does not own it.
+int observe(int apid, uint8_t addr, uint8_t *value) {
+    volatile uint32_t *ch = gObs.va + (gObsStride * (uint32_t)apid) / 4;
+    ch[0x00 / 4] = bt_command(false, addr);
+    __asm__ volatile("dsb sy" ::: "memory");
+    for (uint32_t n = 0; n < 100000; ++n) {
+        const int result = bt_status_result(ch[0x08 / 4]);
+        if (result == BT_NOT_DONE) continue;
+        if (result != BT_OK) return result;
+        *value = (uint8_t)ch[0x18 / 4];
+        return 0;
+    }
+    return 1;
+}
+int read8(int apid, uint8_t addr, uint8_t *value) {return observe(apid, addr, value);}
 int write8(int apid, uint8_t addr, uint8_t value) {return transfer(apid, addr, &value, true);}
 
-// The APID that serves ppid with its interrupts owned by this EE; -1 when there is none.
-int findApid(uint32_t ppid) {
+// The APID that serves ppid, preferring one whose interrupts and writes this EE owns; *owned says whether it does. -1 when
+// the arbiter maps no APID to ppid. pdx203: Sony's firmware left the PON without an APID alioth's test accepted (usb-62
+// "failed at step 4"), so every match is printed with its IRQ-owner bit and owning EE, and an unowned APID is still used
+// for reading (observer channel) with the levels polled.
+int findApid(uint32_t ppid, bool *owned) {
     int found = -1;
+    *owned = false;
     for (uint32_t i = 0; i < gApids; ++i) {
         const uint32_t map = gCore.va[(gApidMap + 4 * i) / 4];
         if (!map || ((map >> 8) & 0xfff) != ppid) continue;
         const bool irqOwner = (map >> 24) & 1;
-        if (irqOwner && (gCnfg.va[(0x00 + 4 * i) / 4] & 7u) == 0) found = (int)i;
+        const uint32_t ee = gCnfg.va[(0x00 + 4 * i) / 4] & 7u;
+        printf("BUTTONS ppid %03x apid %u map %08x irq-owner %d ee %u\n", ppid, i, map, irqOwner ? 1 : 0, ee);
+        const bool mine = irqOwner && ee == 0;
+        if (found < 0 || (mine && !*owned)) {found = (int)i; *owned = mine;}
     }
     return found;
 }
@@ -188,11 +212,16 @@ bool setup() {
     if (!mapWindow(gObs, kObsrvr, ((uint64_t)gObsStride * gApids + 0xfff) & ~0xfffull) ||
         !mapWindow(gChn, kChnls, (uint64_t)gApidStride * gApids)) {fail(3, -12); return false;}
     native_buttons_stats[0] = 1;
-    gPon = findApid(kPonPpid); gGpio = findApid(kGpioPpid); gCam = findApid(kCamPpid);
+    printf("BUTTONS arb v%08x apids %u\n", gVersion, gApids);
+    bool ponOwned = false, gpioOwned = false, camOwned = false;
+    gPon = findApid(kPonPpid, &ponOwned); gGpio = findApid(kGpioPpid, &gpioOwned); gCam = findApid(kCamPpid, &camOwned);
     native_buttons_stats[4] = gPon; native_buttons_stats[5] = gGpio;
     if (gPon < 0) {fail(4, -2); return false;}
     native_buttons_stats[0] = 2;
-    printf("BUTTONS arb v%08x apids %u pon %d vol- gpio %d cam gpio %d\n", gVersion, gApids, gPon, gGpio, gCam);
+    // Interrupts only when this EE owns every key's APID it found; otherwise the thread polls the levels.
+    gPolled = !ponOwned || (gGpio >= 0 && !gpioOwned) || (gCam >= 0 && !camOwned);
+    printf("BUTTONS pon %d%s vol- gpio %d%s cam gpio %d%s -> %s\n", gPon, ponOwned ? "" : " (not ours)", gGpio,
+        gpioOwned ? "" : " (not ours)", gCam, camOwned ? "" : " (not ours)", gPolled ? "polling" : "interrupts");
     // The key pads as Sony's pinctrl leaves them: digital input (MODE_CTL 0x40 mode bits 0), 30 uA pull-up (DIG_PULL_CTL
     // 0x42 = 0), enabled (EN_CTL 0x46 bit 7). Read first; set only what differs.
     const int pads[2] = {gGpio, gCam};
@@ -202,7 +231,8 @@ bool setup() {
         uint8_t mode = 0xff, pull = 0xff, en = 0xff, level = 0xff;
         read8(apid, 0x40, &mode); read8(apid, 0x42, &pull); read8(apid, 0x46, &en); read8(apid, kRtSts, &level);
         printf("BUTTONS pad apid %d mode %02x pull %02x en %02x rt %02x\n", apid, mode, pull, en, level);
-        if (gMode >= 3 && ((mode & 0x3) != 0 || (pull & 0x7) != 0 || !(en & 0x80))) {
+        const bool ownPad = (apid == gGpio) ? gpioOwned : camOwned;
+        if (gMode >= 3 && ownPad && ((mode & 0x3) != 0 || (pull & 0x7) != 0 || !(en & 0x80))) {
             if (mode & 0x3) write8(apid, 0x40, (uint8_t)(mode & ~0x3));
             if (pull & 0x7) write8(apid, 0x42, (uint8_t)(pull & ~0x7));
             if (!(en & 0x80)) write8(apid, 0x46, 0x80);
@@ -211,6 +241,7 @@ bool setup() {
     }
     if (gMode == 2) {uint8_t pon = 0; read8(gPon, kRtSts, &pon); printf("BUTTONS pon rt %02x mask %x\n", pon, pressed());}
     if (gMode == 2) return true;      // read-only: no arming, no interrupt
+    if (gPolled) {native_buttons_stats[0] = 3; printf("BUTTONS polling every %u ms\n", kPollMs); return true;}
     int rc = armPeripheral(gPon, kPowerBit | kResinBit);
     if (!rc && gGpio >= 0) rc = armPeripheral(gGpio, kGpioBit);
     if (!rc && gCam >= 0) rc = armPeripheral(gCam, kGpioBit);
@@ -252,6 +283,7 @@ void buttonsThread(void *, wait_result_t) {
             void (*sink)(void *, uint32_t) = __atomic_load_n(&gSink, __ATOMIC_ACQUIRE);
             if (sink) {sink(gSinkContext, mask); native_buttons_stats[2] = native_buttons_stats[2] + 1;}
         }
+        if (gPolled) {IOSleep(kPollMs); continue;}
         assert_wait((event_t)&gEvents, THREAD_UNINT);
         if (gEvents != seen) clear_wait(current_thread(), THREAD_AWAKENED);
         else thread_block(THREAD_CONTINUE_NULL);
