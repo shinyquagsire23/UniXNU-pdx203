@@ -1564,9 +1564,33 @@ extern volatile int native_gpu_addon_files __attribute__((weak_import)), native_
     native_gpu_addon2_status __attribute__((weak_import)), native_gpu_addon3_stage __attribute__((weak_import)),
     native_gpu_addon3_status __attribute__((weak_import));
 }
+// The display's swap and transfer counters (package/LegacyDisplayProbe.cpp, the same kernel), printed as a DISPLAY row: whether
+// accepted swaps reach the scanout, and how long a copy takes.
+extern "C" {
+extern volatile uint32_t native_legacy_swap_validation_calls __attribute__((weak_import)),
+    native_legacy_swap_accepted_count __attribute__((weak_import)), native_legacy_swap_rejected_count __attribute__((weak_import)),
+    native_legacy_transfer_calls __attribute__((weak_import)), native_legacy_gpu_fallbacks __attribute__((weak_import)),
+    native_legacy_retirement_calls __attribute__((weak_import)), native_legacy_retired_generation __attribute__((weak_import)),
+    native_legacy_presented_generation __attribute__((weak_import));
+extern volatile int native_legacy_transfer_status __attribute__((weak_import));
+extern volatile uint64_t native_legacy_copy_n __attribute__((weak_import)), native_legacy_copy_last __attribute__((weak_import)),
+    native_legacy_copy_max __attribute__((weak_import));
+}
 namespace {
 char gPrinted[kRows][120];
 char gAddonPrinted[120];
+char gDisplayPrinted[160];
+void displayRow() {
+    if (!&native_legacy_transfer_calls || !&native_legacy_copy_n) return;
+    char row[160];
+    snprintf(row, sizeof row, "DISPLAY validate %u ok %u rej %u | transfer %u status %x | copies %llu last %llu us max %llu us | gpufb %u | retire %u gen %u/%u",
+             native_legacy_swap_validation_calls, native_legacy_swap_accepted_count, native_legacy_swap_rejected_count,
+             native_legacy_transfer_calls, (unsigned)native_legacy_transfer_status, (unsigned long long)native_legacy_copy_n,
+             (unsigned long long)(native_legacy_copy_last / 19), (unsigned long long)(native_legacy_copy_max / 19),
+             native_legacy_gpu_fallbacks, native_legacy_retirement_calls, native_legacy_retired_generation, native_legacy_presented_generation);
+    // the counters move every frame: print at most every 5 s (the caller's cadence decides), and only when something changed
+    if (strncmp(row, gDisplayPrinted, sizeof row)) {strlcpy(gDisplayPrinted, row, sizeof gDisplayPrinted); printf("%s\n", row);}
+}
 int addonValue(volatile int *value) {return value ? *value : -99;}
 void addonRow() {
     if (!&native_gpu_addon_files) return;
@@ -1586,6 +1610,7 @@ void gpuReportThread(void *, wait_result_t)
     uint32_t seen = ~0u;
     for (unsigned round = 0;; ++round) {
         addonRow();
+        if (round % 10 == 0) displayRow();   // every 5 s for the first ten minutes, every 50 s after
         uint32_t now = native_gpu_changes;
         if (now != seen) {
             seen = now;
