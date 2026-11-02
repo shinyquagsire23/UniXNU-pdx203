@@ -7,7 +7,8 @@
 //   charging   SMB5 CHGR 0x1000 (ppid 0x210) + 0x06 BATTERY_CHARGER_STATUS_1, bits 2:0: 0 inhibit, 1 trickle, 2 pre, 3 full-on,
 //              4 taper, 5 terminate, 6 pause, 7 disabled (smb5-reg.h); 1..4 charging, 5 full
 //   external   USBIN 0x1300 (ppid 0x213) + 0x10 USB_INT_RT_STS bit 4 USBIN_PLUGIN_RT_STS
-//   temperature FG BATT_INFO 0x4100 (ppid 0x241) + 0x50/0x51 BATT_TEMP, 10 bits of quarter kelvin
+// No temperature: gen4 reads the battery thermistor through the PMIC's ADC5 channel, not a gauge register (BATT_INFO 0x4150/51
+// read 0 on the phone, usb-64: -273 C), so none is published until that channel is driven.
 // Charging itself stays with the PMIC's own charger as the boot loader left it; nothing is written. powerd finds every
 // IOPMPowerSource, reads CurrentCapacity/MaxCapacity, IsCharging, ExternalConnected and listens for updateStatus; the status bar,
 // the lock screen's charging state and Settings > Battery follow. The voltage is not a register on this gauge (gen4 keeps it in its
@@ -24,12 +25,12 @@
 
 extern "C" int pdx203_spmi_read(uint32_t ppid, uint8_t addr, uint8_t *value);
 // [0] stage (1 class up, 2 timer running, 3 published; negative: the step that failed), [1] percent, [2] raw monotonic SOC,
-// [3] charger status, [4] USB present, [5] temperature (decidegrees C), [6] reads, [7] read failures, [8] last failure
+// [3] charger status, [4] USB present, [5] unused, [6] reads, [7] read failures, [8] last failure
 extern "C" {volatile int32_t native_battery_stats[10];}
 
 namespace {
 constexpr uint32_t kFastMs = 2000, kRefreshMs = 20000, kNominalMv = 3850;
-constexpr uint32_t kSocPpid = 0x240, kInfoPpid = 0x241, kChgrPpid = 0x210, kUsbPpid = 0x213;
+constexpr uint32_t kSocPpid = 0x240, kChgrPpid = 0x210, kUsbPpid = 0x213;
 }
 
 class Pdx203Battery : public IOPMPowerSource {
@@ -58,19 +59,17 @@ class Pdx203Battery : public IOPMPowerSource {
     }
     // One reading; false when the charge could not be read (the arbiter is not mapped yet, or the read failed).
     bool refresh() {
-        uint8_t msoc = 0, status = 0, usb = 0, tlo = 0, thi = 0;
+        uint8_t msoc = 0, status = 0, usb = 0;
         if (!read(kSocPpid, 0x09, &msoc)) return false;
         const bool haveStatus = read(kChgrPpid, 0x06, &status);
         const bool haveUsb = read(kUsbPpid, 0x10, &usb);
-        const bool haveTemp = read(kInfoPpid, 0x50, &tlo) && read(kInfoPpid, 0x51, &thi);
         const int percent = msoc == 0 ? 0 : msoc == 255 ? 100 : (int)(((msoc - 1) * 98 + 126) / 253) + 1;
         const int charger = haveStatus ? (status & 7) : -1;
         const bool external = haveUsb && (usb & (1u << 4));
         const bool charging = external && charger >= 1 && charger <= 4;
         const bool full = external && (charger == 5 || percent >= 100);
-        const int deciC = haveTemp ? (int)(((((uint32_t)thi & 3) << 8 | tlo) * 10 + 2) / 4) - 2730 : -9999;
         native_battery_stats[1] = percent; native_battery_stats[2] = msoc; native_battery_stats[3] = charger;
-        native_battery_stats[4] = external; native_battery_stats[5] = deciC;
+        native_battery_stats[4] = external;
         setBatteryInstalled(true);
         setExternalConnected(external);
         setExternalChargeCapable(external);
@@ -82,10 +81,9 @@ class Pdx203Battery : public IOPMPowerSource {
         setAmperage(0);
         setTimeRemaining(0xffff);
         flag("FullyCharged", full);
-        if (haveTemp) number("Temperature", deciC * 10);   // hundredths of a degree, as AppleSmartBattery
         if (percent != lastPercent || charger != lastStatus || (int)external != lastUsb) {
-            printf("BATTERY %d%% (msoc %u) charger %d%s usb %d temp %d.%d C\n", percent, msoc, charger,
-                charging ? " charging" : full ? " full" : "", external ? 1 : 0, deciC / 10, deciC < 0 ? -deciC % 10 : deciC % 10);
+            printf("BATTERY %d%% (msoc %u) charger %d%s usb %d\n", percent, msoc, charger, charging ? " charging" : full ? " full" : "",
+                external ? 1 : 0);
             lastPercent = percent; lastStatus = charger; lastUsb = external;
         }
         return true;
