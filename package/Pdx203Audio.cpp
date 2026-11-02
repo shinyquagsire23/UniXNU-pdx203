@@ -822,6 +822,34 @@ void printServe() {
            d ? d->loads : 0, d ? d->volume_milli : 0, d ? d->mix_peak : 0, d ? d->host_clock : 0, d ? d->host_clock_result : 0);
 }
 
+// The plug-in's record of what the audio server asked for (ShengAudioDiag: properties it does not answer) and of every distinct property
+// access, failing VirtualAudio call and VirtualAudio throw (ShengAudioTrace), printed as they appear.
+char fourcc(uint32_t v, unsigned shift) {const char c = (char)(v >> shift); return c >= 32 && c < 127 ? c : '.';}
+void printPlugin() {
+    static uint32_t diagShown, traceShown;
+    if (!gPath.ctl) return;
+    const uint8_t *page = reinterpret_cast<const uint8_t *>(gPath.ctl);
+    const ShengAudioDiag *d = reinterpret_cast<const ShengAudioDiag *>(page + SHENG_AUDIO_DIAG_OFFSET);
+    const ShengAudioTrace *t = reinterpret_cast<const ShengAudioTrace *>(page + SHENG_AUDIO_TRACE_OFFSET);
+    const uint32_t dn = d->count < SHENG_AUDIO_DIAG_SLOTS ? d->count : SHENG_AUDIO_DIAG_SLOTS;
+    for (; diagShown < dn; ++diagShown) {
+        const uint32_t v = d->selector[diagShown], w = d->where[diagShown];
+        printf("PDX203 HAL unanswered %u: '%c%c%c%c' object %u scope '%c'\n", diagShown, fourcc(v, 24), fourcc(v, 16), fourcc(v, 8), fourcc(v, 0),
+               w >> 24, fourcc(w, 0));
+    }
+    const uint32_t tn = t->count < SHENG_AUDIO_TRACE_SLOTS ? t->count : SHENG_AUDIO_TRACE_SLOTS;
+    for (; traceShown < tn; ++traceShown) {
+        const uint32_t v = t->entry[traceShown][0], w = t->entry[traceShown][1];
+        const uint32_t kind = w & 0xffff;
+        if (kind & 8)
+            printf("PDX203 HAL trace %u: VirtualAudio throw at +0x%x info %x\n", traceShown, v, w);
+        else
+            printf("PDX203 HAL trace %u: '%c%c%c%c' object %u scope '%c' %s%s%s\n", traceShown, fourcc(v, 24), fourcc(v, 16), fourcc(v, 8),
+                   fourcc(v, 0), w >> 24, fourcc(w, 16), (kind & 4) ? "va-call" : (kind & 1) ? "set" : "get", (kind & 2) ? " FAILED" : "",
+                   (kind & 4) ? " (failed in VirtualAudio)" : "");
+    }
+}
+
 void audioThread(void *, wait_result_t) {
     thread_set_thread_name(current_thread(), "pdx203-audio");
     unsigned mode = 0, delay = 40, beeps = 0;   // pdx203-audio-beeps=6 plays the test beeps before the service starts
@@ -887,6 +915,7 @@ void audioThread(void *, wait_result_t) {
         }
         AprMessage m;
         while (popMessage(m)) dispatch(m);
+        printPlugin();
         const uint32_t sig = (uint32_t)native_audio_service[1] << 24 ^ (uint32_t)native_audio_service[3] << 12 ^ gServe[0] ^ gServe[2] << 8;
         if (sig != lastServe || nowMs() >= nextRow) {
             lastServe = sig;
