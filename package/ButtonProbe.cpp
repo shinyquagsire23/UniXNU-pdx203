@@ -116,7 +116,9 @@ int findApid(uint32_t ppid, bool *owned) {
         const uint32_t map = gCore.va[(gApidMap + 4 * i) / 4];
         if (!map || ((map >> 8) & 0xfff) != ppid) continue;
         const bool irqOwner = (map >> 24) & 1;
-        const uint32_t ee = gCnfg.va[(0x00 + 4 * i) / 4] & 7u;
+        // The owning EE is in SPMI_OWNERSHIP_TABLE_REG(apid) = cnfg + 0x700 + 4 * apid (spmi-pmic-arb.c); alioth's copy read
+        // cnfg + 4 * apid, another register, so every "owner" it printed was wrong (pdx203 usb-63/67).
+        const uint32_t ee = gCnfg.va[(0x700 + 4 * i) / 4] & 7u;
         printf("BUTTONS ppid %03x apid %u map %08x irq-owner %d ee %u\n", ppid, i, map, irqOwner ? 1 : 0, ee);
         const bool mine = irqOwner && ee == 0;
         if (found < 0 || (mine && !*owned)) {found = (int)i; *owned = mine;}
@@ -220,7 +222,8 @@ bool setup() {
     if (gPon < 0) {fail(4, -2); return false;}
     native_buttons_stats[0] = 2;
     // Interrupts only when this EE owns every key's APID it found; otherwise the thread polls the levels.
-    gPolled = !ponOwned || (gGpio >= 0 && !gpioOwned) || (gCam >= 0 && !camOwned);
+    // Polled regardless for now: the interrupt path has not run on this board (the ownership read that ruled it out was wrong).
+    gPolled = true || !ponOwned || (gGpio >= 0 && !gpioOwned) || (gCam >= 0 && !camOwned);
     printf("BUTTONS pon %d%s vol- gpio %d%s cam gpio %d%s -> %s\n", gPon, ponOwned ? "" : " (not ours)", gGpio,
         gpioOwned ? "" : " (not ours)", gCam, camOwned ? "" : " (not ours)", gPolled ? "polling" : "interrupts");
     // The key pads as Sony's pinctrl leaves them: digital input (MODE_CTL 0x40 mode bits 0), 30 uA pull-up (DIG_PULL_CTL
@@ -328,10 +331,9 @@ void haltRestart(int reboot) {
     uint8_t ctl = 0, ctl2 = 0;
     printf("BOARD %s: PON apid %d, type %x\n", reboot ? "restart" : "shutdown", gPonWrite, type);
     haltSpin(50000);
-    // usb-67: the first write through APID 1's channel wedged the CPU (reads worked: ctl 01 warm reset, ctl2 80 enabled), so the
-    // PON is only written when boot argument pdx203-halt-pon=1 asks for it; by default PS_HOLD is dropped with the type the boot
-    // loader left (warm reset, so shutdown restarts for now).
-    unsigned ponWrites = 0;
+    // usb-67: the first write through APID 1's channel wedged the CPU; that APID was picked by an ownership read at the wrong
+    // offset. findWritableApid now takes the APID spmi-pmic-arb itself would write through.
+    unsigned ponWrites = 1;   // the PON APID is now the one Linux writes through (ownership EE 0); pdx203-halt-pon=0 skips the writes
     PE_parse_boot_argn("pdx203-halt-pon", &ponWrites, sizeof ponWrites);
     if (gPonWrite >= 0 && ponWrites != 1) {
         int rc = read8(gPonWrite, 0x5A, &ctl); rc |= read8(gPonWrite, 0x5B, &ctl2);
@@ -364,11 +366,14 @@ void haltRestart(int reboot) {
 }
 // The PON APID whose channel this EE may write: owner EE 0 in the ownership table.
 int findWritableApid(uint32_t ppid) {
+    int found = -1;
     for (uint32_t i = 0; i < gApids; ++i) {
         const uint32_t map = gCore.va[(gApidMap + 4 * i) / 4];
-        if (map && ((map >> 8) & 0xfff) == ppid && (gCnfg.va[i] & 7u) == 0) return (int)i;
+        // As pmic_arb_read_apid_map_v5: the APID a write goes through is the last one mapped to the PPID whose ownership entry
+        // (cnfg + 0x700 + 4 * apid, bits 2:0) names this EE (0). Map bit 24 marks the APID whose owner gets the interrupts.
+        if (map && ((map >> 8) & 0xfff) == ppid && (gCnfg.va[(0x700 + 4 * i) / 4] & 7u) == 0) found = (int)i;
     }
-    return -1;
+    return found;
 }
 }  // namespace
 extern "C" void pdx203_halt_install(void) {
