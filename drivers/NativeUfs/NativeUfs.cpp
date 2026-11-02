@@ -1269,6 +1269,61 @@ extern "C" unsigned native_ufs_store_gpt_check (void)
   return rootCrc32 (entries, gStoreGeometry.entryCount * 128) == gStoreGeometry.entriesCrc ? 0 : 5;
 }
 
+// ---- Read-only access to the other partitions ------------------------------------------------------------------------
+// For board code that reads firmware in place (pdx203: the audio DSP image in modem_a's FAT volume). native_ufs_part_find looks
+// the name up in the GPT of each LUN in kPartLuns (the SM8250 phones carry the firmware partitions on LUN 4; only LUNs every
+// such device has are read, since a command to a missing LUN is not worth the risk to the root transport). Reads never write.
+static const uint8_t kPartLuns[] = { 4, 0, 5, 1, 2, 3 };
+
+// 1 and the partition's LUN, first 4096-byte LBA and size in blocks; 0 when the host is not up or no LUN has the name.
+extern "C" int native_ufs_part_find (const char *name, uint32_t *lun, uint64_t *first, uint64_t *blocks)
+{
+  if (!gHost.ready || !name || !name[0] || strlen (name) > 36) return 0;
+  uint8_t *block = static_cast<uint8_t *> (IOMallocData (4096));
+  if (!block) return 0;
+  int found = 0;
+  for (unsigned l = 0; l < sizeof kPartLuns && !found; l++) {
+    const uint8_t unit = kPartLuns[l];
+    if (hostRead4k (unit, 1, 1, block) != kIOReturnSuccess || memcmp (block, "EFI PART", 8)) continue;
+    const uint64_t entriesLba = le64 (block + 72);
+    const uint32_t count = le32 (block + 80), size = le32 (block + 84);
+    if (size < 128 || size > 4096 || (size & (size - 1)) || count > 1024 || !entriesLba) continue;
+    const uint32_t perBlock = 4096 / size;
+    for (uint32_t index = 0; index < count && !found; index += perBlock) {
+      if (hostRead4k (unit, entriesLba + index / perBlock, 1, block) != kIOReturnSuccess) break;
+      for (uint32_t k = 0; k < perBlock && index + k < count && !found; k++) {
+        const uint8_t *entry = block + k * size;
+        const uint64_t start = le64 (entry + 32), end = le64 (entry + 40);
+        if (!start || end < start) continue;
+        unsigned c = 0;
+        while (c < 36 && name[c] && entry[56 + 2 * c] == uint8_t (name[c]) && !entry[57 + 2 * c]) c++;
+        if (name[c] || (c < 36 && (entry[56 + 2 * c] || entry[57 + 2 * c]))) continue;
+        if (lun) *lun = unit;
+        if (first) *first = start;
+        if (blocks) *blocks = end - start + 1;
+        found = 1;
+      }
+    }
+  }
+  IOFreeData (block, 4096);
+  return found;
+}
+
+// 1 when `blocks` 4096-byte blocks of LUN `lun` from `lba` are in dst.
+extern "C" int native_ufs_part_read (uint32_t lun, uint64_t lba, uint32_t blocks, void *dst)
+{
+  if (!gHost.ready || !dst || !blocks || lun > 7) return 0;
+  uint8_t *out = static_cast<uint8_t *> (dst);
+  while (blocks) {
+    const uint32_t chunk = blocks > kDataMax / 4096 ? static_cast<uint32_t> (kDataMax / 4096) : blocks;
+    if (hostRead4k (uint8_t (lun), lba, chunk, out) != kIOReturnSuccess) return 0;
+    out += chunk * 4096ULL;
+    lba += chunk;
+    blocks -= chunk;
+  }
+  return 1;
+}
+
 // One read-only window of the root image as a block device: 512-byte sectors on top of 4096-byte
 // UFS blocks, so the unchanged dmg disk images (GPT with 512-byte sectors) parse as they do on
 // the virtio path.

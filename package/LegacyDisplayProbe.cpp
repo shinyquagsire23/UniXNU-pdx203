@@ -518,6 +518,10 @@ extern "C" void pdx203_buttons_probe(void);
 // the battery as an IOPMPowerSource (package/Pdx203Battery.cpp; pdx203-battery=1): PM8150B fuel gauge and charger over the
 // arbiter the button thread maps
 extern "C" void pdx203_battery_probe(void);
+// the audio DSP (package/AdspProbe.cpp, sheng's for SM8250; pdx203-adsp=<mode>) and the speaker path on top of it
+// (package/Pdx203Audio.cpp; pdx203-audio=<bits>): their own threads, nothing without the arguments
+extern "C" void sheng_adsp_probe(void);
+extern "C" void pdx203_audio_probe(void);
 void native_legacy_display_late_probe(void) {
     pdx203_cpufreq_start();
     pdx203_gpu_start();
@@ -525,6 +529,8 @@ void native_legacy_display_late_probe(void) {
     (void)native_hid_input_probe();
     pdx203_buttons_probe();
     pdx203_battery_probe();
+    sheng_adsp_probe();
+    pdx203_audio_probe();
     unsigned touch=0;
     if(PE_parse_boot_argn("pdx203-touch",&touch,sizeof(touch)) && touch==1)(void)pdx203_touch_start();
     IOService *display=pendingLegacyDisplay;if(!display)return;pendingLegacyDisplay=nullptr;

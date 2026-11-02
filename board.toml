@@ -222,6 +222,12 @@ kernel_args = [
   # the battery (package/Pdx203Battery.cpp): an IOPMPowerSource with the PM8150B fuel gauge's monotonic SOC, the charger status
   # and USB presence read over SPMI through the buttons' arbiter mapping (needs pdx203-bt). BATTERY rows on the console.
   "pdx203-battery=1",
+  # the audio DSP (package/AdspProbe.cpp, sheng's ADSP bring-up for SM8250): 2 loads adsp from modem_a's FAT volume (read in
+  # place through NativeUfs), starts it with the secure world, answers its service locator and brings up GLINK (1 only surveys).
+  "pdx203-adsp=2",
+  # speaker path stage 1 (package/Pdx203Audio.cpp): 1 reads the two CS35L41 amplifiers' identity over I2C, 2 asks the DSP's APR
+  # core service whether audio is up. ADSP / QRTR / AUDIO / APR rows on the console.
+  "pdx203-audio=3",
   # the AppleKeyStore stand-in (package/KeyStoreProbe.cpp + drivers/NativeKeyStoreEvents, alioth's pair). without a SEP and
   # its keybag the lock screen asks for a passcode nothing can satisfy (2026-11-01, touch boot); this owned AppleKeyStore
   # answers "no passcode, nothing locked". alioth: add sheng-aks-sls=3 only if the prompt survives
