@@ -8,10 +8,12 @@
 // GCC (Linux gcc-sm8250.c): wrapper 0 core 2x / core / m_ahb / s_ahb and s2 are vote bits 9, 8, 6, 7 and 12 of 0x52008; the s2 clock
 // source (an RCG with DFS) is at 0x17270.
 //
-// Boot argument pdx203-audio (bits): 1 reads the amplifiers' identity over I2C; 2 talks to the audio DSP's APR core service over GLINK
-// channel "apr_audio_svc" (needs pdx203-adsp=2): it asks whether the DSP's audio framework is up (AVCS_CMD_ADSP_EVENT_GET_STATE) and
-// for its service versions (AVCS_GET_VERSIONS). Rows print as "PDX203 ADSP", "PDX203 QRTR", "PDX203 AUDIO" and "PDX203 APR" on the
-// console whenever something changed, for ten minutes.
+// Boot argument pdx203-audio (bits): 1 reads the amplifiers' identity over I2C; 2 opens the audio DSP's APR channel "apr_audio_svc"
+// over GLINK (needs pdx203-adsp=2); 4 (with 1 and 2) plays test beeps pdx203-audio-delay seconds (default 40) after the probe starts:
+// pdx203-audio-beeps (default 5) beeps of 1 s of 750 Hz at -20 dBFS, 2 s apart, through AFE port SENARY_MI2S_RX, an ADM COPP and an
+// ASM stream (/tmp/kmdconn/q6-playback-spec.md), with the CS35L41s set up to play ASP RX1 without their DSP
+// (/tmp/kmdconn/cs35l41-init-spec.md) at pdx203-audio-vol (AMP_DIG_VOL_CTRL, default 0xbe80 = -6 dB) and pdx203-audio-gain
+// (AMP_GAIN_CTRL, default 0 = 0.5 dB). Rows print as "PDX203 ADSP", "QRTR", "AUDIO", "APR" and "PLAY" on the console.
 #include <IOKit/IOLib.h>
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -23,6 +25,8 @@
 extern "C" {
 #include "ShengAdsp.h"
 #include "GeniI2c.h"
+#include "Cs35l41Otp.h"
+#include "SmmuBypass.h"
 }
 
 extern "C" ShengAdspChannel *sheng_adsp_channel(const char *, uint32_t, uint32_t, int, const ShengAdspClient *, void *) __attribute__((weak_import));
@@ -38,7 +42,7 @@ extern char native_qrtr_text[96] __attribute__((weak_import));
 // of the low 16 bits | status << 16), [12] SE2 rcg cfg, [13] SE2 DFS, [14] GCC vote word after voting, [15] ms from start
 volatile int32_t pdx203_audio_stats[16];
 // Per amplifier: DEVID, REVID, OTPID, IRQ1 status 1
-volatile uint32_t pdx203_audio_amps[2][4];
+volatile uint32_t pdx203_audio_amps[2][8];
 }
 
 namespace {
@@ -157,6 +161,96 @@ bool ampRead(unsigned amp, uint32_t reg, uint32_t *value) {
     *value = (rx & 0xff) << 24 | ((rx >> 8) & 0xff) << 16 | ((rx >> 16) & 0xff) << 8 | rx >> 24;
     return true;
 }
+bool ampWrite(unsigned amp, uint32_t reg, uint32_t value) {
+    const uint8_t b[8] = {uint8_t(reg >> 24), uint8_t(reg >> 16), uint8_t(reg >> 8), uint8_t(reg),
+                          uint8_t(value >> 24), uint8_t(value >> 16), uint8_t(value >> 8), uint8_t(value)};
+    return transfer(kAmpAddress[amp], b, 8, 0);
+}
+bool ampRmw(unsigned amp, uint32_t reg, uint32_t mask, uint32_t value) {
+    uint32_t v = 0;
+    return ampRead(amp, reg, &v) && ampWrite(amp, reg, (v & ~mask) | (value & mask));
+}
+bool ampUnlock(unsigned amp) {return ampWrite(amp, 0x40, 0x55) && ampWrite(amp, 0x40, 0xaa);}
+bool ampLock(unsigned amp) {return ampWrite(amp, 0x40, 0xcc) && ampWrite(amp, 0x40, 0x33);}
+// Polls reg until (value & bit), every 1 ms for at most 100 ms.
+bool ampPoll(unsigned amp, uint32_t reg, uint32_t bit) {
+    for (unsigned i = 0; i < 100; ++i) {uint32_t v = 0; if (ampRead(amp, reg, &v) && (v & bit)) return true; IOSleep(1);}
+    return false;
+}
+
+// ---- CS35L41 set-up for ASP RX1 straight to the DAC, the HALO DSP halted and never loaded (/tmp/kmdconn/cs35l41-init-spec.md:
+// Linux cs35l41-lib.c / cs35l41.c / cs35l41_hda.c, Sony's driver for the board values). 16-bit I2S slots at 48 kHz, BCLK 1.536 MHz.
+// Per amplifier: [0] DEVID, [1] REVID, [2] OTPID, [3] IRQ1 status 1 at the last look, then the bring-up: [4] the step that failed
+// (0: none), [5] IRQ1 status 3 (bit 1 PLL lock), [6] PWR_CTRL2, [7] OTP fields written.
+uint32_t gAmpVolume = 0xbe80, gAmpGain = 0;   // -6 dB digital, 0.5 dB analog (pdx203-audio-vol / -gain override)
+
+int ampOtpUnpack(unsigned amp) {
+    uint32_t id = 0, otp[24];
+    if (!ampRead(amp, 0x10, &id)) return 1;
+    if (id != 0x01 && id != 0x08) return 2;   // only map 1 is carried (the pdx203 parts read 0x08)
+    for (unsigned i = 0; i < 24; ++i) if (!ampRead(amp, 0x400 + 4 * i, &otp[i])) return 3;
+    unsigned pos = CS35L41_OTP_START_BIT, written = 0;
+    for (const Cs35l41OtpField &f : kCs35l41OtpMap1) {
+        uint32_t value = 0;
+        for (unsigned k = 0; k < f.size; ++k, ++pos) value |= ((otp[pos / 32] >> (pos % 32)) & 1u) << k;
+        if (!f.reg) continue;
+        const uint32_t mask = (f.size == 32 ? 0xffffffffu : ((1u << f.size) - 1)) << f.shift;
+        if (!ampRmw(amp, f.reg, mask, value << f.shift)) return 4;
+        ++written;
+    }
+    pdx203_audio_amps[amp][7] = written;
+    return 0;
+}
+
+// Once after the shared reset: OTP boot, errata, trim, HALO halt, interrupt pin, boost, the ASP format and routing, muted.
+int ampInit(unsigned amp) {
+    uint32_t v = 0;
+    if (!ampPoll(amp, 0x1001c, 0x2)) return 10;                       // OTP_BOOT_DONE
+    if (!ampRead(amp, 0x10018, &v) || (v & 0x80000000u)) return 11;   // OTP_BOOT_ERR
+    if (!ampUnlock(amp)) return 12;
+    static const uint32_t errata[][2] = {{0x4100, 0}, {0x4310, 0}, {0x4400, 0}, {0x381c, 0x51}, {0x02bc20e0, 0}, {0x02bc2020, 0},
+                                         {0x2018, 0}, {0x6c04, 0}, {0x4c28, 0}, {0x4c2c, 0}, {0x02bc1000, 0}};
+    for (const auto &w : errata) if (!ampWrite(amp, w[0], w[1])) return 13;
+    if (const int rc = ampOtpUnpack(amp)) return 20 + rc;
+    if (!ampLock(amp)) return 14;
+    static const uint32_t setup[][3] = {   // reg, mask, value (mask 0: plain write)
+        {0x11008, 0x80001000, 0x80000000}, {0x1100c, 0x80001000, 0}, {0x242c, 0x07000000, 0x02000000}, {0x10110, 0, 0x7ffcfe3f},
+        {0x3810, 0xffff, 0x2424}, {0x3814, 0xff03, 0x7500}, {0x3808, 0x7f, 0x40}, {0x2018, 0x30, 0x20}, {0x480c, 0x3, 0x3},
+        {0x2c04, 0, 0x370}, {0x2c0c, 0x1f, 0x3}, {0x2c08, 0, 0x3}, {0x4804, 0, 0x1b}, {0x4808, 0, 0x10100200}, {0x4840, 0x3f, 0x10},
+        {0x4820, 0x3f3f, 0}, {0x4c00, 0x7f, 0x8}, {0x4800, 0, 0x10000}, {0x6000, 0, 0xa678}, {0x6c04, 0, 0}, {0x201c, 0x10, 0x10},
+    };
+    for (const auto &w : setup) {
+        uint32_t value = w[2];
+        if (w[0] == 0x4820) value = amp ? 0x0001 : 0x0100;   // the left amplifier plays slot 0, the right one slot 1 (Sony's)
+        if (!(w[1] ? ampRmw(amp, w[0], w[1], value) : ampWrite(amp, w[0], value))) return 15;
+    }
+    // TST_FS_MON0 for BCLK 1.536 MHz: FS1 = 52, FS2 = 84 (Sony's dai_set_sysclk formula), under the test key
+    if (!ampUnlock(amp) || !ampWrite(amp, 0x2d10, 0x00054034) || !ampLock(amp)) return 16;
+    return 0;
+}
+
+// With BCLK and LRCLK running: the power-up patch, global enable, PUP_DONE, amplifier on, unmute; then the status words.
+int ampStart(unsigned amp) {
+    if (!ampUnlock(amp) || !ampWrite(amp, 0x2084, 0x002f1aa0) || !ampLock(amp)) return 30;
+    if (!ampRmw(amp, 0x2014, 0x1, 0x1)) return 31;
+    if (!ampPoll(amp, 0x10010, 0x01000000)) return 32;
+    if (!ampWrite(amp, 0x10010, 0x01000000) || !ampRmw(amp, 0x2018, 0x1, 0x1)) return 33;
+    if (!ampWrite(amp, 0x6000, gAmpVolume) || !ampWrite(amp, 0x6c04, gAmpGain)) return 34;
+    return 0;
+}
+void ampStatus(unsigned amp) {
+    uint32_t s1 = 0, s3 = 0, p2 = 0;
+    ampRead(amp, 0x10010, &s1); ampRead(amp, 0x10018, &s3); ampRead(amp, 0x2018, &p2);
+    pdx203_audio_amps[amp][3] = s1; pdx203_audio_amps[amp][5] = s3; pdx203_audio_amps[amp][6] = p2;
+}
+int ampStop(unsigned amp) {
+    if (!ampWrite(amp, 0x6c04, 0) || !ampWrite(amp, 0x6000, 0xa678)) return 40;
+    if (!ampRmw(amp, 0x2018, 0x1, 0) || !ampRmw(amp, 0x2014, 0x1, 0)) return 41;
+    const bool down = ampPoll(amp, 0x10010, 0x00800000);
+    ampWrite(amp, 0x10010, 0x00800000);
+    if (!ampUnlock(amp) || !ampWrite(amp, 0x2084, 0x002f1aa3) || !ampLock(amp)) return 42;
+    return down ? 0 : 43;
+}
 
 void probeAmps() {
     if (!mapRegion(kGcc, 0x60000, gGcc) || !mapRegion(kSe2, 0x4000, gSe)) {fail(1, -12); return;}
@@ -195,15 +289,25 @@ struct AprHeader {
 };
 static_assert(sizeof(AprHeader) == 20, "APR header");
 constexpr uint16_t kAprSeqCmd = (2u << 8) | ((sizeof(AprHeader) / 4) << 4);   // APR_HDR_FIELD(SEQ_CMD, APR_HDR_LEN(20), version 0)
-constexpr uint8_t kDomainAdsp = 4, kDomainApps = 5, kSvcCore = 3;
-constexpr uint32_t kBasicResult = 0x000110e8, kGetState = 0x0001326c, kGetStateRsp = 0x0001326d, kGetVersions = 0x00012905,
-                   kGetVersionsRsp = 0x00012906;
+constexpr uint8_t kDomainAdsp = 4, kDomainApps = 5;
+constexpr uint8_t kSvcAfe = 4, kSvcAsm = 7, kSvcAdm = 8;
+// Opcodes (/tmp/kmdconn/q6-playback-spec.md: downstream apr_audio-v2.h, q6afe.c, q6asm.c, q6adm.c on kona)
+constexpr uint32_t kBasicResult = 0x000110e8;
+constexpr uint32_t kAfeVote = 0x000100f4, kAfeVoteRsp = 0x000100f5, kAfeDevote = 0x000100f6, kAfeSvcSetParam = 0x000100f3,
+                   kAfePortSetParam = 0x000100ef, kAfeStart = 0x000100e5, kAfeStop = 0x000100e6;
+constexpr uint32_t kAsmMap = 0x00010d92, kAsmMapRsp = 0x00010d93, kAsmUnmap = 0x00010d94, kAsmOpenWrite = 0x00010db3,
+                   kAsmMediaFmt = 0x00010d98, kAsmRun = 0x00010daa, kAsmWrite = 0x00010dab, kAsmWriteDone = 0x00010d99,
+                   kAsmPause = 0x00010bd3, kAsmClose = 0x00010bcd;
+constexpr uint32_t kAdmOpen = 0x00010326, kAdmOpenRsp = 0x00010329, kAdmMap = 0x00010325, kAdmClose = 0x00010327;
+constexpr uint16_t kSenMi2sRx = 0x1018, kAsmPort = 0x0101;   // session 1, stream 1
+constexpr uint32_t kAsmSession = 1;
 
 ShengAdspChannel *gApr;
 volatile uint32_t gAprUp;
-// Messages the DSP thread hands over: a small ring, copied out by the audio thread.
-struct AprMessage {uint32_t length; uint8_t data[256];};
-AprMessage gRing[8];
+// Messages the DSP thread hands over, already split at the header's own length (APRv2.1 replies carry a 32-byte header: trace word and
+// timestamp after the 20 bytes of v2), copied out by the audio thread.
+struct AprMessage {uint32_t opcode, token, words; uint16_t src_port, dest_port; uint8_t src_svc, version; uint32_t payload[24];};
+AprMessage gRing[16];
 volatile uint32_t gRingHead, gRingTail;
 volatile uint32_t gWake;
 
@@ -215,19 +319,20 @@ void aprState(void *, int up) {
 }
 void aprReceive(void *, const uint8_t *data, uint32_t length) {
     pdx203_audio_stats[6] = pdx203_audio_stats[6] + 1;
+    if (length < sizeof(AprHeader)) return;
+    AprHeader h;
+    memcpy(&h, data, sizeof h);
+    const uint32_t headerBytes = ((h.hdr_field >> 4) & 0xfu) * 4u;
+    if (headerBytes < sizeof(AprHeader) || headerBytes > length) return;
     const uint32_t head = gRingHead;
-    if (head - __atomic_load_n(&gRingTail, __ATOMIC_ACQUIRE) >= 8) return;   // full: dropped (counted in [6] only)
-    AprMessage &m = gRing[head % 8];
-    m.length = length < sizeof m.data ? length : sizeof m.data;
-    memcpy(m.data, data, m.length);
+    if (head - __atomic_load_n(&gRingTail, __ATOMIC_ACQUIRE) >= 16) {pdx203_audio_stats[9] = pdx203_audio_stats[9] + 1; return;}
+    AprMessage &m = gRing[head % 16];
+    m.opcode = h.opcode; m.token = h.token; m.src_port = h.src_port; m.dest_port = h.dest_port; m.src_svc = h.src_svc;
+    m.version = (uint8_t)(h.hdr_field & 0xf);
+    m.words = (length - headerBytes) / 4 > 24 ? 24 : (length - headerBytes) / 4;
+    memcpy(m.payload, data + headerBytes, m.words * 4);
     __atomic_store_n(&gRingHead, head + 1, __ATOMIC_RELEASE);
     wakeAudio();
-}
-bool aprSend(uint8_t svc, uint32_t opcode, uint32_t token) {
-    AprHeader h = {kAprSeqCmd, sizeof(AprHeader), svc, kDomainApps, 0, svc, kDomainAdsp, 0, token, opcode};
-    if (!sheng_adsp_send || sheng_adsp_send(gApr, &h, sizeof h)) return false;
-    pdx203_audio_stats[7] = pdx203_audio_stats[7] + 1;
-    return true;
 }
 void sleepMs(uint32_t ms) {
     if (__atomic_exchange_n(&gWake, 0, __ATOMIC_ACQ_REL)) return;
@@ -236,23 +341,312 @@ void sleepMs(uint32_t ms) {
     thread_block(THREAD_CONTINUE_NULL);
     __atomic_store_n(&gWake, 0, __ATOMIC_RELEASE);
 }
-
-void handleApr(const AprMessage &m) {
-    if (m.length < sizeof(AprHeader)) return;
-    AprHeader h;
-    memcpy(&h, m.data, sizeof h);
-    const uint32_t *payload = reinterpret_cast<const uint32_t *>(m.data + sizeof h);
-    const uint32_t words = (m.length - sizeof h) / 4;
-    pdx203_audio_stats[10] = (int32_t)h.opcode;
-    char text[160];
+bool popMessage(AprMessage &m) {
+    const uint32_t tail = __atomic_load_n(&gRingTail, __ATOMIC_ACQUIRE);
+    if (tail == __atomic_load_n(&gRingHead, __ATOMIC_ACQUIRE)) return false;
+    m = gRing[tail % 16];
+    __atomic_store_n(&gRingTail, tail + 1, __ATOMIC_RELEASE);
+    pdx203_audio_stats[10] = (int32_t)m.opcode;
+    return true;
+}
+void logMessage(const char *why, const AprMessage &m) {
+    char text[140];
     unsigned at = 0;
-    for (uint32_t i = 0; i < words && i < 12 && at + 10 < sizeof text; ++i) at += snprintf(text + at, sizeof text - at, " %x", payload[i]);
+    for (uint32_t i = 0; i < m.words && i < 8 && at + 10 < sizeof text; ++i) at += snprintf(text + at, sizeof text - at, " %x", m.payload[i]);
     text[at] = 0;
-    printf("PDX203 APR in op %x from %u:%u:%u to %u:%u:%u token %x len %u:%s\n", h.opcode, h.src_domain, h.src_svc, h.src_port,
-           h.dest_domain, h.dest_svc, h.dest_port, h.token, m.length, text);
-    if (h.opcode == kBasicResult && words >= 2) pdx203_audio_stats[11] = (int32_t)((payload[0] & 0xffff) | payload[1] << 16);
-    if (h.opcode == kGetStateRsp && words >= 1) pdx203_audio_stats[8] = (int32_t)payload[0];
-    if (h.opcode == kGetVersionsRsp) printf("PDX203 APR versions: %u words\n", words);
+    printf("PDX203 APR %s op %x svc %u port %x->%x token %x v%u:%s\n", why, m.opcode, m.src_svc, m.src_port, m.dest_port, m.token, m.version, text);
+}
+
+// ---- the playback path (pdx203-audio bit 4) ----
+// [0] step (positive progress, negative the step that failed), [1] the DSP status of the last command, [2] MACRO vote handle, [3] DCODEC
+// vote handle, [4] memory map handle, [5] COPP id, [6] writes sent, [7] writes returned, [8] writes returned with an error, [9] SMMU
+// (slot | bank << 8, or -1 refused), [10] left amplifier start result, [11] right, [12] messages we did not expect, [13] beeps played
+volatile int32_t gPlay[16];
+const char *gSmmuError = "";
+volatile uint32_t gWritesDone;
+
+// Packets: little-endian fields at byte offsets after the 20-byte command header.
+struct Packet {
+    uint8_t b[128] = {};
+    uint32_t size = 0;
+    Packet(uint8_t svc, uint16_t srcPort, uint16_t dstPort, uint32_t token, uint32_t opcode, uint32_t bytes) {
+        size = bytes;
+        AprHeader h = {kAprSeqCmd, (uint16_t)bytes, svc, kDomainApps, srcPort, svc, kDomainAdsp, dstPort, token, opcode};
+        memcpy(b, &h, sizeof h);
+    }
+    void u16(uint32_t at, uint16_t v) {memcpy(b + at, &v, 2);}
+    void u32(uint32_t at, uint32_t v) {memcpy(b + at, &v, 4);}
+    void u8(uint32_t at, uint8_t v) {b[at] = v;}
+    uint32_t opcode() const {uint32_t v; memcpy(&v, b + 16, 4); return v;}
+};
+
+// Sends the packet and waits up to ms for its answer: the given reply opcode, or the basic result naming this command. Anything else
+// that arrives meanwhile is handled as a playback event (write done) or logged. Returns the DSP status (0 ok), -60 on timeout, -5 if the
+// send was refused; reply gets the answer's payload.
+void otherMessage(const AprMessage &m) {
+    if (m.opcode == kAsmWriteDone) {
+        gPlay[7] = gPlay[7] + 1;
+        if (m.words >= 4 && m.payload[3]) gPlay[8] = gPlay[8] + 1;
+        __atomic_fetch_add(&gWritesDone, 1u, __ATOMIC_RELEASE);
+        return;
+    }
+    gPlay[12] = gPlay[12] + 1;
+    logMessage("event", m);
+}
+int aprCall(const Packet &p, uint32_t reply, AprMessage *answer = nullptr, uint32_t ms = 2000) {
+    if (!sheng_adsp_send || sheng_adsp_send(gApr, p.b, p.size)) return -5;
+    pdx203_audio_stats[7] = pdx203_audio_stats[7] + 1;
+    const uint32_t op = p.opcode();
+    uint64_t deadline;
+    clock_interval_to_deadline(ms, kMillisecondScale, &deadline);
+    for (;;) {
+        AprMessage m;
+        while (popMessage(m)) {
+            if (m.opcode == kBasicResult && m.words >= 2 && m.payload[0] == op) {
+                gPlay[1] = (int32_t)m.payload[1];
+                if (m.payload[1]) logMessage("error", m);
+                if (answer) *answer = m;
+                return (int)m.payload[1];
+            }
+            if (reply && m.opcode == reply) {
+                if (answer) *answer = m;
+                gPlay[1] = 0;
+                return 0;
+            }
+            otherMessage(m);
+        }
+        if (mach_absolute_time() >= deadline) {printf("PDX203 APR timeout op %x\n", op); return -60;}
+        sleepMs(20);
+    }
+}
+
+// The apps SMMU stream the DSP's audio buffers arrive with (kona-audio.dtsi msm-audio-ion: iommus <&apps_smmu 0x1801 0>), mapped
+// pass-through into the bypass bank NativeUfs already uses (SmmuBypass.h, sheng's). The buffer: 64 KiB of PIL CVP (0x87300000), DRAM
+// below 4 GiB the firmware reserves for a coprocessor this board never starts; the DSP gets its physical address with the stream's
+// index (1) in the upper word, as msm_audio_ion and Linux q6asm-dai hand it out.
+constexpr uint64_t kSmmu = 0x15000000, kSmmuSize = 0x100000, kBufPhys = 0x87300000, kBufSize = 0x10000;
+constexpr uint16_t kAudioStream = 0x1801;
+constexpr uint32_t kBufMsw = 1;
+constexpr uint32_t kPeriodFrames = 480, kPeriodBytes = kPeriodFrames * 4, kSlotBytes = 2048, kSlots = 8;
+Region gSmmuMap, gBuf, gLpi;
+uint32_t smmuRd(void *ctx, unsigned at) {return *reinterpret_cast<volatile uint32_t *>(reinterpret_cast<uintptr_t>(ctx) + at);}
+void smmuWr(void *ctx, unsigned at, uint32_t value) {
+    *reinterpret_cast<volatile uint32_t *>(reinterpret_cast<uintptr_t>(ctx) + at) = value;
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+bool smmuPassThrough() {
+    if (!mapRegion(kSmmu, kSmmuSize, gSmmuMap)) {gSmmuError = "map"; return false;}
+    const smmu_io io = {reinterpret_cast<void *>(gSmmuMap.va), smmuRd, smmuWr};
+    const smmu_plan plan = smmu_plan_bypass(&io, kAudioStream, kBufPhys, kBufSize);
+    const char *error = smmu_configure_bypass(&io, &plan, kAudioStream);
+    if (error) {gSmmuError = error; gPlay[9] = -1; return false;}
+    gPlay[9] = (int32_t)(plan.slot | plan.bank << 8 | (plan.reuse ? 1u << 16 : 0) | (plan.bank_ready ? 1u << 17 : 0));
+    return true;
+}
+
+// The LPASS LPI pins of the senary MI2S (Sony kona-edo-common.dtsi lpi_i2s2: gpio10 SCK func1, gpio11 WS func1, gpio12 SD0 func2,
+// gpio13 SD1 func2; 2 mA, no pull); Linux pinctrl-lpass-lpi.h: pin n at 0x033c0000 + n * 0x1000, function in bits 5:2, drive 8:6.
+// Only touched while the MACRO vote is held (the LPI TLMM refuses access without it).
+bool lpiPins() {
+    if (!mapRegion(0x033c0000 + 10 * 0x1000, 4 * 0x1000, gLpi)) return false;
+    const unsigned funcs[4] = {1, 1, 2, 2};
+    for (unsigned i = 0; i < 4; ++i) wr(gLpi, i * 0x1000, (rd(gLpi, i * 0x1000) & ~0x1ffu) | funcs[i] << 2);
+    return true;
+}
+
+int afeVote(uint32_t block, int32_t *handle) {
+    Packet p(kSvcAfe, 0, 0, block, kAfeVote, 0x20);
+    p.u32(0x14, block);
+    memcpy(p.b + 0x18, "LPASS_H", 8);
+    AprMessage m;
+    const int rc = aprCall(p, kAfeVoteRsp, &m);
+    if (!rc && m.opcode == kAfeVoteRsp && m.words >= 1) *handle = (int32_t)m.payload[0];
+    return rc;
+}
+int afeDevote(uint32_t block, int32_t handle) {
+    Packet p(kSvcAfe, 0, 0, 0, kAfeDevote, 0x1c);
+    p.u32(0x14, block); p.u32(0x18, (uint32_t)handle);
+    return aprCall(p, 0);
+}
+int afeClock(bool enable) {   // AFE_SVC_CMD_SET_PARAM, module CLOCK_SET: SEN_MI2S_IBIT at 1.536 MHz
+    Packet p(kSvcAfe, 0, 0, 1024, kAfeSvcSetParam, 0x44);
+    p.u32(0x14, 32); p.u32(0x24, 0x0001028f); p.u32(0x28, 0x00010290); p.u16(0x2c, 20);
+    p.u32(0x30, 1); p.u32(0x34, 0x10d); p.u32(0x38, 1536000); p.u16(0x3c, 1); p.u16(0x3e, 0); p.u32(0x40, enable ? 1 : 0);
+    return aprCall(p, 0);
+}
+int afePortConfig() {   // AFE_PORT_CMD_SET_PARAM_V2, AFE_PARAM_ID_I2S_CONFIG: 16 bit, SD0, stereo, internal WS, 48 kHz, linear PCM
+    Packet p(kSvcAfe, 0, 0, 0, kAfePortSetParam, 0x44);
+    p.u16(0x14, kSenMi2sRx); p.u16(0x16, 32); p.u32(0x24, 0x0001020c); p.u32(0x28, 0x0001020d); p.u16(0x2c, 20);
+    p.u32(0x30, 1); p.u16(0x34, 16); p.u16(0x36, 1); p.u16(0x38, 1); p.u16(0x3a, 1); p.u32(0x3c, 48000); p.u16(0x40, 0);
+    return aprCall(p, 0);
+}
+int afePort(uint32_t opcode) {
+    Packet p(kSvcAfe, 0, 0, 0, opcode, 0x18);
+    p.u16(0x14, kSenMi2sRx);
+    return aprCall(p, 0);
+}
+int asmMap(int32_t *handle) {
+    Packet p(kSvcAsm, 0, 0, kAsmSession << 8, kAsmMap, 0x28);
+    p.u16(0x14, 3); p.u16(0x16, 1); p.u32(0x18, 0); p.u32(0x1c, (uint32_t)kBufPhys); p.u32(0x20, kBufMsw); p.u32(0x24, kBufSize);
+    AprMessage m;
+    const int rc = aprCall(p, kAsmMapRsp, &m);
+    if (!rc && m.opcode == kAsmMapRsp && m.words >= 1) *handle = (int32_t)m.payload[0];
+    return rc;
+}
+int asmOpen() {   // legacy stream to the device matrix, 16 bit, the DSP's default post-processing topology, multichannel PCM v2
+    Packet p(kSvcAsm, kAsmPort, kAsmPort, 0, kAsmOpenWrite, 0x24);
+    p.u32(0x14, 0); p.u16(0x18, 0); p.u16(0x1a, 16); p.u32(0x1c, 0x00010be4); p.u32(0x20, 0x00010da5);
+    return aprCall(p, 0);
+}
+int admOpen(int32_t *copp) {   // COPP on the senary MI2S with the null topology, 2 channels, 16 bit, 48 kHz, FL/FR
+    Packet p(kSvcAdm, kSenMi2sRx, kSenMi2sRx, 0, kAdmOpen, 0x30);
+    p.u16(0x14, 0); p.u16(0x16, 1); p.u16(0x18, kSenMi2sRx); p.u16(0x1a, 0xffff); p.u32(0x1c, 0x00010312);
+    p.u16(0x20, 2); p.u16(0x22, 16); p.u32(0x24, 48000); p.u8(0x28, 1); p.u8(0x29, 2);
+    AprMessage m;
+    const int rc = aprCall(p, kAdmOpenRsp, &m);
+    if (rc) return rc;
+    if (m.opcode == kAdmOpenRsp && m.words >= 2) {
+        if (m.payload[0]) {gPlay[1] = (int32_t)m.payload[0]; logMessage("error", m); return (int)m.payload[0];}
+        *copp = (int32_t)(m.payload[1] & 0xffff);
+    }
+    return 0;
+}
+int admRoute(int32_t copp) {
+    Packet p(kSvcAdm, 0, 0, 0, kAdmMap, 0x24);
+    p.u32(0x14, 0); p.u32(0x18, 1); p.u16(0x1c, kAsmSession); p.u16(0x1e, 1); p.u16(0x20, (uint16_t)copp);
+    return aprCall(p, 0);
+}
+int admClose(int32_t copp) {
+    Packet p(kSvcAdm, kSenMi2sRx, (uint16_t)copp, 0, kAdmClose, 0x14);
+    return aprCall(p, 0);
+}
+int asmFormat() {
+    Packet p(kSvcAsm, kAsmPort, kAsmPort, 0, kAsmMediaFmt, 0x2c);
+    p.u32(0x14, 20); p.u16(0x18, 2); p.u16(0x1a, 16); p.u32(0x1c, 48000); p.u16(0x20, 1); p.u8(0x24, 1); p.u8(0x25, 2);
+    return aprCall(p, 0);
+}
+int asmSimple(uint32_t opcode, uint32_t bytes) {
+    Packet p(kSvcAsm, kAsmPort, kAsmPort, 0, opcode, bytes);
+    return aprCall(p, 0);
+}
+int asmUnmap(int32_t handle) {
+    Packet p(kSvcAsm, 0, 0, 0, kAsmUnmap, 0x18);
+    p.u32(0x14, (uint32_t)handle);
+    return aprCall(p, 0);
+}
+bool asmWrite(uint32_t slot) {   // no answer on success; the buffer comes back as a write done event
+    Packet p(kSvcAsm, kAsmPort, kAsmPort, slot, kAsmWrite, 0x34);
+    p.u32(0x14, (uint32_t)kBufPhys + slot * kSlotBytes); p.u32(0x18, kBufMsw); p.u32(0x1c, (uint32_t)gPlay[4]);
+    p.u32(0x20, kPeriodBytes); p.u32(0x24, slot);
+    if (!sheng_adsp_send || sheng_adsp_send(gApr, p.b, p.size)) return false;
+    gPlay[6] = gPlay[6] + 1;
+    return true;
+}
+
+// 750 Hz is exactly 64 samples at 48 kHz, so every 10 ms period (480 frames) holds the same 7.5 cycles. -20 dBFS.
+const int16_t kSine64[64] = {0, 321, 639, 951, 1254, 1545, 1821, 2079, 2317, 2533, 2725, 2890, 3028, 3136, 3214, 3261, 3277, 3261, 3214,
+    3136, 3028, 2890, 2725, 2533, 2317, 2079, 1821, 1545, 1254, 951, 639, 321, 0, -321, -639, -951, -1254, -1545, -1821, -2079, -2317,
+    -2533, -2725, -2890, -3028, -3136, -3214, -3261, -3277, -3261, -3214, -3136, -3028, -2890, -2725, -2533, -2317, -2079, -1821, -1545,
+    -1254, -951, -639, -321};
+void fillSlot(uint32_t slot, bool tone) {
+    volatile uint32_t *frames = reinterpret_cast<volatile uint32_t *>(gBuf.va + slot * kSlotBytes);
+    for (uint32_t i = 0; i < kPeriodFrames; ++i) {
+        const uint16_t s = tone ? (uint16_t)kSine64[i % 64] : 0;
+        frames[i] = (uint32_t)s | (uint32_t)s << 16;   // left and right
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+}
+
+void printPlay(const char *what) {
+    const volatile int32_t *p = gPlay;
+    printf("PDX203 PLAY %s step %d status %x votes %x/%x map %x copp %d writes %d done %d bad %d smmu %x %s amps %d/%d other %d beeps %d\n",
+           what, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], gSmmuError, p[10], p[11], p[12], p[13]);
+    for (unsigned amp = 0; amp < 2; ++amp) {
+        ampStatus(amp);
+        printf("PDX203 PLAY amp %x irq1 %x irq3 %x pwr2 %x otp %u\n", kAmpAddress[amp], pdx203_audio_amps[amp][3],
+               pdx203_audio_amps[amp][5], pdx203_audio_amps[amp][6], pdx203_audio_amps[amp][7]);
+    }
+}
+
+// Brings the path up, plays beeps (1 s tone, 2 s silence) and takes it down again. Steps report in gPlay[0].
+void playBeeps(unsigned beeps) {
+    auto step = [](int n) {gPlay[0] = n;};
+    auto failed = [](int n, int rc) {gPlay[0] = -n; gPlay[1] = rc; printPlay("failed"); return;};
+    int rc = 0;
+    int32_t macro = -1, dcodec = -1, map = -1, copp = -1;
+    bool clock = false, port = false, opened = false, ampsOn = false;
+    for (unsigned amp = 0; amp < 2; ++amp) {
+        if (!(pdx203_audio_stats[2] & (1 << amp))) {failed(1, -19); return;}
+        if ((rc = ampInit(amp))) {pdx203_audio_amps[amp][4] = (uint32_t)rc; failed(1, rc); return;}
+    }
+    step(1);
+    if (!smmuPassThrough()) {failed(2, -1); return;}
+    if (!mapRegion(kBufPhys, kBufSize, gBuf)) {failed(2, -12); return;}
+    for (uint32_t s = 0; s < kSlots; ++s) fillSlot(s, false);
+    step(2);
+    if ((rc = afeVote(3, &macro))) {failed(3, rc); return;}
+    gPlay[2] = macro;
+    if (afeVote(4, &dcodec) == 0) gPlay[3] = dcodec;
+    if (!lpiPins()) {failed(3, -12); goto down;}
+    step(3);
+    if ((rc = afeClock(true))) {failed(4, rc); goto down;}
+    clock = true;
+    if ((rc = afePortConfig())) {failed(5, rc); goto down;}
+    if ((rc = afePort(kAfeStart))) {failed(5, rc); goto down;}
+    port = true;
+    step(5);
+    IOSleep(5);   // the bit clock runs: the amplifiers' PLL locks to it
+    for (unsigned amp = 0; amp < 2; ++amp) {gPlay[10 + amp] = ampStart(amp); ampsOn = true;}
+    step(6);
+    if ((rc = asmMap(&map))) {failed(7, rc); goto down;}
+    gPlay[4] = map;
+    if ((rc = asmOpen())) {failed(8, rc); goto down;}
+    opened = true;
+    if ((rc = admOpen(&copp))) {failed(9, rc); goto down;}
+    gPlay[5] = copp;
+    if ((rc = admRoute(copp))) {failed(10, rc); goto down;}
+    if ((rc = asmFormat())) {failed(11, rc); goto down;}
+    if ((rc = asmSimple(kAsmRun, 0x20))) {failed(12, rc); goto down;}
+    step(12);
+    printPlay("running");
+    {
+        // Periods in order: each beep is 100 tone periods then 200 silent ones. Four are kept queued at the DSP.
+        const uint32_t total = beeps * 300;
+        uint32_t sent = 0, done0 = __atomic_load_n(&gWritesDone, __ATOMIC_ACQUIRE);
+        uint64_t stall;
+        clock_interval_to_deadline(2000, kMillisecondScale, &stall);
+        while (sent < total || __atomic_load_n(&gWritesDone, __ATOMIC_ACQUIRE) - done0 < sent) {
+            const uint32_t done = __atomic_load_n(&gWritesDone, __ATOMIC_ACQUIRE) - done0;
+            while (sent < total && sent - done < 4) {
+                const uint32_t slot = sent % kSlots;
+                fillSlot(slot, (sent % 300) < 100);
+                if (!asmWrite(slot)) break;
+                if (sent % 300 == 0) gPlay[13] = gPlay[13] + 1;
+                ++sent;
+                clock_interval_to_deadline(2000, kMillisecondScale, &stall);
+            }
+            AprMessage m;
+            bool any = false;
+            while (popMessage(m)) {otherMessage(m); any = true;}
+            if (any) clock_interval_to_deadline(2000, kMillisecondScale, &stall);
+            if (mach_absolute_time() >= stall) {printf("PDX203 PLAY stalled: sent %u done %u\n", sent, done); break;}
+            if (sent == 100 || sent == 400) printPlay("tone");
+            sleepMs(5);
+        }
+    }
+    step(13);
+    printPlay("played");
+down:
+    if (opened) asmSimple(kAsmPause, 0x14);
+    if (ampsOn) for (unsigned amp = 0; amp < 2; ++amp) ampStop(amp);
+    if (opened) asmSimple(kAsmClose, 0x14);
+    if (copp >= 0) admClose(copp);
+    if (port) afePort(kAfeStop);
+    if (clock) afeClock(false);
+    if (map >= 0) asmUnmap(map);
+    if (dcodec >= 0) afeDevote(4, dcodec);
+    if (macro >= 0) afeDevote(3, macro);
+    printPlay("down");
 }
 
 // ---- rows ----
@@ -277,23 +671,25 @@ void printRows() {
                q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[8], q[9], q[10], q[11], q[12], q[13], native_qrtr_text);
     }
     const volatile int32_t *s = pdx203_audio_stats;
-    printf("PDX203 AUDIO stage %d se2 %08x amps %x i2c fail %d err %x | apr up %d in %d out %d state %d asks %d op %x result %x | "
-           "rcg %x dfs %x vote %x | %d ms\n", s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14],
-           s[15]);
+    printf("PDX203 AUDIO stage %d se2 %08x amps %x i2c fail %d err %x | apr up %d in %d out %d dropped %d op %x | rcg %x dfs %x vote %x | %d ms\n",
+           s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[9], s[10], s[12], s[13], s[14], s[15]);
     if (s[2]) {
         for (unsigned amp = 0; amp < 2; ++amp)
             if (s[2] & (1 << amp))
-                printf("PDX203 AUDIO amp %x devid %x revid %x otpid %x irq1 %x\n", kAmpAddress[amp], pdx203_audio_amps[amp][0],
-                       pdx203_audio_amps[amp][1], pdx203_audio_amps[amp][2], pdx203_audio_amps[amp][3]);
+                printf("PDX203 AUDIO amp %x devid %x revid %x otpid %x irq1 %x init %u\n", kAmpAddress[amp], pdx203_audio_amps[amp][0],
+                       pdx203_audio_amps[amp][1], pdx203_audio_amps[amp][2], pdx203_audio_amps[amp][3], pdx203_audio_amps[amp][4]);
     }
 }
 
 void audioThread(void *, wait_result_t) {
     thread_set_thread_name(current_thread(), "pdx203-audio");
-    unsigned mode = 0;
+    unsigned mode = 0, delay = 40, beeps = 5;
     PE_parse_boot_argn("pdx203-audio", &mode, sizeof mode);
+    PE_parse_boot_argn("pdx203-audio-delay", &delay, sizeof delay);
+    PE_parse_boot_argn("pdx203-audio-beeps", &beeps, sizeof beeps);
+    PE_parse_boot_argn("pdx203-audio-vol", &gAmpVolume, sizeof gAmpVolume);
+    PE_parse_boot_argn("pdx203-audio-gain", &gAmpGain, sizeof gAmpGain);
     const uint64_t began = mach_absolute_time();
-    pdx203_audio_stats[8] = -1;
     if (mode & 1) probeAmps();
     if ((mode & 2) && sheng_adsp_channel) {
         static const ShengAdspClient client = {aprState, aprReceive};
@@ -302,30 +698,22 @@ void audioThread(void *, wait_result_t) {
         if (!gApr) pdx203_audio_stats[0] = -10;
     }
     uint32_t last = 0;
-    bool asked = false, versions = false;
-    uint64_t nextAsk = 0;
+    bool played = false;
     for (unsigned tick = 0; tick < 1200; ++tick) {   // ten minutes of 500 ms steps
-        while (__atomic_load_n(&gRingTail, __ATOMIC_ACQUIRE) != __atomic_load_n(&gRingHead, __ATOMIC_ACQUIRE)) {
-            const uint32_t tail = gRingTail;
-            handleApr(gRing[tail % 8]);
-            __atomic_store_n(&gRingTail, tail + 1, __ATOMIC_RELEASE);
-        }
-        if (gApr && __atomic_load_n(&gAprUp, __ATOMIC_ACQUIRE)) {
-            const uint64_t now = mach_absolute_time();
-            if (pdx203_audio_stats[8] != 1 && pdx203_audio_stats[9] < 40 && now >= nextAsk) {
-                if (aprSend(kSvcCore, kGetState, 0x5001)) {pdx203_audio_stats[9] = pdx203_audio_stats[9] + 1; asked = true;}
-                clock_interval_to_deadline(500, kMillisecondScale, &nextAsk);
-            }
-            if (pdx203_audio_stats[8] == 1 && !versions) versions = aprSend(kSvcCore, kGetVersions, 0x5002);
-        }
+        AprMessage m;
+        while (popMessage(m)) logMessage("in", m);
         uint64_t ns = 0;
         absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
         pdx203_audio_stats[15] = (int32_t)(ns / 1000000);
         const uint32_t h = hashRows();
         if (h != last || tick % 120 == 0) {last = h; printRows();}
+        if ((mode & 5) == 5 && gApr && !played && __atomic_load_n(&gAprUp, __ATOMIC_ACQUIRE) && ns / 1000000000ull >= delay) {
+            played = true;
+            printf("PDX203 PLAY start: %u beeps, volume %x gain %x\n", beeps, gAmpVolume, gAmpGain);
+            playBeeps(beeps);
+        }
         sleepMs(500);
     }
-    (void)asked;
     printRows();
 }
 }  // namespace
