@@ -328,7 +328,17 @@ void haltRestart(int reboot) {
     uint8_t ctl = 0, ctl2 = 0;
     printf("BOARD %s: PON apid %d, type %x\n", reboot ? "restart" : "shutdown", gPonWrite, type);
     haltSpin(50000);
-    if (gPonWrite >= 0) {
+    // usb-67: the first write through APID 1's channel wedged the CPU (reads worked: ctl 01 warm reset, ctl2 80 enabled), so the
+    // PON is only written when boot argument pdx203-halt-pon=1 asks for it; by default PS_HOLD is dropped with the type the boot
+    // loader left (warm reset, so shutdown restarts for now).
+    unsigned ponWrites = 0;
+    PE_parse_boot_argn("pdx203-halt-pon", &ponWrites, sizeof ponWrites);
+    if (gPonWrite >= 0 && ponWrites != 1) {
+        int rc = read8(gPonWrite, 0x5A, &ctl); rc |= read8(gPonWrite, 0x5B, &ctl2);
+        printf("BOARD halt: PON not written (ctl %02x ctl2 %02x rc %d)\n", ctl, ctl2, rc);
+        haltSpin(50000);
+    }
+    if (gPonWrite >= 0 && ponWrites == 1) {
         int rc = read8(gPonWrite, 0x5B, &ctl2); haltStep("read ctl2", rc);
         rc = read8(gPonWrite, 0x5A, &ctl); haltStep("read ctl", rc);
         rc = write8(gPonWrite, 0x5B, (uint8_t)(ctl2 & ~0x80)); haltStep("ctl2 reset-enable off", rc);
