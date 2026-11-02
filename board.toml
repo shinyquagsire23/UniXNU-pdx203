@@ -248,7 +248,7 @@ kernel_args = [
   # and LaunchDaemons before launchd; their CDHashes come from the owner trust bundle (--owner-trust-cache). sheng-fb-gpu=1
   # hands GPU-composited frames to the panel through the GOP presenter. alioth's working pair since its u208
   "sheng-gpu-addon=1",
-  # "sheng-fb-gpu=1",   # off until the GPU hand-off is proven here: with it the first accepted swap may wait on the plugin forever
+  "sheng-fb-gpu=1",   # the GPU copies each frame into the flip's back buffer (no CPU copy); a failed hand-off falls back to the CPU copy
 ]
 # Fixups of signed text, applied by the kernel after signature validation and only where the original bytes match
 # (patches/xnu/native-text-fixup.patch). They reach it as /chosen/text-fixups, not on the command line. Each is

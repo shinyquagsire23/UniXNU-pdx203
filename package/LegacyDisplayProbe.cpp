@@ -792,3 +792,19 @@ extern "C" void native_legacy_flip_commit(void) {
     native_legacy_flip_stats[1] = native_legacy_flip_stats[1] + 1;
     native_legacy_flip_stats[5] = (uint32_t)gFlipShown;
 }
+// The GPU hand-off through the flip (sheng-fb-gpu=1): the display picks the back buffer before it offers the frame (no CPU wait, the
+// GPU's copy runs after the frame's own work on the same GPU), the presenter tells the GPU client which buffer to copy into and exposes
+// all three buffers as its scanout, and the display commits the flip when the client reports the copy done.
+extern "C" int native_legacy_flip_pick(void) {
+    if (!flipReady()) return -1;
+    for (int i = 0; i < 3; ++i)
+        if (i != gFlipShown && i != gFlipPending) {gFlipBack = i; break;}
+    return gFlipBack;
+}
+extern "C" int native_legacy_flip_back_index(void) {return gFlipState == 1 ? gFlipBack : -1;}
+extern "C" IOMemoryDescriptor *native_legacy_flip_memory(void) {
+    static IOMemoryDescriptor *whole;
+    if (!flipReady()) return nullptr;
+    if (!whole) whole = IODeviceMemory::withRange(kReservedBase, 3 * gFlipBytes);   // kept for the life of the system
+    return whole;
+}
