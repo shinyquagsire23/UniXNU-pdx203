@@ -1563,7 +1563,8 @@ extern volatile int native_gpu_addon_files __attribute__((weak_import)), native_
     native_gpu_addon_status __attribute__((weak_import)), native_gpu_addon2_stage __attribute__((weak_import)),
     native_gpu_addon2_status __attribute__((weak_import)), native_gpu_addon3_stage __attribute__((weak_import)),
     native_gpu_addon3_status __attribute__((weak_import)), native_gpu_addon4_stage __attribute__((weak_import)),
-    native_gpu_addon4_status __attribute__((weak_import)), native_gpu_addon_reset __attribute__((weak_import));
+    native_gpu_addon4_status __attribute__((weak_import)), native_gpu_addon_reset __attribute__((weak_import)),
+    native_gpu_addon_cryptex_execs __attribute__((weak_import));
 }
 // The display's swap and transfer counters (package/LegacyDisplayProbe.cpp, the same kernel), printed as a DISPLAY row: whether
 // accepted swaps reach the scanout, and how long a copy takes.
@@ -1708,12 +1709,12 @@ int addonValue(volatile int *value) {return value ? *value : -99;}
 void addonRow() {
     if (!&native_gpu_addon_files) return;
     char row[160];
-    snprintf(row, sizeof row, "GPUADDON files %d written %d same %d failed %d error %d | mount %d/%d mount2 %d/%d mount3 %d/%d mount4 %d/%d | reset %d",
+    snprintf(row, sizeof row, "GPUADDON files %d written %d same %d failed %d error %d | mount %d/%d mount2 %d/%d mount3 %d/%d mount4 %d/%d cx %d | reset %d",
              addonValue(&native_gpu_addon_files), addonValue(&native_gpu_addon_written), addonValue(&native_gpu_addon_same),
              addonValue(&native_gpu_addon_failed), addonValue(&native_gpu_addon_error), addonValue(&native_gpu_addon_stage),
              addonValue(&native_gpu_addon_status), addonValue(&native_gpu_addon2_stage), addonValue(&native_gpu_addon2_status),
              addonValue(&native_gpu_addon3_stage), addonValue(&native_gpu_addon3_status), addonValue(&native_gpu_addon4_stage),
-             addonValue(&native_gpu_addon4_status), addonValue(&native_gpu_addon_reset));
+             addonValue(&native_gpu_addon4_status), addonValue(&native_gpu_addon_cryptex_execs), addonValue(&native_gpu_addon_reset));
     if (strncmp(row, gAddonPrinted, sizeof row)) {
         strlcpy(gAddonPrinted, row, sizeof gAddonPrinted);
         printf("%s\n", row);
