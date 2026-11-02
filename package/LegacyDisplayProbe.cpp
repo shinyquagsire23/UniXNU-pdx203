@@ -620,3 +620,62 @@ extern "C" uint64_t native_legacy_surface_stride(OSObject *surface) {
     if (stride && allocation && height && stride <= allocation / height / 4) return stride * 4;
     return stride;
 }
+
+// pdx203: a read-only dump of the display engine as the boot loader left it, for the page flip (DPU 6.0, SM8250; offsets of the stock
+// device tree's qcom,mdss_mdp from 0xae00000: CTL 0x2000 + 0x200 n, VIG 0x5000 + 0x2000 n, DMA 0x25000 + 0x2000 n, mixers 0x45000 +
+// 0x1000 n, pingpong 0x71000 + 0x800 n), and the apps SMMU's stream entries for the display's stream 0x820 (mask 0x402,
+// qcom,smmu_sde_unsec, iommu-earlymap): whether the pipes fetch physical addresses or the boot loader's IOVAs. Called once.
+extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern "C" void pdx203_dpu_dump(void) {
+    static bool done;
+    if (done) return;
+    done = true;
+    volatile uint32_t *mdss = reinterpret_cast<volatile uint32_t *>(ml_io_map(0xae00000, 0x80000));
+    if (!mdss) {printf("DPU map failed\n"); return;}
+    auto rd = [&](uint32_t off) {return mdss[off / 4];};
+    printf("DPU hw %08x mdp-top %08x | gop %llx bytes %llx\n", rd(0x0), rd(0x1000), (unsigned long long)native_legacy_gop_physical,
+           (unsigned long long)native_legacy_gop_bytes);
+    static const uint32_t pipes[8] = {0x5000, 0x7000, 0x9000, 0xb000, 0x25000, 0x27000, 0x29000, 0x2b000};
+    static const char *const names[8] = {"vig0", "vig1", "vig2", "vig3", "dma0", "dma1", "dma2", "dma3"};
+    for (unsigned i = 0; i < 8; ++i) {
+        const uint32_t b = pipes[i];
+        if (!rd(b + 0x14) && !rd(b + 0x00)) continue;
+        printf("DPU %s src %08x xy %08x out %08x oxy %08x addr %08x %08x stride %08x %08x fmt %08x unpack %08x op %08x\n", names[i],
+               rd(b + 0x00), rd(b + 0x08), rd(b + 0x0c), rd(b + 0x10), rd(b + 0x14), rd(b + 0x18), rd(b + 0x24), rd(b + 0x28),
+               rd(b + 0x30), rd(b + 0x34), rd(b + 0x38));
+    }
+    for (unsigned i = 0; i < 6; ++i) {
+        const uint32_t b = 0x2000 + 0x200 * i;
+        const uint32_t top = rd(b + 0x14), intf = rd(b + 0xf4);
+        if (!top && !intf && !rd(b + 0x00) && !rd(b + 0x04)) continue;
+        printf("DPU ctl%u layer %08x %08x %08x %08x %08x %08x top %08x flush %08x start %08x intf %08x ext %08x %08x\n", i, rd(b + 0x00),
+               rd(b + 0x04), rd(b + 0x08), rd(b + 0x0c), rd(b + 0x10), rd(b + 0x24), top, rd(b + 0x18), rd(b + 0x1c), intf, rd(b + 0x40),
+               rd(b + 0x44));
+    }
+    for (unsigned i = 0; i < 2; ++i) {
+        const uint32_t b = 0x45000 + 0x1000 * i;
+        printf("DPU lm%u op %08x out %08x bg %08x\n", i, rd(b + 0x00), rd(b + 0x04), rd(b + 0x08));
+    }
+    for (unsigned i = 0; i < 2; ++i) {
+        const uint32_t b = 0x71000 + 0x800 * i;
+        printf("DPU pp%u te %08x vsync %08x height %08x wr %08x init %08x thresh %08x start %08x line %08x autorefresh %08x\n", i,
+               rd(b + 0x00), rd(b + 0x04), rd(b + 0x08), rd(b + 0x0c), rd(b + 0x10), rd(b + 0x18), rd(b + 0x1c), rd(b + 0x2c), rd(b + 0x30));
+    }
+    volatile uint32_t *smmu = reinterpret_cast<volatile uint32_t *>(ml_io_map(0x15000000, 0x1000));
+    if (!smmu) {printf("DPU smmu map failed\n"); return;}
+    const uint32_t idr0 = smmu[0x20 / 4], idr1 = smmu[0x24 / 4], cr0 = smmu[0];
+    const unsigned smrs = idr0 & 0xff;
+    printf("DPU smmu cr0 %08x idr0 %08x idr1 %08x smrs %u\n", cr0, idr0, idr1, smrs);
+    const uint32_t page = (idr1 >> 31) ? 0x10000 : 0x1000, numpage = 1u << (((idr1 >> 28) & 7) + 1);
+    for (unsigned n = 0; n < smrs && n < 128; ++n) {
+        const uint32_t smr = smmu[(0x800 + 4 * n) / 4], s2cr = smmu[(0xc00 + 4 * n) / 4];
+        if (!(smr >> 31)) continue;
+        const uint32_t id = smr & 0xffff, mask = (smr >> 16) & 0x7fff;
+        if (((id ^ 0x820) & ~(mask | 0x402) & 0x7fff)) continue;
+        printf("DPU smr %u id %04x mask %04x s2cr %08x (type %u cb %u)\n", n, id, mask, s2cr, (s2cr >> 16) & 3, s2cr & 0xff);
+        if (((s2cr >> 16) & 3) == 0) {
+            volatile uint32_t *cb = reinterpret_cast<volatile uint32_t *>(ml_io_map(0x15000000 + numpage * page + (s2cr & 0xff) * page, 0x1000));
+            if (cb) printf("DPU cb%u sctlr %08x ttbr0 %08x%08x tcr %08x\n", s2cr & 0xff, cb[0], cb[0x24 / 4], cb[0x20 / 4], cb[0x30 / 4]);
+        }
+    }
+}

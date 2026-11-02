@@ -1604,6 +1604,7 @@ extern volatile uint32_t native_adreno_window_overflow[4][3] __attribute__((weak
 extern volatile uint32_t native_adreno_client_stats[5][6] __attribute__((weak_import));
 extern volatile uint64_t native_adreno_import_diag[10] __attribute__((weak_import));
 }
+extern "C" void pdx203_dpu_dump(void) __attribute__((weak_import));
 namespace {
 char gPrinted[kRows][120];
 char gMetalPrinted[48][96], gMetalLine[4][200], gClientPrinted[8][96], gTextPrinted[4][2][64];
@@ -1703,6 +1704,7 @@ void gpuReportThread(void *, wait_result_t)
         addonRow();
         if (round % 10 == 0) displayRow();   // every 5 s for the first ten minutes, every 50 s after
         if (round % 20 == 5) metalRows();    // every 10 s, then every 100 s
+        if (round == 6 && &pdx203_dpu_dump) pdx203_dpu_dump();   // package/LegacyDisplayProbe.cpp, once
         uint32_t now = native_gpu_changes;
         if (now != seen) {
             seen = now;
