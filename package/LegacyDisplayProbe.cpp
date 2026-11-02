@@ -722,6 +722,26 @@ bool flipReady() {
     }
     gFlipState = 1;
     native_legacy_flip_stats[0] = 1;
+    // pdx203-hwte=1: frames go to the command-mode panel on its own tear-effect signal (GPIO 66, function mdp_vsync, TE source GPIO 0)
+    // instead of pingpong 0's free-running counter that the UEFI shim enabled (PlatformSec.c: PP_VSYNC_COUNTER_ENABLE | 123, no external
+    // TE), which writes the panel's memory out of step with its scan and tears whatever buffer is shown. Linux dpu_hw_pingpong
+    // connect_external_te: PP_SYNC_CONFIG_VSYNC bit 20; dpu_hw_top setup_vsync_sel: MDP_VSYNC_SEL (MDP top 0x414) bits 15:12 for
+    // pingpong 0. If the signal never comes the autorefresh stops and a flip's latch times out: native_legacy_flip_commit then clears
+    // bit 20 again (native_legacy_flip_stats[0] = 6).
+    unsigned hwte = 0;
+    PE_parse_boot_argn("pdx203-hwte", &hwte, sizeof hwte);
+    if (hwte == 1) {
+        volatile uint32_t *gpio = reinterpret_cast<volatile uint32_t *>(ml_io_map(0xf942000, 0x1000));   // north tile 0xf900000, gpio 66
+        const uint32_t gpioBefore = gpio ? gpio[0] : 0xffffffffu, selBefore = m[0x1414 / 4], ppBefore = m[0x71004 / 4];
+        if (gpio && ((gpioBefore >> 2) & 0xf) != 1) gpio[0] = (gpioBefore & ~(0xfu << 2)) | (1u << 2);
+        m[0x1414 / 4] = selBefore & ~(0xfu << 12);
+        __asm__ volatile("dsb sy" ::: "memory");
+        m[0x71004 / 4] = ppBefore | (1u << 20);
+        __asm__ volatile("dsb sy" ::: "memory");
+        printf("DPU hwte gpio66 %08x>%08x vsync-sel %08x>%08x pp0 sync %08x>%08x\n", gpioBefore, gpio ? gpio[0] : 0, selBefore, m[0x1414 / 4],
+               ppBefore, m[0x71004 / 4]);
+        native_legacy_flip_stats[0] = 2;   // on, with the panel's TE
+    }
     return true;
 }
 }  // namespace
@@ -733,7 +753,7 @@ extern "C" volatile void *native_legacy_flip_target(uint64_t *bytes) {
     return gFlipVa[gFlipBack];
 }
 extern "C" void native_legacy_flip_commit(void) {
-    if (gFlipState != 1 || gFlipBack < 0) return;
+    if (gFlipState != 1 || gFlipBack < 0) return;   // gFlipState stays 1 with or without the TE
     volatile uint32_t *m = gFlipMdss;
     if (gFlipPending >= 0) {
         // the previous flip latches at a frame start (16.7 ms at most); wait up to 40 ms for its flush bits to clear
@@ -745,7 +765,15 @@ extern "C" void native_legacy_flip_commit(void) {
             absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
         }
         if (waited) native_legacy_flip_stats[2] = native_legacy_flip_stats[2] + 1;
-        if (m[kCtl0Flush / 4] & 0x3) native_legacy_flip_stats[3] = native_legacy_flip_stats[3] + 1;
+        if (m[kCtl0Flush / 4] & 0x3) {
+            native_legacy_flip_stats[3] = native_legacy_flip_stats[3] + 1;
+            if (native_legacy_flip_stats[0] == 2) {   // no TE arrives: back to pingpong 0's own counter
+                m[0x71004 / 4] = m[0x71004 / 4] & ~(1u << 20);
+                __asm__ volatile("dsb sy" ::: "memory");
+                native_legacy_flip_stats[0] = 6;
+                printf("DPU hwte reverted: the flip did not latch in 40 ms\n");
+            }
+        }
         if (ns / 1000 > native_legacy_flip_stats[4]) native_legacy_flip_stats[4] = (uint32_t)(ns / 1000);
         gFlipShown = gFlipPending;
         gFlipPending = -1;

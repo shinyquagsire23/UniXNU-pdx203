@@ -239,6 +239,7 @@ kernel_args = [
   # the page flip (package/LegacyDisplayProbe.cpp): frames stored into one of three buffers of "Display Reserved" and the display's two
   # pipes pointed at it once stored, instead of copied into the buffer being scanned out (tearing)
   "pdx203-flip=1",
+  "pdx203-hwte=1",   # the panel's tear-effect signal paces the pushes into its memory (LegacyDisplayProbe.cpp)
   "pipa-gpu-perf=7",   # 670 MHz, the SD865 top level (Linux sm8250 gpu opp table); 5 = 525 MHz was the bring-up clock
   # pipa-ddr-vote: on by default (the CPU-side RPMh DDR vote alioth measured: scanout copy 2.69 -> 1.66 ms)
   "pipa-gpu-pool=512",
