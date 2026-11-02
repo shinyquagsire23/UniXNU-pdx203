@@ -27,6 +27,17 @@ extern "C" {
 #include "GeniI2c.h"
 #include "Cs35l41Otp.h"
 #include "SmmuBypass.h"
+#include "ShengAudioAbi.h"
+}
+#include <IOKit/IOBufferMemoryDescriptor.h>
+#include <libkern/c++/OSMetaClass.h>
+#include <mach/kmod.h>
+extern kmod_info_t g_kernel_kmod_info;
+extern "C" void native_audio_service_static_init(void) __asm__("__GLOBAL__sub_I_ShengAudioService.cpp");
+extern "C" void sheng_audio_service_start(void);
+extern "C" {
+extern volatile int32_t native_audio_service[8];
+extern volatile int native_gpu_addon5_stage __attribute__((weak_import)), native_gpu_addon5_status __attribute__((weak_import));
 }
 
 extern "C" ShengAdspChannel *sheng_adsp_channel(const char *, uint32_t, uint32_t, int, const ShengAdspClient *, void *) __attribute__((weak_import));
@@ -55,9 +66,9 @@ constexpr uint8_t kAmpAddress[2] = {0x40, 0x41};
 constexpr uint32_t kDevid = 0x00000000, kRevid = 0x00000004, kOtpid = 0x00000010, kIrq1Status1 = 0x00010010;
 
 struct Region {IOMemoryMap *map; uintptr_t va;};
-bool mapRegion(uint64_t phys, uint64_t length, Region &r) {
+bool mapRegion(uint64_t phys, uint64_t length, Region &r, IOOptionBits cache = kIOMapInhibitCache) {
     IODeviceMemory *memory = IODeviceMemory::withRange(phys, length);
-    r.map = memory ? memory->map(kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
+    r.map = memory ? memory->map(kIOMapAnywhere | cache) : nullptr;
     if (memory) memory->release();
     r.va = r.map ? static_cast<uintptr_t>(r.map->getVirtualAddress()) : 0;
     return r.va != 0;
@@ -182,7 +193,7 @@ bool ampPoll(unsigned amp, uint32_t reg, uint32_t bit) {
 // Linux cs35l41-lib.c / cs35l41.c / cs35l41_hda.c, Sony's driver for the board values). 16-bit I2S slots at 48 kHz, BCLK 1.536 MHz.
 // Per amplifier: [0] DEVID, [1] REVID, [2] OTPID, [3] IRQ1 status 1 at the last look, then the bring-up: [4] the step that failed
 // (0: none), [5] IRQ1 status 3 (bit 1 PLL lock), [6] PWR_CTRL2, [7] OTP fields written.
-uint32_t gAmpVolume = 0xbe80, gAmpGain = 0;   // -6 dB digital, 0.5 dB analog (pdx203-audio-vol / -gain override)
+uint32_t gAmpVolume = 0x8000, gAmpGain = 0;   // 0 dB digital, 0.5 dB analog (the plug-in applies the system volume) (pdx203-audio-vol / -gain override)
 
 int ampOtpUnpack(unsigned amp) {
     uint32_t id = 0, otp[24];
@@ -363,7 +374,6 @@ void logMessage(const char *why, const AprMessage &m) {
 // (slot | bank << 8, or -1 refused), [10] left amplifier start result, [11] right, [12] messages we did not expect, [13] beeps played
 volatile int32_t gPlay[16];
 const char *gSmmuError = "";
-volatile uint32_t gWritesDone;
 
 // Packets: little-endian fields at byte offsets after the 20-byte command header.
 struct Packet {
@@ -383,16 +393,7 @@ struct Packet {
 // Sends the packet and waits up to ms for its answer: the given reply opcode, or the basic result naming this command. Anything else
 // that arrives meanwhile is handled as a playback event (write done) or logged. Returns the DSP status (0 ok), -60 on timeout, -5 if the
 // send was refused; reply gets the answer's payload.
-void otherMessage(const AprMessage &m) {
-    if (m.opcode == kAsmWriteDone) {
-        gPlay[7] = gPlay[7] + 1;
-        if (m.words >= 4 && m.payload[3]) gPlay[8] = gPlay[8] + 1;
-        __atomic_fetch_add(&gWritesDone, 1u, __ATOMIC_RELEASE);
-        return;
-    }
-    gPlay[12] = gPlay[12] + 1;
-    logMessage("event", m);
-}
+void dispatch(const AprMessage &m);
 int aprCall(const Packet &p, uint32_t reply, AprMessage *answer = nullptr, uint32_t ms = 2000) {
     if (!sheng_adsp_send || sheng_adsp_send(gApr, p.b, p.size)) return -5;
     pdx203_audio_stats[7] = pdx203_audio_stats[7] + 1;
@@ -413,7 +414,7 @@ int aprCall(const Packet &p, uint32_t reply, AprMessage *answer = nullptr, uint3
                 gPlay[1] = 0;
                 return 0;
             }
-            otherMessage(m);
+            dispatch(m);
         }
         if (mach_absolute_time() >= deadline) {printf("PDX203 APR timeout op %x\n", op); return -60;}
         sleepMs(20);
@@ -463,7 +464,7 @@ int afeVote(uint32_t block, int32_t *handle) {
     if (!rc && m.opcode == kAfeVoteRsp && m.words >= 1) *handle = (int32_t)m.payload[0];
     return rc;
 }
-int afeDevote(uint32_t block, int32_t handle) {
+[[maybe_unused]] int afeDevote(uint32_t block, int32_t handle) {   // the votes and the map stay for the boot
     Packet p(kSvcAfe, 0, 0, 0, kAfeDevote, 0x1c);
     p.u32(0x14, block); p.u32(0x18, (uint32_t)handle);
     return aprCall(p, 0);
@@ -529,7 +530,7 @@ int asmSimple(uint32_t opcode, uint32_t bytes) {
     Packet p(kSvcAsm, kAsmPort, kAsmPort, 0, opcode, bytes);
     return aprCall(p, 0);
 }
-int asmUnmap(int32_t handle) {
+[[maybe_unused]] int asmUnmap(int32_t handle) {
     Packet p(kSvcAsm, 0, 0, 0, kAsmUnmap, 0x18);
     p.u32(0x14, (uint32_t)handle);
     return aprCall(p, 0);
@@ -549,14 +550,203 @@ const int16_t kSine64[64] = {0, 321, 639, 951, 1254, 1545, 1821, 2079, 2317, 253
     3136, 3028, 2890, 2725, 2533, 2317, 2079, 1821, 1545, 1254, 951, 639, 321, 0, -321, -639, -951, -1254, -1545, -1821, -2079, -2317,
     -2533, -2725, -2890, -3028, -3136, -3214, -3261, -3277, -3261, -3214, -3136, -3028, -2890, -2725, -2533, -2317, -2079, -1821, -1545,
     -1254, -951, -639, -321};
-// channels: bit 0 left, bit 1 right (0: silence); period: the stream's period number, for the phase.
-void fillSlot(uint32_t slot, unsigned channels, uint32_t period) {
-    volatile uint32_t *frames = reinterpret_cast<volatile uint32_t *>(gBuf.va + slot * kSlotBytes);
-    for (uint32_t i = 0; i < kPeriodFrames; ++i) {
-        const uint16_t s = (uint16_t)kSine64[(period * kPeriodFrames + i) % 64];
-        frames[i] = ((channels & 1) ? (uint32_t)s : 0) | ((channels & 2) ? (uint32_t)s << 16 : 0);
+
+void printPlay(const char *what);
+
+// ---- the path and the audio service ----
+// The service iOS's audio server plug-in opens is sheng's (ShengAudioService.cpp, ShengAudioAbi.h, hal/ShengAudioPlugIn.c, unchanged):
+// a control page and a playback ring of 16-bit stereo frames shared with the plug-in on one timeline anchored at boot. This thread takes
+// period n (timeline frames n * 480 on) from the ring into DSP buffer n % 8 and keeps four queued, refilled on each write done; the
+// frames it takes are cleared, so a period the audio server did not write in time plays as silence. The path comes up when the plug-in
+// starts output (AFE clock, I2S config and start, amplifiers, ASM open, ADM open and route, media format, run) and goes down 5 s after it
+// stops (the amplifiers' power-up would cut the start of the next sound). Capture is not wired yet: input requests are accepted, the
+// capture ring stays silent.
+constexpr uint32_t kRingFrames = SHENG_AUDIO_RING_FRAMES, kInFlight = 4, kLeadFrames = 30 * kPeriodFrames, kKeepMs = 5000;
+constexpr int64_t kDriftLimit = 3 * kPeriodFrames;
+struct Path {
+    int32_t macro = -1, dcodec = -1, map = -1, copp = -1;
+    bool clock, port, ampsOn, opened, running, tone;
+    uint64_t next, done, first, stopAsked;
+    uint32_t inFlight;
+    IOBufferMemoryDescriptor *control, *outRing, *inRing;
+    ShengAudioControl *ctl;
+    int16_t *out;
+    volatile uint32_t want, serving;
+    int64_t baseLead;
+};
+Path gPath;
+// [audio] starts, stops, failed starts, periods sent late (the plug-in had not written them), resyncs, least and most drift
+volatile int32_t gServe[8] = {0, 0, 0, 0, 0, 0x7fffffff, -0x7fffffff, 0};
+uint64_t nowMs() {uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &ns); return ns / 1000000;}
+
+bool setupShared() {
+    const IOOptionBits shared = static_cast<IOOptionBits>(kIODirectionInOut) | static_cast<IOOptionBits>(kIOMemoryKernelUserShared);
+    gPath.control = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, shared, 4096, 4096);
+    gPath.outRing = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, shared, kRingFrames * SHENG_AUDIO_OUT_CHANNELS * 2, 4096);
+    gPath.inRing = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, shared, kRingFrames * SHENG_AUDIO_IN_CHANNELS * 2, 4096);
+    if (!gPath.control || !gPath.outRing || !gPath.inRing) return false;
+    gPath.ctl = static_cast<ShengAudioControl *>(gPath.control->getBytesNoCopy());
+    gPath.out = static_cast<int16_t *>(gPath.outRing->getBytesNoCopy());
+    memset(gPath.ctl, 0, 4096);
+    memset(gPath.out, 0, kRingFrames * SHENG_AUDIO_OUT_CHANNELS * 2);
+    memset(gPath.inRing->getBytesNoCopy(), 0, kRingFrames * SHENG_AUDIO_IN_CHANNELS * 2);
+    mach_timebase_info_data_t tb;
+    clock_timebase_info(&tb);
+    ShengAudioControl *c = gPath.ctl;
+    c->rate = SHENG_AUDIO_RATE; c->out_channels = SHENG_AUDIO_OUT_CHANNELS; c->in_channels = SHENG_AUDIO_IN_CHANNELS;
+    c->period_frames = kPeriodFrames; c->ring_frames = kRingFrames; c->lead_frames = kLeadFrames;
+    // host ticks per frame in 32.32, through 128 bits (the 19.2 MHz timebase overflows 64; sheng i535)
+    c->ticks_per_frame_q32 = (uint64_t)(((__uint128_t)1000000000ULL * tb.denom << 32) / ((uint64_t)SHENG_AUDIO_RATE * tb.numer));
+    c->out_anchor_host = mach_absolute_time();
+    c->in_anchor_host = c->out_anchor_host;
+    c->version = SHENG_AUDIO_VERSION;
+    __atomic_store_n(&c->magic, SHENG_AUDIO_MAGIC, __ATOMIC_RELEASE);
+    return true;
+}
+uint64_t framesNow() {
+    const uint64_t now = mach_absolute_time(), anchor = gPath.ctl->out_anchor_host;
+    return now > anchor ? (uint64_t)(((__uint128_t)(now - anchor) << 32) / gPath.ctl->ticks_per_frame_q32) : 0;
+}
+// sheng's: the steady distance between the next period and the play position settles once the DSP's queue has filled; when the DSP's
+// clock and the host's drift three periods from it, the next period is set back to it (one click). The published lead is that plus two
+// periods, so the plug-in's latency and safety offset follow what the DSP really takes.
+void syncPlayback() {
+    const uint64_t now = framesNow(), played = gPath.done - gPath.first;
+    const int64_t lead = (int64_t)(gPath.next * kPeriodFrames) - (int64_t)now;
+    if (played < 2 * kInFlight) return;
+    if (played == 2 * kInFlight) {
+        gPath.baseLead = lead;
+        const int64_t want = lead + 2 * (int64_t)kPeriodFrames;
+        gPath.ctl->lead_frames = (uint32_t)(want < (int64_t)kLeadFrames ? kLeadFrames : want > 24000 ? 24000 : want);
+        return;
+    }
+    const int64_t drift = lead - gPath.baseLead;
+    if (drift < gServe[5]) gServe[5] = (int32_t)drift;
+    if (drift > gServe[6]) gServe[6] = (int32_t)drift;
+    if (drift > kDriftLimit || drift < -kDriftLimit) {
+        gPath.next = (uint64_t)((int64_t)now + gPath.baseLead + kPeriodFrames / 2) / kPeriodFrames;
+        gServe[4] = gServe[4] + 1;
+    }
+}
+
+// Period n into DSP buffer n % 8: the test beeps (1 s on, 2 s off; left, right, both) or the plug-in's ring.
+bool submit(uint64_t n) {
+    const uint32_t slot = (uint32_t)(n % kSlots);
+    int16_t *dst = reinterpret_cast<int16_t *>(gBuf.va + slot * kSlotBytes);
+    if (gPath.tone) {
+        const uint64_t k = n - gPath.first;
+        const unsigned channels = (k % 300) < 100 ? 1u + (unsigned)((k / 300) % 3) : 0u;
+        for (uint32_t i = 0; i < kPeriodFrames; ++i) {
+            const int16_t s = kSine64[(k * kPeriodFrames + i) % 64];
+            dst[2 * i] = (channels & 1) ? s : 0;
+            dst[2 * i + 1] = (channels & 2) ? s : 0;
+        }
+        if (k % 300 == 0) gPlay[13] = gPlay[13] + 1;
+    } else {
+        const uint32_t at = (uint32_t)((n * kPeriodFrames) % kRingFrames);
+        const uint32_t head = kRingFrames - at < kPeriodFrames ? kRingFrames - at : kPeriodFrames;
+        memcpy(dst, gPath.out + at * 2, head * 4);
+        if (head < kPeriodFrames) memcpy(dst + head * 2, gPath.out, (kPeriodFrames - head) * 4);
+        memset(gPath.out + at * 2, 0, head * 4);
+        if (head < kPeriodFrames) memset(gPath.out, 0, (kPeriodFrames - head) * 4);
+        uint64_t recent = 0;
+        nanoseconds_to_absolutetime(100000000ULL, &recent);
+        if ((gPath.want & ShengAudioOutputRunning) && mach_absolute_time() - gPath.ctl->out_written_host < recent &&
+            gPath.ctl->out_written < (n + 1) * kPeriodFrames) {
+            gPath.ctl->out_late = gPath.ctl->out_late + 1;
+            gServe[3] = gServe[3] + 1;
+        }
     }
     __asm__ volatile("dsb sy" ::: "memory");
+    if (!asmWrite(slot)) return false;
+    gPath.inFlight++;
+    return true;
+}
+void onWriteDone(const AprMessage &m) {
+    gPlay[7] = gPlay[7] + 1;
+    if (m.words >= 4 && m.payload[3]) gPlay[8] = gPlay[8] + 1;
+    if (gPath.inFlight) gPath.inFlight--;
+    gPath.done++;
+    if (gPath.ctl) gPath.ctl->out_frames = (gPath.done - gPath.first) * kPeriodFrames;
+    if (!gPath.running) return;
+    if (!gPath.tone) syncPlayback();
+    while (gPath.inFlight < kInFlight && submit(gPath.next)) gPath.next++;
+}
+
+// Takes down whatever of the stream is up (also the remains of a failed start).
+void stopOutput() {
+    const bool was = gPath.running;
+    gPath.running = false;
+    if (gPath.opened) asmSimple(kAsmPause, 0x14);
+    if (gPath.ampsOn) for (unsigned amp = 0; amp < 2; ++amp) ampStop(amp);
+    gPath.ampsOn = false;
+    if (gPath.opened) asmSimple(kAsmClose, 0x14);
+    gPath.opened = false;
+    if (gPath.copp >= 0) admClose(gPath.copp);
+    gPath.copp = -1;
+    if (gPath.port) afePort(kAfeStop);
+    gPath.port = false;
+    if (gPath.clock) afeClock(false);
+    gPath.clock = false;
+    if (gPath.ctl) __atomic_and_fetch(&gPath.ctl->state, ~ShengAudioOutputRunning, __ATOMIC_ACQ_REL);
+    if (was) gServe[1] = gServe[1] + 1;
+}
+bool startOutput() {
+    if (gPath.running) return true;
+    int rc = 0;
+    auto failed = [&](int n) {gPlay[0] = -n; gPlay[1] = rc; gServe[2] = gServe[2] + 1; stopOutput(); printPlay("failed"); return false;};
+    if ((rc = afeClock(true))) return failed(4);
+    gPath.clock = true;
+    if ((rc = afePortConfig())) return failed(5);
+    if ((rc = afePort(kAfeStart))) return failed(5);
+    gPath.port = true;
+    IOSleep(5);   // the bit clock runs: the amplifiers' PLL locks to it
+    gPath.ampsOn = true;
+    for (unsigned amp = 0; amp < 2; ++amp) gPlay[10 + amp] = ampStart(amp);
+    if ((rc = asmOpen())) return failed(8);
+    gPath.opened = true;
+    int32_t copp = -1;
+    if ((rc = admOpen(&copp))) return failed(9);
+    gPath.copp = copp;
+    gPlay[5] = copp;
+    if ((rc = admRoute(copp))) return failed(10);
+    if ((rc = asmFormat())) return failed(11);
+    if ((rc = asmSimple(kAsmRun, 0x20))) return failed(12);
+    // The DSP plays the first period at once, so it is the period of the timeline that plays now (sheng i533).
+    if (!gPath.tone) memset(gPath.out, 0, kRingFrames * 4);   // the plug-in adds each IO context's mix: no frames of the last run
+    gPath.next = gPath.done = gPath.first = (framesNow() + kPeriodFrames - 1) / kPeriodFrames;
+    gPath.ctl->out_frames = 0;
+    gPath.inFlight = 0;
+    gPath.running = true;
+    while (gPath.inFlight < kInFlight && submit(gPath.next)) gPath.next++;
+    __atomic_or_fetch(&gPath.ctl->state, ShengAudioOutputRunning, __ATOMIC_ACQ_REL);
+    gServe[0] = gServe[0] + 1;
+    gPlay[0] = 12;
+    return true;
+}
+
+// Once at boot: amplifiers configured (muted, off), SMMU pass-through, the DSP buffer, the LPASS votes, the LPI pins, the ASM memory map.
+bool bootPath() {
+    int rc = 0;
+    auto failed = [&](int n) {gPlay[0] = -n; gPlay[1] = rc; printPlay("failed"); return false;};
+    for (unsigned amp = 0; amp < 2; ++amp) {
+        if (!(pdx203_audio_stats[2] & (1 << amp))) {rc = -19; return failed(1);}
+        if ((rc = ampInit(amp))) {pdx203_audio_amps[amp][4] = (uint32_t)rc; return failed(1);}
+    }
+    gPlay[0] = 1;
+    if (!smmuPassThrough()) {rc = -1; return failed(2);}
+    if (!mapRegion(kBufPhys, kBufSize, gBuf, kIOMapWriteCombineCache)) {rc = -12; return failed(2);}
+    bzero(reinterpret_cast<void *>(gBuf.va), kBufSize);
+    gPlay[0] = 2;
+    if ((rc = afeVote(3, &gPath.macro))) return failed(3);
+    gPlay[2] = gPath.macro;
+    if (afeVote(4, &gPath.dcodec) == 0) gPlay[3] = gPath.dcodec;
+    if (!lpiPins()) {rc = -12; return failed(3);}
+    gPlay[0] = 3;
+    if ((rc = asmMap(&gPath.map))) return failed(7);
+    gPlay[4] = gPath.map;
+    gPlay[0] = 7;
+    return true;
 }
 
 void printPlay(const char *what) {
@@ -570,86 +760,21 @@ void printPlay(const char *what) {
     }
 }
 
-// Brings the path up, plays beeps (1 s tone, 2 s silence) and takes it down again. Steps report in gPlay[0].
-void playBeeps(unsigned beeps) {
-    auto step = [](int n) {gPlay[0] = n;};
-    auto failed = [](int n, int rc) {gPlay[0] = -n; gPlay[1] = rc; printPlay("failed"); return;};
-    int rc = 0;
-    int32_t macro = -1, dcodec = -1, map = -1, copp = -1;
-    bool clock = false, port = false, opened = false, ampsOn = false;
-    for (unsigned amp = 0; amp < 2; ++amp) {
-        if (!(pdx203_audio_stats[2] & (1 << amp))) {failed(1, -19); return;}
-        if ((rc = ampInit(amp))) {pdx203_audio_amps[amp][4] = (uint32_t)rc; failed(1, rc); return;}
-    }
-    step(1);
-    if (!smmuPassThrough()) {failed(2, -1); return;}
-    if (!mapRegion(kBufPhys, kBufSize, gBuf)) {failed(2, -12); return;}
-    for (uint32_t s = 0; s < kSlots; ++s) fillSlot(s, 0, 0);
-    step(2);
-    if ((rc = afeVote(3, &macro))) {failed(3, rc); return;}
-    gPlay[2] = macro;
-    if (afeVote(4, &dcodec) == 0) gPlay[3] = dcodec;
-    if (!lpiPins()) {failed(3, -12); goto down;}
-    step(3);
-    if ((rc = afeClock(true))) {failed(4, rc); goto down;}
-    clock = true;
-    if ((rc = afePortConfig())) {failed(5, rc); goto down;}
-    if ((rc = afePort(kAfeStart))) {failed(5, rc); goto down;}
-    port = true;
-    step(5);
-    IOSleep(5);   // the bit clock runs: the amplifiers' PLL locks to it
-    for (unsigned amp = 0; amp < 2; ++amp) {gPlay[10 + amp] = ampStart(amp); ampsOn = true;}
-    step(6);
-    if ((rc = asmMap(&map))) {failed(7, rc); goto down;}
-    gPlay[4] = map;
-    if ((rc = asmOpen())) {failed(8, rc); goto down;}
-    opened = true;
-    if ((rc = admOpen(&copp))) {failed(9, rc); goto down;}
-    gPlay[5] = copp;
-    if ((rc = admRoute(copp))) {failed(10, rc); goto down;}
-    if ((rc = asmFormat())) {failed(11, rc); goto down;}
-    if ((rc = asmSimple(kAsmRun, 0x20))) {failed(12, rc); goto down;}
-    step(12);
-    printPlay("running");
-    {
-        // Periods in order: each beep is 100 tone periods then 200 silent ones, left only, right only, then both, repeating. Four are
-        // kept queued at the DSP.
-        const uint32_t total = beeps * 300;
-        uint32_t sent = 0, done0 = __atomic_load_n(&gWritesDone, __ATOMIC_ACQUIRE);
-        uint64_t stall;
-        clock_interval_to_deadline(2000, kMillisecondScale, &stall);
-        while (sent < total || __atomic_load_n(&gWritesDone, __ATOMIC_ACQUIRE) - done0 < sent) {
-            const uint32_t done = __atomic_load_n(&gWritesDone, __ATOMIC_ACQUIRE) - done0;
-            while (sent < total && sent - done < 4) {
-                const uint32_t slot = sent % kSlots;
-                fillSlot(slot, (sent % 300) < 100 ? 1u + (sent / 300) % 3 : 0u, sent);
-                if (!asmWrite(slot)) break;
-                if (sent % 300 == 0) gPlay[13] = gPlay[13] + 1;
-                ++sent;
-                clock_interval_to_deadline(2000, kMillisecondScale, &stall);
-            }
-            AprMessage m;
-            bool any = false;
-            while (popMessage(m)) {otherMessage(m); any = true;}
-            if (any) clock_interval_to_deadline(2000, kMillisecondScale, &stall);
-            if (mach_absolute_time() >= stall) {printf("PDX203 PLAY stalled: sent %u done %u\n", sent, done); break;}
-            if (sent == 100 || sent == 400) printPlay("tone");
-            sleepMs(5);
-        }
-    }
-    step(13);
-    printPlay("played");
-down:
-    if (opened) asmSimple(kAsmPause, 0x14);
-    if (ampsOn) for (unsigned amp = 0; amp < 2; ++amp) ampStop(amp);
-    if (opened) asmSimple(kAsmClose, 0x14);
-    if (copp >= 0) admClose(copp);
-    if (port) afePort(kAfeStop);
-    if (clock) afeClock(false);
-    if (map >= 0) asmUnmap(map);
-    if (dcodec >= 0) afeDevote(4, dcodec);
-    if (macro >= 0) afeDevote(3, macro);
-    printPlay("down");
+void dispatch(const AprMessage &m) {
+    if (m.opcode == kAsmWriteDone) {onWriteDone(m); return;}
+    gPlay[12] = gPlay[12] + 1;
+    logMessage("event", m);
+}
+
+// The service's classes (ShengAudioService.cpp, static initializer taken out of __mod_init_func by the build) registered late, as the
+// battery's, then the service published.
+bool publishService() {
+    void *handle = OSMetaClass::preModLoad(g_kernel_kmod_info.name);
+    if (!handle) return false;
+    native_audio_service_static_init();
+    if (OSMetaClass::postModLoad(handle)) return false;
+    sheng_audio_service_start();
+    return true;
 }
 
 // ---- rows ----
@@ -684,9 +809,22 @@ void printRows() {
     }
 }
 
+void printServe() {
+    const ShengAudioControl *c = gPath.ctl;
+    const ShengAudioDiag *d = c ? reinterpret_cast<const ShengAudioDiag *>(reinterpret_cast<const uint8_t *>(c) + SHENG_AUDIO_DIAG_OFFSET) : nullptr;
+    printf("PDX203 SERVE svc %d opens %d closes %d reqs %d refused %d maps %d | want %x running %d starts %d stops %d failed %d late %d "
+           "resync %d drift %d..%d lead %u | written %llu frames %llu | mount5 %d/%d | plugin loads %u vol %u peak %u clock %u/%d\n",
+           native_audio_service[0], native_audio_service[1], native_audio_service[2], native_audio_service[3], native_audio_service[4],
+           native_audio_service[5], gPath.want, gPath.running, gServe[0], gServe[1], gServe[2], gServe[3], gServe[4],
+           gServe[5] == 0x7fffffff ? 0 : gServe[5], gServe[6] == -0x7fffffff ? 0 : gServe[6], c ? c->lead_frames : 0,
+           c ? (unsigned long long)c->out_written : 0ull, c ? (unsigned long long)c->out_frames : 0ull,
+           &native_gpu_addon5_stage ? native_gpu_addon5_stage : -9, &native_gpu_addon5_status ? native_gpu_addon5_status : -9,
+           d ? d->loads : 0, d ? d->volume_milli : 0, d ? d->mix_peak : 0, d ? d->host_clock : 0, d ? d->host_clock_result : 0);
+}
+
 void audioThread(void *, wait_result_t) {
     thread_set_thread_name(current_thread(), "pdx203-audio");
-    unsigned mode = 0, delay = 40, beeps = 6;
+    unsigned mode = 0, delay = 40, beeps = 0;   // pdx203-audio-beeps=6 plays the test beeps before the service starts
     PE_parse_boot_argn("pdx203-audio", &mode, sizeof mode);
     PE_parse_boot_argn("pdx203-audio-delay", &delay, sizeof delay);
     PE_parse_boot_argn("pdx203-audio-beeps", &beeps, sizeof beeps);
@@ -700,26 +838,85 @@ void audioThread(void *, wait_result_t) {
         gApr = sheng_adsp_channel("apr_audio_svc", 512, 20, 0, &client, nullptr);
         if (!gApr) pdx203_audio_stats[0] = -10;
     }
+    // Wait for the DSP's APR channel (up to five minutes), printing the bring-up rows as they change.
     uint32_t last = 0;
-    bool played = false;
-    for (unsigned tick = 0; tick < 1200; ++tick) {   // ten minutes of 500 ms steps
+    for (unsigned tick = 0; tick < 600 && !(gApr && __atomic_load_n(&gAprUp, __ATOMIC_ACQUIRE)); ++tick) {
         AprMessage m;
         while (popMessage(m)) logMessage("in", m);
-        uint64_t ns = 0;
-        absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
-        pdx203_audio_stats[15] = (int32_t)(ns / 1000000);
         const uint32_t h = hashRows();
-        if (h != last || tick % 120 == 0) {last = h; printRows();}
-        if ((mode & 5) == 5 && gApr && !played && __atomic_load_n(&gAprUp, __ATOMIC_ACQUIRE) && ns / 1000000000ull >= delay) {
-            played = true;
-            printf("PDX203 PLAY start: %u beeps, volume %x gain %x\n", beeps, gAmpVolume, gAmpGain);
-            playBeeps(beeps);
-        }
+        if (h != last) {last = h; printRows();}
         sleepMs(500);
     }
     printRows();
+    if (!(mode & 4) || !gApr || !__atomic_load_n(&gAprUp, __ATOMIC_ACQUIRE)) return;
+    // Service mode (bit 4): the path, then the test beeps (pdx203-audio-beeps, 0 for none), then the audio service for iOS.
+    if (!setupShared() || !bootPath()) return;
+    printPlay("ready");
+    if (beeps) {
+        uint64_t ns = 0;
+        absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+        if (ns / 1000000000ull < delay) IOSleep((uint32_t)(delay * 1000 - ns / 1000000));
+        printf("PDX203 PLAY start: %u beeps, volume %x gain %x\n", beeps, gAmpVolume, gAmpGain);
+        gPath.tone = true;
+        if (startOutput()) {
+            const uint64_t end = nowMs() + beeps * 3000ull;
+            while (nowMs() < end) {AprMessage m; while (popMessage(m)) dispatch(m); sleepMs(20);}
+            printPlay("played");
+        }
+        stopOutput();
+        gPath.tone = false;
+        printPlay("down");
+    }
+    if (!publishService()) {printf("PDX203 SERVE: the service did not register\n"); return;}
+    __atomic_store_n(&gPath.ctl->state, gPath.ctl->state | ShengAudioOutputReady, __ATOMIC_RELEASE);
+    __atomic_store_n(&gPath.serving, 1u, __ATOMIC_RELEASE);
+    printServe();
+    uint64_t nextRow = nowMs() + 30000;
+    uint32_t lastServe = 0;
+    for (;;) {
+        const uint32_t want = __atomic_load_n(&gPath.want, __ATOMIC_ACQUIRE);
+        if (want & ShengAudioOutputRunning) {
+            gPath.stopAsked = 0;
+            if (!gPath.running) {startOutput(); printServe();}
+        } else if (gPath.running && !gPath.stopAsked) {
+            gPath.stopAsked = nowMs();
+        } else if (gPath.running && nowMs() - gPath.stopAsked >= kKeepMs) {
+            gPath.stopAsked = 0;
+            stopOutput();
+            printServe();
+        }
+        AprMessage m;
+        while (popMessage(m)) dispatch(m);
+        const uint32_t sig = (uint32_t)native_audio_service[1] << 24 ^ (uint32_t)native_audio_service[3] << 12 ^ gServe[0] ^ gServe[2] << 8;
+        if (sig != lastServe || nowMs() >= nextRow) {
+            lastServe = sig;
+            nextRow = nowMs() + (gPath.running ? 10000 : 60000);
+            printServe();
+        }
+        sleepMs(gPath.running ? 5 : 250);
+    }
 }
 }  // namespace
+
+// The audio service's side (ShengAudioService.cpp): its memory and the plug-in's start and stop requests.
+extern "C" IOBufferMemoryDescriptor *sheng_audio_memory(uint32_t type) {
+    if (!__atomic_load_n(&gPath.serving, __ATOMIC_ACQUIRE)) return nullptr;
+    IOBufferMemoryDescriptor *m = type == ShengAudioMemoryControl ? gPath.control : type == ShengAudioMemoryOutput ? gPath.outRing :
+                                  type == ShengAudioMemoryInput ? gPath.inRing : nullptr;
+    if (m) m->retain();
+    return m;
+}
+extern "C" int sheng_audio_request(uint32_t selector) {
+    if (!__atomic_load_n(&gPath.serving, __ATOMIC_ACQUIRE)) return -1;
+    switch (selector) {
+    case ShengAudioStartOutput: __atomic_or_fetch(&gPath.want, ShengAudioOutputRunning, __ATOMIC_ACQ_REL); break;
+    case ShengAudioStopOutput: __atomic_and_fetch(&gPath.want, ~ShengAudioOutputRunning, __ATOMIC_ACQ_REL); break;
+    case ShengAudioStartInput: case ShengAudioStopInput: return 0;   // no capture yet: the capture ring stays silent
+    default: return -1;
+    }
+    wakeAudio();
+    return 0;
+}
 
 extern "C" void pdx203_audio_probe(void) {
     unsigned mode = 0;
