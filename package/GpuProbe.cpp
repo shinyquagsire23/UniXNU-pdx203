@@ -1562,7 +1562,8 @@ extern volatile int native_gpu_addon_files __attribute__((weak_import)), native_
     native_gpu_addon_error __attribute__((weak_import)), native_gpu_addon_stage __attribute__((weak_import)),
     native_gpu_addon_status __attribute__((weak_import)), native_gpu_addon2_stage __attribute__((weak_import)),
     native_gpu_addon2_status __attribute__((weak_import)), native_gpu_addon3_stage __attribute__((weak_import)),
-    native_gpu_addon3_status __attribute__((weak_import)), native_gpu_addon_reset __attribute__((weak_import));
+    native_gpu_addon3_status __attribute__((weak_import)), native_gpu_addon4_stage __attribute__((weak_import)),
+    native_gpu_addon4_status __attribute__((weak_import)), native_gpu_addon_reset __attribute__((weak_import));
 }
 // The display's swap and transfer counters (package/LegacyDisplayProbe.cpp, the same kernel), printed as a DISPLAY row: whether
 // accepted swaps reach the scanout, and how long a copy takes.
@@ -1672,7 +1673,7 @@ void metalRows() {
         printf("METALROW %u %.95s\n", i, native_adreno_metal_rows[i]);
     }
 }
-char gAddonPrinted[120];
+char gAddonPrinted[160];
 char gDisplayPrinted[340];
 void displayRow() {
     if (!&native_legacy_transfer_calls || !&native_legacy_copy_n) return;
@@ -1706,12 +1707,13 @@ void displayRow() {
 int addonValue(volatile int *value) {return value ? *value : -99;}
 void addonRow() {
     if (!&native_gpu_addon_files) return;
-    char row[120];
-    snprintf(row, sizeof row, "GPUADDON files %d written %d same %d failed %d error %d | mount %d/%d mount2 %d/%d mount3 %d/%d | reset %d",
+    char row[160];
+    snprintf(row, sizeof row, "GPUADDON files %d written %d same %d failed %d error %d | mount %d/%d mount2 %d/%d mount3 %d/%d mount4 %d/%d | reset %d",
              addonValue(&native_gpu_addon_files), addonValue(&native_gpu_addon_written), addonValue(&native_gpu_addon_same),
              addonValue(&native_gpu_addon_failed), addonValue(&native_gpu_addon_error), addonValue(&native_gpu_addon_stage),
              addonValue(&native_gpu_addon_status), addonValue(&native_gpu_addon2_stage), addonValue(&native_gpu_addon2_status),
-             addonValue(&native_gpu_addon3_stage), addonValue(&native_gpu_addon3_status), addonValue(&native_gpu_addon_reset));
+             addonValue(&native_gpu_addon3_stage), addonValue(&native_gpu_addon3_status), addonValue(&native_gpu_addon4_stage),
+             addonValue(&native_gpu_addon4_status), addonValue(&native_gpu_addon_reset));
     if (strncmp(row, gAddonPrinted, sizeof row)) {
         strlcpy(gAddonPrinted, row, sizeof gAddonPrinted);
         printf("%s\n", row);
