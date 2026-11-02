@@ -238,7 +238,7 @@ kernel_args = [
   "pipa-gpu=12",
   "pipa-gpu-perf=5",
   "pipa-ddr-vote=0",
-  "pipa-gpu-pool=256",
+  "pipa-gpu-pool=512",
   # the Metal plugin (Turnip, the bridge, NativeAdrenoMetal.bundle) and its probe daemon, written into Data from the payload's
   # gpu addon (UniXNU scripts/make-gpu-addon.py, unixnu build payload --gpu-addon) and mounted over /System/Library/Extensions
   # and LaunchDaemons before launchd; their CDHashes come from the owner trust bundle (--owner-trust-cache). sheng-fb-gpu=1

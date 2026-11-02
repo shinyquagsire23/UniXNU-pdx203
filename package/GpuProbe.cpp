@@ -1573,6 +1573,9 @@ extern volatile uint32_t native_legacy_swap_validation_calls __attribute__((weak
     native_legacy_retirement_calls __attribute__((weak_import)), native_legacy_retired_generation __attribute__((weak_import)),
     native_legacy_presented_generation __attribute__((weak_import));
 extern volatile int native_legacy_transfer_status __attribute__((weak_import));
+// NativeAdrenoSubmit.cpp: [0] waits, [1] timeouts, [2] the fence of the last timed-out wait, [3] the GPU's fence then, [4] the newest
+// fence handed out, [5] the newest completed, [6] waits for a fence no job holds, [7] the last fence refused as never submitted
+extern volatile uint32_t native_adreno_fence_wait[8] __attribute__((weak_import));
 extern volatile uint64_t native_legacy_copy_n __attribute__((weak_import)), native_legacy_copy_last __attribute__((weak_import)),
     native_legacy_copy_max __attribute__((weak_import));
 }
@@ -1590,6 +1593,13 @@ void displayRow() {
              native_legacy_gpu_fallbacks, native_legacy_retirement_calls, native_legacy_retired_generation, native_legacy_presented_generation);
     // the counters move every frame: print at most every 5 s (the caller's cadence decides), and only when something changed
     if (strncmp(row, gDisplayPrinted, sizeof row)) {strlcpy(gDisplayPrinted, row, sizeof gDisplayPrinted); printf("%s\n", row);}
+    static uint32_t lastTimeouts = ~0u;
+    if (&native_adreno_fence_wait && native_adreno_fence_wait[1] != lastTimeouts) {
+        lastTimeouts = native_adreno_fence_wait[1];
+        printf("FENCE waits %u timeouts %u | last timed-out %u gpu %u | newest %u completed %u | nojob %u refused %u\n",
+               native_adreno_fence_wait[0], native_adreno_fence_wait[1], native_adreno_fence_wait[2], native_adreno_fence_wait[3],
+               native_adreno_fence_wait[4], native_adreno_fence_wait[5], native_adreno_fence_wait[6], native_adreno_fence_wait[7]);
+    }
 }
 int addonValue(volatile int *value) {return value ? *value : -99;}
 void addonRow() {
