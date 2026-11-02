@@ -215,6 +215,10 @@ kernel_args = [
   "offline-hid-input=1",
   "sheng-touch-hid=1",
   "pdx203-touch=1",
+  # the power and volume buttons (package/ButtonProbe.cpp): PM8150 PON kpdpwr = power, PON resin = volume up, PM8150 GPIO 1 =
+  # volume down (Sony kona-edo-common.dtsi), over the SPMI arbiter v5 and PDC pin 1 as alioth; 3 arms the interrupts and feeds
+  # the hid input device's report 2 (2 reads once, 1 only finds the APIDs). BUTTONS rows on the console.
+  "pdx203-bt=3",
   # the AppleKeyStore stand-in (package/KeyStoreProbe.cpp + drivers/NativeKeyStoreEvents, alioth's pair). without a SEP and
   # its keybag the lock screen asks for a passcode nothing can satisfy (2026-11-01, touch boot); this owned AppleKeyStore
   # answers "no passcode, nothing locked". alioth: add sheng-aks-sls=3 only if the prompt survives

@@ -512,11 +512,15 @@ extern "C" void native_keystore_probe(void);
 extern "C" void pdx203_cpufreq_start(void);
 // the adreno 650 (package/GpuProbe.cpp, alioth's; pipa-gpu=<mode>, nothing without it): before the display part, as alioth
 extern "C" void pdx203_gpu_start(void);
+// the power and volume buttons (package/ButtonProbe.cpp, alioth's with this board's keys; pdx203-bt=<mode>): their own thread,
+// which waits for the interrupt controller, and they feed the hid input device's report 2
+extern "C" void pdx203_buttons_probe(void);
 void native_legacy_display_late_probe(void) {
     pdx203_cpufreq_start();
     pdx203_gpu_start();
     native_keystore_probe();
     (void)native_hid_input_probe();
+    pdx203_buttons_probe();
     unsigned touch=0;
     if(PE_parse_boot_argn("pdx203-touch",&touch,sizeof(touch)) && touch==1)(void)pdx203_touch_start();
     IOService *display=pendingLegacyDisplay;if(!display)return;pendingLegacyDisplay=nullptr;
