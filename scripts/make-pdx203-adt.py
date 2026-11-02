@@ -234,7 +234,10 @@ def build(args, seed=None):
                             ('artwork-device-idiom', cstr('pad')),
                             ('artwork-device-subtype', u32(2732)),
                             ('artwork-scale-factor', u32(2)),
-                            ('artwork-display-gamut', cstr('P3')),
+                            # sRGB, as sheng declares it for the 8-bit framebuffer: MobileGestalt answers HasExtendedColorDisplay from
+                            # this, and with P3 the render server draws a 10-bit 'b3a8' deep framebuffer once it has a Metal device
+                            # (usb-29..33), which CAEnableDeepFramebuffer=false in any preference domain did not change
+                            ('artwork-display-gamut', cstr('sRGB')),
                             ('compatible-device-fallback', cstr('iPad6,7')),
                             ('thin-bezel', u32(1))] if args.ipad_identity else [])]),
         node('arm-io', [('device_type', cstr('arm-io')),
