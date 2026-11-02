@@ -1579,8 +1579,62 @@ extern volatile uint32_t native_adreno_fence_wait[8] __attribute__((weak_import)
 extern volatile uint64_t native_legacy_copy_n __attribute__((weak_import)), native_legacy_copy_last __attribute__((weak_import)),
     native_legacy_copy_max __attribute__((weak_import));
 }
+// The plugin's telemetry the driver keeps (drivers/NativeAdreno NativeAdrenoPublish.cpp): its result lines, its table of text rows,
+// each process's own lines, and who opened the GPU. alioth reads them in its boot log; here they go to the console as METAL lines,
+// each only when it changed.
+extern "C" {
+struct Pdx203MetalDiag {
+    uint32_t opens, busy, bad, closes, reports, property_reads, foreign_opens, foreign_type, name_reads, calls, last_selector, last_status, ext_entries,
+        ext_selector, ext_status, ext_in, ext_out, tunnel_calls, probes, sel_bits[8], mb_maps, mb_calls, marks_total, marks[16], chk_macf, chk_res,
+        chk_type, type_pass_lo, type_pass_hi, attach_status, inflight, inflight_since_calls, forced_unmaps;
+    char opener[3][17], reader[3][17], name_reader[17], starter[3][17], report[64], report2[64];
+    uint32_t grants;
+};
+struct Pdx203ClientRecord {char name[20]; uint32_t opens, refused, closes, slot, peak_mib, last_refusal;};
+struct Pdx203ClientText {char name[20]; char text[2][64]; uint32_t lines;};
+extern struct Pdx203MetalDiag native_adreno_metal_diag __attribute__((weak_import));
+extern struct Pdx203ClientRecord native_adreno_client_log[8] __attribute__((weak_import));
+extern struct Pdx203ClientText native_adreno_client_text[4] __attribute__((weak_import));
+extern char native_adreno_metal_rows[48][96] __attribute__((weak_import));
+extern volatile uint32_t native_adreno_mount_fail[4] __attribute__((weak_import));
+}
 namespace {
 char gPrinted[kRows][120];
+char gMetalPrinted[48][96], gMetalLine[4][200], gClientPrinted[8][96], gTextPrinted[4][2][64];
+void printIfChanged(char *last, size_t cap, const char *now) {
+    if (strncmp(last, now, cap)) {strlcpy(last, now, cap); printf("%s\n", now);}
+}
+void metalRows() {
+    if (!&native_adreno_metal_diag) return;
+    const Pdx203MetalDiag &d = native_adreno_metal_diag;
+    char line[200];
+    snprintf(line, sizeof line, "METAL opens %u busy %u bad %u closes %u grants %u foreign %u/%x | open %.16s %.16s %.16s | start %.16s %.16s %.16s | mount fail %u/%x/%u/%u",
+             d.opens, d.busy, d.bad, d.closes, d.grants, d.foreign_opens, d.foreign_type, d.opener[0], d.opener[1], d.opener[2],
+             d.starter[0], d.starter[1], d.starter[2], &native_adreno_mount_fail ? native_adreno_mount_fail[0] : 0,
+             &native_adreno_mount_fail ? native_adreno_mount_fail[1] : 0, &native_adreno_mount_fail ? native_adreno_mount_fail[2] : 0,
+             &native_adreno_mount_fail ? native_adreno_mount_fail[3] : 0);
+    printIfChanged(gMetalLine[0], sizeof gMetalLine[0], line);
+    snprintf(line, sizeof line, "METAL report %.63s", d.report); if (d.report[0]) printIfChanged(gMetalLine[1], sizeof gMetalLine[1], line);
+    snprintf(line, sizeof line, "METAL report2 %.63s", d.report2); if (d.report2[0]) printIfChanged(gMetalLine[2], sizeof gMetalLine[2], line);
+    if (&native_adreno_client_log) for (unsigned i = 0; i < 8; ++i) {
+        const Pdx203ClientRecord &c = native_adreno_client_log[i];
+        if (!c.name[0]) continue;
+        snprintf(line, sizeof line, "METALCLI %.19s opens %u refused %u closes %u slot %u peak %u MiB last %x", c.name, c.opens, c.refused,
+                 c.closes, c.slot, c.peak_mib, c.last_refusal);
+        printIfChanged(gClientPrinted[i], sizeof gClientPrinted[i], line);
+    }
+    if (&native_adreno_client_text) for (unsigned i = 0; i < 4; ++i) for (unsigned k = 0; k < 2; ++k) {
+        const Pdx203ClientText &t = native_adreno_client_text[i];
+        if (!t.name[0] || !t.text[k][0] || !strncmp(gTextPrinted[i][k], t.text[k], 64)) continue;
+        strlcpy(gTextPrinted[i][k], t.text[k], 64);
+        printf("METALTXT %.19s %.63s\n", t.name, t.text[k]);
+    }
+    if (&native_adreno_metal_rows) for (unsigned i = 0; i < 48; ++i) {
+        if (!native_adreno_metal_rows[i][0] || !strncmp(gMetalPrinted[i], native_adreno_metal_rows[i], 96)) continue;
+        strlcpy(gMetalPrinted[i], native_adreno_metal_rows[i], 96);
+        printf("METALROW %u %.95s\n", i, native_adreno_metal_rows[i]);
+    }
+}
 char gAddonPrinted[120];
 char gDisplayPrinted[160];
 void displayRow() {
@@ -1621,6 +1675,7 @@ void gpuReportThread(void *, wait_result_t)
     for (unsigned round = 0;; ++round) {
         addonRow();
         if (round % 10 == 0) displayRow();   // every 5 s for the first ten minutes, every 50 s after
+        if (round % 20 == 5) metalRows();    // every 10 s, then every 100 s
         uint32_t now = native_gpu_changes;
         if (now != seen) {
             seen = now;
