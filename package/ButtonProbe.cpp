@@ -269,9 +269,13 @@ bool setup() {
     return true;
 }
 
+}  // namespace
+extern "C" void pdx203_halt_install(void);
+namespace {
 void buttonsThread(void *, wait_result_t) {
     thread_set_thread_name(current_thread(), "pdx203-bt");
     if (!setup()) return;
+    pdx203_halt_install();
     uint32_t seen = gEvents, last = 0;
     for (;;) {
         const uint32_t mask = pressed();
@@ -291,6 +295,56 @@ void buttonsThread(void *, wait_result_t) {
     }
 }
 }  // namespace
+
+// pdx203: shutdown and restart. The PSCI firmware reports SYSTEM_RESET as not supported (alioth measured "psci v10001 reset=0"),
+// and Apple's platform driver resets through a watchdog this board does not have, so the kernel's halt_all_cpus calls this
+// (zzy-zhalt-board.patch) before it. As Linux's qpnp-power-on (qpnp_pon_reset_config) and msm-poweroff do it: tell the PM8150's
+// PON what a dropped PS_HOLD means (PS_HOLD_RST_CTL 0x5A bits 3:0: 4 shutdown, 7 hard reset; the S2 reset enable, CTL2 0x5B
+// bit 7, cleared around the change), then drop PS_HOLD (restart@c264000 "qcom,pshold" in pdx203.dtb). The PON's writes go
+// through an APID whose channel this EE owns (cnfg owner 0; usb-63: APIDs 1 and 116, the IRQ-owning one is EE 2's).
+extern "C" {extern void (*volatile native_board_halt_restart)(int reboot);}
+namespace {
+Window gPsHold;
+int gPonWrite = -1;
+void haltRestart(int reboot) {
+    const uint8_t type = reboot ? 0x7 : 0x4;
+    uint8_t ctl = 0, ctl2 = 0;
+    int rc = 0;
+    if (gPonWrite >= 0) {
+        rc |= read8(gPonWrite, 0x5B, &ctl2);
+        rc |= write8(gPonWrite, 0x5B, (uint8_t)(ctl2 & ~0x80));
+        IODelay(500);
+        rc |= read8(gPonWrite, 0x5A, &ctl);
+        rc |= write8(gPonWrite, 0x5A, (uint8_t)((ctl & ~0x0f) | type));
+        rc |= write8(gPonWrite, 0x5B, (uint8_t)(ctl2 | 0x80));
+    }
+    printf("BOARD %s: PON apid %d ps_hold type %x (was %02x, ctl2 %02x) rc %d, dropping PS_HOLD\n", reboot ? "restart" : "shutdown",
+        gPonWrite, type, ctl, ctl2, rc);
+    IODelay(1000);
+    if (gPsHold.va) {
+        gPsHold.va[0] = 0;
+        __asm__ volatile("dsb sy" ::: "memory");
+    }
+    for (;;) __asm__ volatile("wfe");
+}
+// The PON APID whose channel this EE may write: owner EE 0 in the ownership table.
+int findWritableApid(uint32_t ppid) {
+    for (uint32_t i = 0; i < gApids; ++i) {
+        const uint32_t map = gCore.va[(gApidMap + 4 * i) / 4];
+        if (map && ((map >> 8) & 0xfff) == ppid && (gCnfg.va[i] & 7u) == 0) return (int)i;
+    }
+    return -1;
+}
+}  // namespace
+extern "C" void pdx203_halt_install(void) {
+    if (native_board_halt_restart || !gCore.va) return;
+    gPonWrite = findWritableApid(kPonPpid);
+    if (!gPsHold.va && !mapWindow(gPsHold, 0x0c264000, 0x1000)) {printf("BUTTONS halt: PS_HOLD not mapped\n"); return;}
+    uint8_t ctl = 0, ctl2 = 0;
+    if (gPonWrite >= 0) {read8(gPonWrite, 0x5A, &ctl); read8(gPonWrite, 0x5B, &ctl2);}
+    printf("BUTTONS halt/restart via PON apid %d (ps_hold_rst_ctl %02x ctl2 %02x) and PS_HOLD\n", gPonWrite, ctl, ctl2);
+    native_board_halt_restart = haltRestart;
+}
 
 // pdx203: one byte of any PMIC peripheral through the arbiter the button thread mapped, for the battery (Pdx203Battery.cpp).
 // ppid = sid << 8 | (peripheral address >> 8). Reads go through the observer channel, so any mapped APID will do. -1 until the
