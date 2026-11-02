@@ -679,3 +679,85 @@ extern "C" void pdx203_dpu_dump(void) {
         }
     }
 }
+
+// pdx203: the page flip (pdx203-flip=1). The boot loader's display engine as the DPU dump read it (usb-40): VIG 0 and VIG 1 each fetch
+// half of the 1096x2560 ARGB8888 splash at 0x9c000000 (stride 4384, VIG 1 through its source x 548), CTL 0 drives both (flush bits 0 and
+// 1), pingpong 0 refreshes the command-mode panel by itself (autorefresh every frame) and the display's SMMU context has translation off,
+// so the pipes fetch physical addresses. Three buffers in the boot loader's 35 MiB "Display Reserved" region (0x9c000000, the boot one
+// first): a frame is stored into one neither shown nor waiting to latch, then both pipes' source address moves to it and CTL 0 is
+// flushed; the hardware latches the new address at a frame start, so a frame is never shown while it is written. Before the next flip the
+// previous one must have latched (its flush bits clear). native_legacy_flip_stats: [0] state (0 off, 1 on, else why it is off), [1]
+// flips, [2] flips that waited for the previous latch, [3] latch waits that timed out, [4] longest wait (us), [5] buffer shown.
+volatile uint32_t native_legacy_flip_stats[6];
+namespace {
+constexpr uint64_t kReservedBase = 0x9c000000ull, kReservedBytes = 0x2300000ull;
+constexpr uint32_t kVig0 = 0x5000, kVig1 = 0x7000, kCtl0Flush = 0x2018, kStride = 4384, kFormat = 0x000237ff;
+volatile uint32_t *gFlipMdss;
+uint64_t gFlipPhys[3];
+volatile void *gFlipVa[3];
+uint64_t gFlipBytes;
+int gFlipState = -1, gFlipShown = 0, gFlipPending = -1, gFlipBack = -1;
+bool flipReady() {
+    if (gFlipState >= 0) return gFlipState == 1;
+    unsigned on = 0;
+    PE_parse_boot_argn("pdx203-flip", &on, sizeof on);
+    auto off = [](int why) {gFlipState = why; native_legacy_flip_stats[0] = (uint32_t)why; return false;};
+    if (on != 1) return off(0);
+    gFlipBytes = native_legacy_gop_bytes;
+    if (native_legacy_gop_physical != kReservedBase || !native_legacy_gop_virtual || !gFlipBytes || (gFlipBytes & 0xfff) ||
+        3 * gFlipBytes > kReservedBytes) return off(2);
+    gFlipMdss = reinterpret_cast<volatile uint32_t *>(ml_io_map(0xae00000, 0x80000));
+    if (!gFlipMdss) return off(3);
+    volatile uint32_t *m = gFlipMdss;
+    if (m[(kVig0 + 0x14) / 4] != (uint32_t)kReservedBase || m[(kVig1 + 0x14) / 4] != (uint32_t)kReservedBase ||
+        (m[(kVig0 + 0x24) / 4] & 0xffff) != kStride || m[(kVig0 + 0x30) / 4] != kFormat || m[(kVig1 + 0x30) / 4] != kFormat) return off(4);
+    for (unsigned i = 0; i < 3; ++i) gFlipPhys[i] = kReservedBase + i * gFlipBytes;
+    gFlipVa[0] = reinterpret_cast<volatile void *>(native_legacy_gop_virtual);
+    for (unsigned i = 1; i < 3; ++i) {
+        IODeviceMemory *memory = IODeviceMemory::withRange(gFlipPhys[i], gFlipBytes);
+        IOMemoryMap *map = memory ? memory->map(kIOMapAnywhere | kIOMapWriteCombineCache) : nullptr;
+        if (memory) memory->release();
+        if (!map) return off(5);
+        gFlipVa[i] = reinterpret_cast<volatile void *>(map->getVirtualAddress());   // kept for the life of the system
+    }
+    gFlipState = 1;
+    native_legacy_flip_stats[0] = 1;
+    return true;
+}
+}  // namespace
+extern "C" volatile void *native_legacy_flip_target(uint64_t *bytes) {
+    if (!flipReady()) return nullptr;
+    for (int i = 0; i < 3; ++i)
+        if (i != gFlipShown && i != gFlipPending) {gFlipBack = i; break;}
+    if (bytes) *bytes = gFlipBytes;
+    return gFlipVa[gFlipBack];
+}
+extern "C" void native_legacy_flip_commit(void) {
+    if (gFlipState != 1 || gFlipBack < 0) return;
+    volatile uint32_t *m = gFlipMdss;
+    if (gFlipPending >= 0) {
+        // the previous flip latches at a frame start (16.7 ms at most); wait up to 40 ms for its flush bits to clear
+        uint64_t start = mach_absolute_time(), ns = 0;
+        bool waited = false;
+        while ((m[kCtl0Flush / 4] & 0x3) && ns < 40000000ull) {
+            waited = true;
+            IODelay(100);
+            absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
+        }
+        if (waited) native_legacy_flip_stats[2] = native_legacy_flip_stats[2] + 1;
+        if (m[kCtl0Flush / 4] & 0x3) native_legacy_flip_stats[3] = native_legacy_flip_stats[3] + 1;
+        if (ns / 1000 > native_legacy_flip_stats[4]) native_legacy_flip_stats[4] = (uint32_t)(ns / 1000);
+        gFlipShown = gFlipPending;
+        gFlipPending = -1;
+    }
+    const uint32_t address = (uint32_t)gFlipPhys[gFlipBack];
+    m[(kVig0 + 0x14) / 4] = address;
+    m[(kVig1 + 0x14) / 4] = address;
+    __asm__ volatile("dsb sy" ::: "memory");
+    m[kCtl0Flush / 4] = 0x3;
+    __asm__ volatile("dsb sy" ::: "memory");
+    gFlipPending = gFlipBack;
+    gFlipBack = -1;
+    native_legacy_flip_stats[1] = native_legacy_flip_stats[1] + 1;
+    native_legacy_flip_stats[5] = (uint32_t)gFlipShown;
+}

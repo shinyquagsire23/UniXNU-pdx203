@@ -1573,6 +1573,7 @@ extern volatile uint32_t native_legacy_swap_validation_calls __attribute__((weak
     native_legacy_retirement_calls __attribute__((weak_import)), native_legacy_retired_generation __attribute__((weak_import)),
     native_legacy_presented_generation __attribute__((weak_import));
 extern volatile int native_legacy_transfer_status __attribute__((weak_import));
+extern volatile uint32_t native_legacy_flip_stats[6] __attribute__((weak_import));
 // NativeAdrenoSubmit.cpp: [0] waits, [1] timeouts, [2] the fence of the last timed-out wait, [3] the GPU's fence then, [4] the newest
 // fence handed out, [5] the newest completed, [6] waits for a fence no job holds, [7] the last fence refused as never submitted
 extern volatile uint32_t native_adreno_fence_wait[8] __attribute__((weak_import));
@@ -1664,15 +1665,17 @@ void metalRows() {
     }
 }
 char gAddonPrinted[120];
-char gDisplayPrinted[160];
+char gDisplayPrinted[220];
 void displayRow() {
     if (!&native_legacy_transfer_calls || !&native_legacy_copy_n) return;
-    char row[160];
-    snprintf(row, sizeof row, "DISPLAY validate %u ok %u rej %u | transfer %u status %x | copies %llu last %llu us max %llu us | gpufb %u | retire %u gen %u/%u",
+    char row[220];
+    const volatile uint32_t *flip = &native_legacy_flip_stats ? native_legacy_flip_stats : nullptr;
+    snprintf(row, sizeof row, "DISPLAY validate %u ok %u rej %u | transfer %u status %x | copies %llu last %llu us max %llu us | gpufb %u | retire %u gen %u/%u | flip %u n %u wait %u to %u max %u us shown %u",
              native_legacy_swap_validation_calls, native_legacy_swap_accepted_count, native_legacy_swap_rejected_count,
              native_legacy_transfer_calls, (unsigned)native_legacy_transfer_status, (unsigned long long)native_legacy_copy_n,
              (unsigned long long)(native_legacy_copy_last / 19), (unsigned long long)(native_legacy_copy_max / 19),
-             native_legacy_gpu_fallbacks, native_legacy_retirement_calls, native_legacy_retired_generation, native_legacy_presented_generation);
+             native_legacy_gpu_fallbacks, native_legacy_retirement_calls, native_legacy_retired_generation, native_legacy_presented_generation,
+             flip ? flip[0] : 99, flip ? flip[1] : 0, flip ? flip[2] : 0, flip ? flip[3] : 0, flip ? flip[4] : 0, flip ? flip[5] : 0);
     // the counters move every frame: print at most every 5 s (the caller's cadence decides), and only when something changed
     if (strncmp(row, gDisplayPrinted, sizeof row)) {strlcpy(gDisplayPrinted, row, sizeof gDisplayPrinted); printf("%s\n", row);}
     static uint32_t lastTimeouts = ~0u;
