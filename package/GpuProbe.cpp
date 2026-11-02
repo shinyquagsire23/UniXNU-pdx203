@@ -1325,7 +1325,7 @@ bool metal() {
     if (!accelerator) return stop(kIOReturnNoMemory);
     if (!accelerator->init()) {accelerator->release(); return stop(kIOReturnError);}
     accelerator->setProperty("MetalPluginName", "NativeAdrenoMetal");
-    accelerator->setProperty("NativeSandboxGrantProcess", "backboardd,iconservicesagent,Preferences");
+    accelerator->setProperty("NativeSandboxGrantProcess", "backboardd,iconservicesagent,Preferences,PosterBoard");
     accelerator->setProperty("MetalPluginClassName", "NativeAdrenoMetalDevice");
     // Turnip's options for this board, which replace the plugin's default "sysmem,nocb" (NativeAdrenoMetalPlugin.mm
     // applyBoardTurnipDebug). That default keeps every pass in system memory against a hang of the A740's concurrent binning (BV
