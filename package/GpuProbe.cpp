@@ -1597,6 +1597,12 @@ extern struct Pdx203ClientRecord native_adreno_client_log[8] __attribute__((weak
 extern struct Pdx203ClientText native_adreno_client_text[4] __attribute__((weak_import));
 extern char native_adreno_metal_rows[48][96] __attribute__((weak_import));
 extern volatile uint32_t native_adreno_mount_fail[4] __attribute__((weak_import));
+// NativeAdrenoUserClient.cpp: per method [0] calls, [1] failures, [2] last status; per window {overflows, last KiB, last end MiB}; per
+// client slot (4 = the kernel's) [2] refused BoAllocs, [3] last refusal, [4] its bytes; BoImport failures [1] count [2] status [3] stage
+extern volatile uint32_t native_adreno_method_stats[20][4] __attribute__((weak_import));
+extern volatile uint32_t native_adreno_window_overflow[4][3] __attribute__((weak_import));
+extern volatile uint32_t native_adreno_client_stats[5][6] __attribute__((weak_import));
+extern volatile uint64_t native_adreno_import_diag[10] __attribute__((weak_import));
 }
 namespace {
 char gPrinted[kRows][120];
@@ -1628,6 +1634,27 @@ void metalRows() {
         if (!t.name[0] || !t.text[k][0] || !strncmp(gTextPrinted[i][k], t.text[k], 64)) continue;
         strlcpy(gTextPrinted[i][k], t.text[k], 64);
         printf("METALTXT %.19s %.63s\n", t.name, t.text[k]);
+    }
+    if (&native_adreno_method_stats) {
+        int n = snprintf(line, sizeof line, "METHODS failed:");
+        for (unsigned m = 1; m < 20 && n > 0 && size_t(n) < sizeof line; ++m)
+            if (native_adreno_method_stats[m][1])
+                n += snprintf(line + n, sizeof line - n, " m%u %u/%u %x", m, native_adreno_method_stats[m][1], native_adreno_method_stats[m][0],
+                              native_adreno_method_stats[m][2]);
+        printIfChanged(gMetalLine[3], sizeof gMetalLine[3], line);
+    }
+    if (&native_adreno_window_overflow && &native_adreno_client_stats && &native_adreno_import_diag) {
+        static char last[200];
+        snprintf(line, sizeof line, "METALMEM overflow %u/%u/%u/%u | refused %u:%x:%u %u:%x:%u %u:%x:%u %u:%x:%u k%u:%x | import fail %llu %llx st%llu",
+                 native_adreno_window_overflow[0][0], native_adreno_window_overflow[1][0], native_adreno_window_overflow[2][0],
+                 native_adreno_window_overflow[3][0], native_adreno_client_stats[0][2], native_adreno_client_stats[0][3],
+                 native_adreno_client_stats[0][4] >> 10, native_adreno_client_stats[1][2], native_adreno_client_stats[1][3],
+                 native_adreno_client_stats[1][4] >> 10, native_adreno_client_stats[2][2], native_adreno_client_stats[2][3],
+                 native_adreno_client_stats[2][4] >> 10, native_adreno_client_stats[3][2], native_adreno_client_stats[3][3],
+                 native_adreno_client_stats[3][4] >> 10, native_adreno_client_stats[4][2], native_adreno_client_stats[4][3],
+                 (unsigned long long)native_adreno_import_diag[1], (unsigned long long)native_adreno_import_diag[2],
+                 (unsigned long long)native_adreno_import_diag[3]);
+        printIfChanged(last, sizeof last, line);
     }
     if (&native_adreno_metal_rows) for (unsigned i = 0; i < 48; ++i) {
         if (!native_adreno_metal_rows[i][0] || !strncmp(gMetalPrinted[i], native_adreno_metal_rows[i], 96)) continue;
