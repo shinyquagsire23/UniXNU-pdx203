@@ -580,3 +580,18 @@ void native_legacy_display_late_probe(void) {
     native_legacy_display_checkpoint();
 }
 }
+
+// pdx203: alioth's stride wrapper (UniXNU-alioth package/LinkStubs.c). A compositor surface can report its row pitch in pixels in
+// the IOSurface field the display reads (alioth: 1088 for a 1080-wide window of four bytes a pixel), while
+// native_legacy_surface_bounds compares it with width*4, so every GPU-composited swap was refused (GPUREJ: stride 1088, need 4320).
+// The field is taken as pixels only when the allocation and the row count prove it; a getter that returns bytes is left alone.
+// scripts/build-pdx203-legacy-display.py binds the original getter as native_legacy_surface_stride_raw.
+extern "C" uint64_t native_legacy_surface_stride_raw(OSObject *), native_legacy_surface_allocation(OSObject *),
+    native_legacy_surface_height(OSObject *);
+extern "C" uint64_t native_legacy_surface_stride(OSObject *surface) {
+    const uint64_t stride = native_legacy_surface_stride_raw(surface);
+    const uint64_t allocation = native_legacy_surface_allocation(surface);
+    const uint64_t height = native_legacy_surface_height(surface);
+    if (stride && allocation && height && stride <= allocation / height / 4) return stride * 4;
+    return stride;
+}

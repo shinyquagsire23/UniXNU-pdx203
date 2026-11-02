@@ -239,6 +239,12 @@ kernel_args = [
   "pipa-gpu-perf=5",
   "pipa-ddr-vote=0",
   "pipa-gpu-pool=256",
+  # the Metal plugin (Turnip, the bridge, NativeAdrenoMetal.bundle) and its probe daemon, written into Data from the payload's
+  # gpu addon (UniXNU scripts/make-gpu-addon.py, unixnu build payload --gpu-addon) and mounted over /System/Library/Extensions
+  # and LaunchDaemons before launchd; their CDHashes come from the owner trust bundle (--owner-trust-cache). sheng-fb-gpu=1
+  # hands GPU-composited frames to the panel through the GOP presenter. alioth's working pair since its u208
+  "sheng-gpu-addon=1",
+  "sheng-fb-gpu=1",
 ]
 # Fixups of signed text, applied by the kernel after signature validation and only where the original bytes match
 # (patches/xnu/native-text-fixup.patch). They reach it as /chosen/text-fixups, not on the command line. Each is

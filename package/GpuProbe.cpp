@@ -1554,12 +1554,38 @@ extern "C" void native_gpu_probe(void) {
 // row that changed (GPUROW <index> <text>) to the console, and so to the USB log, polling native_gpu_changes twice a second for the
 // first ten minutes and every 5 s after. Started with the probe by pdx203_gpu_start(), from the late display probe.
 #include <libkern/libkern.h>
+// The GPU addon's install and mounts (the fork's zzy-native-gpu-addon-mount.patch, sheng-gpu-addon=1) keep their progress in
+// globals and print nothing; alioth reads them in its boot log row. Weak, as the kernel only has them with that patch.
+extern "C" {
+extern volatile int native_gpu_addon_files __attribute__((weak_import)), native_gpu_addon_written __attribute__((weak_import)),
+    native_gpu_addon_same __attribute__((weak_import)), native_gpu_addon_failed __attribute__((weak_import)),
+    native_gpu_addon_error __attribute__((weak_import)), native_gpu_addon_stage __attribute__((weak_import)),
+    native_gpu_addon_status __attribute__((weak_import)), native_gpu_addon2_stage __attribute__((weak_import)),
+    native_gpu_addon2_status __attribute__((weak_import)), native_gpu_addon3_stage __attribute__((weak_import)),
+    native_gpu_addon3_status __attribute__((weak_import));
+}
 namespace {
 char gPrinted[kRows][120];
+char gAddonPrinted[120];
+int addonValue(volatile int *value) {return value ? *value : -99;}
+void addonRow() {
+    if (!&native_gpu_addon_files) return;
+    char row[120];
+    snprintf(row, sizeof row, "GPUADDON files %d written %d same %d failed %d error %d | mount %d/%d mount2 %d/%d mount3 %d/%d",
+             addonValue(&native_gpu_addon_files), addonValue(&native_gpu_addon_written), addonValue(&native_gpu_addon_same),
+             addonValue(&native_gpu_addon_failed), addonValue(&native_gpu_addon_error), addonValue(&native_gpu_addon_stage),
+             addonValue(&native_gpu_addon_status), addonValue(&native_gpu_addon2_stage), addonValue(&native_gpu_addon2_status),
+             addonValue(&native_gpu_addon3_stage), addonValue(&native_gpu_addon3_status));
+    if (strncmp(row, gAddonPrinted, sizeof row)) {
+        strlcpy(gAddonPrinted, row, sizeof gAddonPrinted);
+        printf("%s\n", row);
+    }
+}
 void gpuReportThread(void *, wait_result_t)
 {
     uint32_t seen = ~0u;
     for (unsigned round = 0;; ++round) {
+        addonRow();
         uint32_t now = native_gpu_changes;
         if (now != seen) {
             seen = now;
