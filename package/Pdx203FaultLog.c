@@ -200,6 +200,8 @@ pdx203_exit_fault(char *out, unsigned long capacity)
  * Metal plugin, Turnip or the dyld cache). Called from proc_prepareexit (the fork's zzzzzzzzzf-freeze-trace.patch) with the exiting
  * process current. */
 extern unsigned native_legacy_swapwait_dump(char *out, unsigned cap) __attribute__((weak_import));
+/* usb-159: who held the display's work-loop gate, and where (NativeMobileDisplay patch 0002, FBGATE rows) */
+extern unsigned native_legacy_gate_dump(char *out, unsigned cap) __attribute__((weak_import));
 #define FREEZE_THREADS 64
 static struct {uint64_t pc, lr, fp, tid; char name[32];} freeze_threads[FREEZE_THREADS];
 static volatile int freeze_busy;
@@ -278,6 +280,11 @@ pdx203_exit_threads(const char *name, int pid, int rv, int current)
 		pdx203_exit_map(pcs + 10, pcCount - 10 < 10 ? pcCount - 10 : 10);
 	}
 	/* usb-154: the display thread was blocked in kern_SwapWait with every swap retired: the swap waits it made (LegacyDisplayProbe.cpp) */
+	if (&native_legacy_gate_dump) {
+		char gate[512] = "";
+		native_legacy_gate_dump(gate, sizeof(gate));
+		printf("%s", gate);
+	}
 	if (&native_legacy_swapwait_dump) {
 		static char waits[6144];
 		native_legacy_swapwait_dump(waits, sizeof(waits));
