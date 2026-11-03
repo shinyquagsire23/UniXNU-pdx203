@@ -77,6 +77,92 @@ void emit(const char *text) {
 
 }  // namespace
 
+// The live stream `log stream` uses (LoggingSupport, private): OSLogEventLiveStore +liveLocalStore, -prepareWithCompletionHandler: gives an
+// OSLogEventLiveSource, OSLogEventLiveStream -initWithLiveSource: with an event handler, -activate. OSLogStore (the stored log) answered nil
+// without an error on pdx203, for both +localStoreAndReturnError: and +storeWithScope:error:.
+namespace {
+Filter gFilter;
+long gSentThisSecond;
+time_t gSecond;
+unsigned long gDropped;
+id gKeepStore, gKeepStream;   // the live store and stream stay alive for the process
+
+// logType: 0x00 default (notice), 0x01 info, 0x02 debug, 0x10 error, 0x11 fault -> the OSLogEntryLog levels of filter.txt.
+long levelOfType(long type) {
+    switch (type) {
+    case 0x02: return 1;
+    case 0x01: return 2;
+    case 0x10: return 4;
+    case 0x11: return 5;
+    default: return 3;
+    }
+}
+
+id value(id object, NSString *key) {
+    @try {return [object valueForKey:key];} @catch (NSException *) {return nil;}
+}
+
+void handle(id event) {
+    NSString *process = value(event, @"process");
+    const char *name = process.UTF8String ?: "?";
+    if (!wanted(gFilter, name)) return;
+    const long level = levelOfType([value(event, @"logType") integerValue]);
+    if (level < gFilter.level) return;
+    const time_t now = time(nullptr);
+    if (now != gSecond) {gSecond = now; gSentThisSecond = 0;}
+    if (gSentThisSecond >= gFilter.rate) {++gDropped; return;}
+    ++gSentThisSecond;
+    NSString *message = value(event, @"composedMessage");
+    NSString *subsystem = value(event, @"subsystem"), *category = value(event, @"category");
+    const int pid = [value(event, @"processIdentifier") intValue];
+    std::string text = message.UTF8String ?: "";
+    for (char &c : text) if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+    if (text.size() > 300) text.resize(300);
+    char line[420];
+    snprintf(line, sizeof line, "OSLOG %s[%d] %c %s:%s %s\n", name, pid, levelLetter(level), subsystem.UTF8String ?: "",
+             category.UTF8String ?: "", text.c_str());
+    emit(line);
+}
+
+bool startLiveStream() {
+    char line[300];
+    void *support = dlopen("/System/Library/PrivateFrameworks/LoggingSupport.framework/LoggingSupport", RTLD_NOW);
+    Class storeClass = objc_getClass("OSLogEventLiveStore"), streamClass = objc_getClass("OSLogEventLiveStream");
+    snprintf(line, sizeof line, "OSLOG LoggingSupport %s, live store %s, live stream %s\n", support ? "loaded" : (dlerror() ?: "not loaded"),
+             storeClass ? "found" : "missing", streamClass ? "found" : "missing");
+    emit(line);
+    if (!storeClass || !streamClass || ![storeClass respondsToSelector:@selector(liveLocalStore)]) return false;
+    id store = ((id (*)(Class, SEL))objc_msgSend)(storeClass, @selector(liveLocalStore));
+    if (!store) {emit("OSLOG liveLocalStore answered nil\n"); return false;}
+    gKeepStore = store;
+    void (^prepared)(id, NSError *) = ^(id source, NSError *error) {
+        if (!source) {
+            char text[300];
+            snprintf(text, sizeof text, "OSLOG live source refused: %s\n", (error ? error.description : @"nil, no error").UTF8String);
+            emit(text);
+            return;
+        }
+        id stream = ((id (*)(id, SEL, id))objc_msgSend)([streamClass alloc], @selector(initWithLiveSource:), source);
+        if (!stream) {emit("OSLOG live stream: init failed\n"); return;}
+        gKeepStream = stream;
+        void (^events)(id) = ^(id event) {@autoreleasepool {handle(event);}};
+        ((void (*)(id, SEL, id))objc_msgSend)(stream, @selector(setEventHandler:), events);
+        if ([stream respondsToSelector:@selector(setInvalidationHandler:)]) {
+            void (^invalid)(int, id) = ^(int reason, id) {
+                char text[100];
+                snprintf(text, sizeof text, "OSLOG live stream invalidated (%d)\n", reason);
+                emit(text);
+            };
+            ((void (*)(id, SEL, id))objc_msgSend)(stream, @selector(setInvalidationHandler:), invalid);
+        }
+        ((void (*)(id, SEL))objc_msgSend)(stream, @selector(activate));
+        emit("OSLOG live stream active\n");
+    };
+    ((void (*)(id, SEL, id))objc_msgSend)(store, @selector(prepareWithCompletionHandler:), prepared);
+    return true;
+}
+}  // namespace
+
 int main() {
     @autoreleasepool {
         Filter filter = load();
@@ -84,6 +170,13 @@ int main() {
         snprintf(line, sizeof line, "OSLOG forwarder started (pid %d): %zu names, %zu prefixes%s, level %ld, rate %ld/s\n", getpid(),
                  filter.exact.size(), filter.prefix.size(), filter.all ? ", all processes" : "", filter.level, filter.rate);
         emit(line);
+        gFilter = filter;
+        if (startLiveStream()) {
+            for (;;) {
+                sleep(10);
+                if (gDropped) {snprintf(line, sizeof line, "OSLOG dropped %lu lines over the rate limit so far\n", gDropped); emit(line);}
+            }
+        }
         // OSLogStore lives in OSLog.framework (linked); load it by path as well and say what dyld answers if the class is still missing.
         void *oslog = dlopen("/System/Library/Frameworks/OSLog.framework/OSLog", RTLD_NOW);
         Class storeClass = NSClassFromString(@"OSLogStore") ?: objc_getClass("OSLogStore");
