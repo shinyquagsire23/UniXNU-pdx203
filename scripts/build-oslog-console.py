@@ -23,7 +23,8 @@ subprocess.run(['xcrun', 'clang++', '-target', 'arm64-apple-ios17.0', '-isysroot
                check=True)
 # The logging grants adrenoprobed carries for its OSLogStore export (UniXNU scripts/build-adreno-metal-plugin.py), outside every container.
 entitlements = out / 'entitlements.plist'
-entitlements.write_bytes(plistlib.dumps({'com.apple.private.security.no-container': True, 'com.apple.private.logging.admin': True,
+entitlements.write_bytes(plistlib.dumps({'com.apple.private.security.no-container': True, 'com.apple.logging.local-store': True,
+                                         'com.apple.private.logging.admin': True,
                                          'com.apple.private.logging.diagnostic': True, 'com.apple.private.logging.stream': True}))
 # The identifier of the program it stands in for, in case the launchd job's constraints name it.
 subprocess.run(['codesign', '--force', '--sign', '-', '--pagesize', '4096', '--identifier', 'com.apple.IOMFB_FDR_Loader',

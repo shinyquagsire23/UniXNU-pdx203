@@ -95,12 +95,24 @@ int main() {
         for (unsigned pass = 0;; ++pass) {
             @autoreleasepool {
                 NSError *error = nil;
-                // Scope 0 (system) is not in the iOS SDK headers; the class answers it at run time with the logging entitlements.
-                id store = storeClass ? ((id (*)(Class, SEL, NSInteger, NSError **))objc_msgSend)(storeClass, @selector(storeWithScope:error:), 0, &error)
-                                      : nil;
+                // iOS: +localStoreAndReturnError: (every process's entries with com.apple.logging.local-store); then the system scope (0),
+                // which storeWithScope:error: (not in the iOS SDK headers) answered with nil on pdx203.
+                id store = nil;
+                const char *how = "none";
+                if (storeClass && [storeClass respondsToSelector:@selector(localStoreAndReturnError:)]) {
+                    store = ((id (*)(Class, SEL, NSError **))objc_msgSend)(storeClass, @selector(localStoreAndReturnError:), &error);
+                    how = "localStoreAndReturnError:";
+                }
+                if (!store && storeClass && [storeClass respondsToSelector:@selector(storeWithScope:error:)]) {
+                    NSError *second = nil;
+                    store = ((id (*)(Class, SEL, NSInteger, NSError **))objc_msgSend)(storeClass, @selector(storeWithScope:error:), 0, &second);
+                    if (!store && !error) error = second;
+                    how = "storeWithScope:error:";
+                }
+                if (store && pass == 0) {snprintf(line, sizeof line, "OSLOG store from %s\n", how); emit(line);}
                 if (!store) {
                     if (pass % 30 == 0) {
-                        snprintf(line, sizeof line, "OSLOG no store: %s\n", (error ? error.description : @"OSLogStore missing").UTF8String);
+                        snprintf(line, sizeof line, "OSLOG no store (%s): %s\n", how, (error ? error.description : @"nil, no error").UTF8String);
                         emit(line);
                     }
                     sleep(1);
