@@ -13,6 +13,12 @@
 // "all" forwards every process at that level. Without the file a built-in list is used.
 #import <Foundation/Foundation.h>
 #include <dlfcn.h>
+#include <fts.h>
+#include <signal.h>
+#include <sys/stat.h>
+// libproc (in libSystem on iOS too; the iOS SDK leaves the header out)
+extern "C" int proc_listallpids(void *buffer, int buffersize);
+extern "C" int proc_name(int pid, void *buffer, uint32_t buffersize);
 #include <fcntl.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -163,6 +169,47 @@ bool startLiveStream() {
 }
 }  // namespace
 
+// The LaunchServices database (csstore) on Data: every one found is logged with its size. With /private/var/ngpu/oslog/lsrebuild (an addon
+// marker) and no lsrebuild.done next to it, they are removed once and lsd is stopped: launchd starts it again on demand and it rebuilds
+// the database from the system's bundles. pdx203: WebKit's WebContent extension (in the OS cryptex, reached through the addon's overlay)
+// was not in the database ("Error launching process ... OSStatus error -10814"), so Safari never started a web process.
+namespace {
+void launchServicesDatabase() {
+    char line[600];
+    const bool rebuild = access("/private/var/ngpu/oslog/lsrebuild", F_OK) == 0 && access("/private/var/ngpu/oslog/lsrebuild.done", F_OK) != 0;
+    char *roots[] = {(char *)"/private/var/containers/Data/System", (char *)"/private/var/mobile/Containers/Data/InternalDaemon",
+                     (char *)"/private/var/mobile/Library/Caches", (char *)"/private/var/db", (char *)"/private/var/root/Library/Caches", nullptr};
+    FTS *fts = fts_open(roots, FTS_PHYSICAL | FTS_NOCHDIR | FTS_XDEV, nullptr);
+    unsigned found = 0, removed = 0;
+    if (fts) {
+        while (FTSENT *e = fts_read(fts)) {
+            if (e->fts_level > 6 && e->fts_info == FTS_D) {fts_set(fts, e, FTS_SKIP); continue;}
+            if (e->fts_info != FTS_F) continue;
+            const size_t n = strlen(e->fts_name);
+            if (n < 8 || strcmp(e->fts_name + n - 8, ".csstore")) continue;
+            ++found;
+            snprintf(line, sizeof line, "OSLOG csstore %s (%lld bytes)%s\n", e->fts_path, (long long)e->fts_statp->st_size, rebuild ? ", removing" : "");
+            emit(line);
+            if (rebuild && unlink(e->fts_path) == 0) ++removed;
+        }
+        fts_close(fts);
+    }
+    if (!rebuild) {snprintf(line, sizeof line, "OSLOG csstore: %u found\n", found); emit(line); return;}
+    int fd = open("/private/var/ngpu/oslog/lsrebuild.done", O_CREAT | O_WRONLY, 0644);
+    if (fd >= 0) close(fd);
+    pid_t pids[2048];
+    const int bytes = proc_listallpids(pids, sizeof pids);
+    unsigned killed = 0;
+    for (int i = 0; i < bytes / (int)sizeof(pid_t); ++i) {
+        char name[64] = {};
+        if (proc_name(pids[i], name, sizeof name) > 0 && !strcmp(name, "lsd") && kill(pids[i], SIGKILL) == 0) ++killed;
+    }
+    snprintf(line, sizeof line, "OSLOG csstore: %u found, %u removed, lsd stopped %u times: LaunchServices rebuilds its database\n", found, removed,
+             killed);
+    emit(line);
+}
+}  // namespace
+
 int main() {
     @autoreleasepool {
         Filter filter = load();
@@ -171,6 +218,7 @@ int main() {
                  filter.exact.size(), filter.prefix.size(), filter.all ? ", all processes" : "", filter.level, filter.rate);
         emit(line);
         gFilter = filter;
+        launchServicesDatabase();
         if (startLiveStream()) {
             for (;;) {
                 sleep(10);
