@@ -6,7 +6,8 @@
   pdx203-rig.py --socket ... tap 0.5 0.3                   x, y as fractions of the panel's width and height (portrait)
   pdx203-rig.py --socket ... swipe 0.5 0.8 0.5 0.2 [300]   from, to, duration in ms
   pdx203-rig.py --socket ... key power                     press and release (power, volup, voldown, home)
-  pdx203-rig.py --socket ... bootloader                    restart into fastboot (REBOOT: IMEM + PON reason, warm reset)
+  pdx203-rig.py --socket ... bootloader                    restart into recovery (REBOOT: PON reason 0x04, warm reset)
+  pdx203-rig.py --socket ... reboot                        restart iPadOS (REBOOT to recovery, then adb reboot)
   pdx203-rig.py --socket ... flash <boot.img>              bootloader, wait for fastboot, flash boot_a, reboot
 
 Touch and keys go through the kernel's board input hook (package/Pdx203TouchProbe.cpp qcom_usb_debug_board_input): an extra finger
@@ -97,6 +98,25 @@ def flash(sock, image, wait=90):
     subprocess.run(['fastboot', 'reboot'], check=True)
 
 
+def reboot(sock, wait=120):
+    """Restart iPadOS: REBOOT lands in recovery (PON spare 0x04), and adb reboot starts the normal boot from there."""
+    try:
+        request(sock, 'REBOOT')
+    except (control.ControlError, OSError) as exc:
+        print(f'REBOOT request failed ({exc}); waiting for recovery anyway', file=sys.stderr)
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        adb = subprocess.run(['adb', 'devices'], capture_output=True, text=True).stdout
+        if any(line.split()[1:] == ['recovery'] for line in adb.splitlines()[1:] if line.strip()):
+            subprocess.run(['adb', 'reboot'], check=True)
+            return
+        if fastboot_devices():
+            subprocess.run(['fastboot', 'reboot'], check=True)
+            return
+        time.sleep(1)
+    raise SystemExit('neither recovery nor fastboot appeared')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--socket', required=True, type=Path)
@@ -107,6 +127,7 @@ def main():
     p = sub.add_parser('swipe'); [p.add_argument(n) for n in ('x1', 'y1', 'x2', 'y2')]; p.add_argument('ms', nargs='?', type=int, default=300)
     p = sub.add_parser('key'); p.add_argument('name', choices=('power', 'volup', 'voldown', 'home'))
     sub.add_parser('bootloader')
+    sub.add_parser('reboot')
     p = sub.add_parser('flash'); p.add_argument('image')
     a = parser.parse_args()
     if a.cmd == 'status':
@@ -121,6 +142,8 @@ def main():
         key(a.socket, a.name)
     elif a.cmd == 'bootloader':
         print(json.dumps(request(a.socket, 'REBOOT').fields))
+    elif a.cmd == 'reboot':
+        reboot(a.socket)
     elif a.cmd == 'flash':
         flash(a.socket, a.image)
 
