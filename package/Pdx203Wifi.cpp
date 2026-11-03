@@ -18,6 +18,9 @@
 #include <IOKit/IODeviceTreeSupport.h>
 #include <libkern/c++/OSData.h>
 #include <string.h>
+#include <stdarg.h>
+#include <mach/kmod.h>
+#include <libkern/c++/OSMetaClass.h>
 extern "C" {
 #include "SmmuBypass.h"
 #include "nw_abi.h"
@@ -457,6 +460,30 @@ void msiWait(unsigned ms) {
     gMsiWake = 0;
 }
 
+// The network side (WifiNet.cpp, sheng's): its classes register with the kernel's module like the other late classes (static initialiser
+// globalised by the build), then en0 and the IO80211 registry entries are made once the module has a station interface.
+}  // namespace
+extern kmod_info_t g_kernel_kmod_info;
+extern "C" void native_wifi_net_static_init(void) __asm__("__GLOBAL__sub_I_WifiNet.cpp");
+extern "C" void sheng_wifi_net_start(const uint8_t mac[6]);
+extern "C" void native_wifi_logf(int level, const char *fmt, ...) {
+    char line[160]; va_list ap; va_start(ap, fmt); vsnprintf(line, sizeof line, fmt, ap); va_end(ap);
+    pLog(level, line);
+}
+// WifiNet's unattended join reads join.txt here (absent unless the add-on carries one); wlan_mac.bin is made from the chip id.
+extern "C" int sheng_wifi_file(const char *name, const uint8_t **data, size_t *size) {return pFwGet(name, data, size);}
+// WifiNet queued a frame: the WiFi thread sends it now instead of at its next wake.
+extern "C" void sheng_wifi_wake(void) {gMsiWake = 1; thread_wakeup(event_t(&gMsiWake));}
+namespace {
+void netStart() {
+    struct nw_wifi_status status; nw_wifi_status_get(&status);
+    void *handle = OSMetaClass::preModLoad(g_kernel_kmod_info.name);
+    if (!handle) {pLog(3, "wifi: network classes: no module handle"); return;}
+    native_wifi_net_static_init();
+    if (const OSReturn r = OSMetaClass::postModLoad(handle)) {char t[64]; snprintf(t, sizeof t, "wifi: network classes not registered: %d", (int)r); pLog(3, t); return;}
+    sheng_wifi_net_start(status.mac);
+}
+
 void wifiStack(volatile uint32_t *config, volatile uint32_t *dbi) {
     gCfg = config; gDbi = dbi;
     PE_parse_boot_argn("pdx203-wifi-verbose", &gVerbose, sizeof gVerbose);
@@ -488,8 +515,12 @@ void wifiStack(volatile uint32_t *config, volatile uint32_t *dbi) {
     pLog(r ? 3 : 6, t);
     uint32_t lastStage = 0xffffffffu;
     uint64_t nextReport = 0;
+    bool netDone = false;
+    unsigned net = 1;
+    PE_parse_boot_argn("pdx203-wifi-net", &net, sizeof net);   // 0: the radio only, no en0 for iOS
     for (;;) {
         const int busy = nw_wifi_step();
+        if (net && !netDone && nw_wifi_stats.stage >= 4) {netDone = true; netStart();}
         if (!busy) {if (gMsiAttached) msiWait(10); else IOSleep(1);}
         const uint64_t now = pNow();
         if (nw_wifi_stats.stage != lastStage || now >= nextReport) {
