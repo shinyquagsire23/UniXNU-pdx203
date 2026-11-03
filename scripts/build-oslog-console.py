@@ -26,7 +26,15 @@ entitlements = out / 'entitlements.plist'
 entitlements.write_bytes(plistlib.dumps({'com.apple.private.security.no-container': True, 'com.apple.logging.local-store': True,
                                          'com.apple.lsapplicationworkspace.rebuildappdatabases': True,
                                          'com.apple.private.logging.admin': True,
-                                         'com.apple.private.logging.diagnostic': True, 'com.apple.private.logging.stream': True}))
+                                         'com.apple.private.logging.diagnostic': True, 'com.apple.private.logging.stream': True,
+                                         # SystemAppMigrator run in-process (installStagedSystemApps): com.apple.datamigrator's install grants
+                                         'com.apple.private.InstallCoordination.allowed': True,
+                                         'com.apple.private.MobileContainerManager.allowed': True,
+                                         'com.apple.private.amfi.can-check-trust-cache': True, 'com.apple.appstored.private': True,
+                                         'com.apple.private.mobileinstall.allowedSPI': [
+                                             'DataMigratorUpdateDataProtection', 'InstallForDataMigrator', 'InstallForLaunchServices',
+                                             'RegisterSafeHarbor', 'ProcessRestoredContainer', 'UninstallForLaunchServices',
+                                             'LookupSystemAppState', 'UpdateSystemAppState', 'SetSystemAppMigrationComplete']}))
 # The identifier of the program it stands in for, in case the launchd job's constraints name it.
 subprocess.run(['codesign', '--force', '--sign', '-', '--pagesize', '4096', '--identifier', 'com.apple.IOMFB_FDR_Loader',
                 '--entitlements', str(entitlements), str(exe)], check=True)

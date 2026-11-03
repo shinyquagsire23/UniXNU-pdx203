@@ -231,6 +231,46 @@ void launchServicesDatabase() {
 }
 }  // namespace
 
+// The deletable system apps (Maps, Music, Stocks, ...): a restore leaves them as placeholders ("Waiting...") that the first-boot data
+// migration fills from /private/var/staged_system_apps (kernel patch zzy-staged-system-apps copies them onto the owner Data volume). The
+// migrator runs its plugins only when the build changes, so on this board it never did. With /private/var/ngpu/oslog/systemapps (an addon
+// marker) and no systemapps.done next to it, the one plugin that installs them (SystemAppMigrator, through InstallCoordination with the
+// entitlements com.apple.datamigrator has) runs here once, a minute after boot. A marker whose first line is "upgrade" runs it as after
+// an OS update (didUpgrade).
+namespace {
+void installStagedSystemApps() {
+    constexpr const char *kMarker = "/private/var/ngpu/oslog/systemapps", *kDone = "/private/var/ngpu/oslog/systemapps.done";
+    if (access(kMarker, F_OK) != 0 || access(kDone, F_OK) == 0) return;
+    char first[32] = {};
+    if (FILE *file = fopen(kMarker, "r")) {fgets(first, sizeof first, file); fclose(file);}
+    const bool upgrade = !strncmp(first, "upgrade", 7);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        @autoreleasepool {
+            char line[400];
+            struct stat staged;
+            const bool present = stat("/private/var/staged_system_apps", &staged) == 0;
+            void *framework = dlopen("/System/Library/PrivateFrameworks/DataMigration.framework/DataMigration", RTLD_NOW);
+            Class migratorClass = objc_getClass("DataClassMigrator");
+            id migrator = nil;
+            if (migratorClass && [migratorClass respondsToSelector:@selector(dataClassMigratorForBundleAtPath:)])
+                migrator = ((id (*)(Class, SEL, NSString *))objc_msgSend)(migratorClass, @selector(dataClassMigratorForBundleAtPath:),
+                                                                          @"/System/Library/DataClassMigrators/SystemAppMigrator.migrator");
+            snprintf(line, sizeof line, "OSLOG system apps: staged directory %s, DataMigration %s, migrator %s%s\n", present ? "present" : "missing",
+                     framework ? "loaded" : (dlerror() ?: "not loaded"), migrator ? object_getClassName(migrator) : "none",
+                     upgrade ? ", as an upgrade" : "");
+            emit(line);
+            if (!migrator) return;
+            if (upgrade && [migrator respondsToSelector:@selector(setDidUpgrade:)])
+                ((void (*)(id, SEL, BOOL))objc_msgSend)(migrator, @selector(setDidUpgrade:), YES);
+            const BOOL ok = ((BOOL (*)(id, SEL))objc_msgSend)(migrator, @selector(performMigration));
+            snprintf(line, sizeof line, "OSLOG system apps: SystemAppMigrator performMigration %s\n", ok ? "succeeded" : "failed");
+            emit(line);
+            if (ok) {int fd = open(kDone, O_CREAT | O_WRONLY, 0644); if (fd >= 0) close(fd);}
+        }
+    });
+}
+}  // namespace
+
 int main() {
     @autoreleasepool {
         Filter filter = load();
@@ -240,6 +280,7 @@ int main() {
         emit(line);
         gFilter = filter;
         launchServicesDatabase();
+        installStagedSystemApps();
         if (startLiveStream()) {
             for (;;) {
                 sleep(10);
