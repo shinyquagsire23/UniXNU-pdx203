@@ -85,6 +85,13 @@ def flash(sock, image, wait=90):
     while not fastboot_devices():
         if time.monotonic() > deadline:
             raise SystemExit('no fastboot device appeared')
+        # A reset that lands in recovery (TWRP, with adb) instead: from there adb reboot bootloader reaches fastboot.
+        adb = subprocess.run(['adb', 'devices'], capture_output=True, text=True).stdout
+        if any(line.split()[1:] == ['recovery'] for line in adb.splitlines()[1:] if line.strip()):
+            print('in recovery; adb reboot bootloader', file=sys.stderr)
+            subprocess.run(['adb', 'reboot', 'bootloader'], check=False)
+            deadline = time.monotonic() + wait
+            time.sleep(5)
         time.sleep(1)
     subprocess.run(['fastboot', 'flash', 'boot_a', str(image)], check=True)
     subprocess.run(['fastboot', 'reboot'], check=True)

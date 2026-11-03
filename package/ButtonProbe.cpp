@@ -351,11 +351,16 @@ void markBootloader(void) {
         __asm__ volatile("dsb sy" ::: "memory");
         imemAfter = imem[0x65c / 4];
     }
+    // The PON spare register is left alone unless pdx203-fastboot-pon=<raw byte> names a value: usb-165 wrote 0x04 (Linux's
+    // mode-bootloader 2 << 1) over 0x82 and Sony's boot chain started recovery with warmboot=0x77665502, the recovery magic, although
+    // the IMEM cell read back 0x77665500.
     uint8_t spare = 0, spareAfter = 0;
     int rc = -9;
+    unsigned ponRaw = 0x100;
+    PE_parse_boot_argn("pdx203-fastboot-pon", &ponRaw, sizeof ponRaw);
     if (gPonWrite >= 0) {
         rc = read8(gPonWrite, 0x8F, &spare);
-        rc |= write8(gPonWrite, 0x8F, (uint8_t)((spare & 0x01) | (2u << 1)));
+        if (ponRaw <= 0xff) rc |= write8(gPonWrite, 0x8F, (uint8_t)ponRaw);
         rc |= read8(gPonWrite, 0x8F, &spareAfter);
     }
     printf("BOARD bootloader: imem %08x>%08x pon spare %02x>%02x rc %d\n", imemBefore, imemAfter, spare, spareAfter, rc);
