@@ -256,6 +256,8 @@ require(code(rtc_obj.read_bytes(),macho(rtc_obj.read_bytes()))==code(rtc_late.re
 # osfmk C line; the firmware reader (AdspFirmware.c, the modem_a FAT volume through NativeUfs) with the bsd one, as sheng builds it.
 adsp_src,adsp_probe=board_cpp('AdspProbe.cpp')
 audio_src,audio_probe=board_cpp('Pdx203Audio.cpp')
+# the headphone jack (WCD938x over SoundWire, the LPASS RX/TX macros), driven from Pdx203Audio.cpp
+hph_src,hph_obj=board_cpp('Pdx203Hph.cpp')
 # the audio service iOS's audio server plug-in opens (sheng's ShengAudioService.cpp): its classes register late from Pdx203Audio.cpp
 audio_svc_src,audio_svc_obj=board_cpp('ShengAudioService.cpp')
 audio_svc_late=OUT/'ShengAudioService.late.o'
@@ -287,10 +289,10 @@ require(code((keyevents/'NativeKeyStoreEvents.o').read_bytes(),macho((keyevents/
         code(keyevents_late.read_bytes(),macho(keyevents_late.read_bytes())),'Owned keystore instructions unchanged by late init staging')
 archive=OUT/'libNativeLegacyDisplay.late.a';archive.unlink(missing_ok=True)
 run(['xcrun','ar','rcs',archive,late,OUT/'original-bindings.o',probe,hid_probe,touch_probe,hid/'NativeHidInput.late.o',hid/'hid-original-bindings.o',
-     keystore_probe,keyevents_late,cpufreq_probe,buttons_probe,battery_late,battery_probe,rtc_late,rtc_probe,adsp_probe,audio_probe,audio_svc_late,*[o for _,o in adsp_c]])
+     keystore_probe,keyevents_late,cpufreq_probe,buttons_probe,battery_late,battery_probe,rtc_late,rtc_probe,adsp_probe,audio_probe,hph_obj,audio_svc_late,*[o for _,o in adsp_c]])
 sources=[ROOT/'drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp',ROOT/'drivers/NativeMobileDisplay/NativeLegacyRequest.h',source,
          hid_src,touch_src,ROOT/'drivers/NativeHidInput/NativeHidInput.cpp',keystore_src,ROOT/'drivers/NativeKeyStoreEvents/NativeKeyStoreEvents.cpp',cpufreq_src,buttons_src,
-         ROOT/'kits/pdx203/ButtonsCore.h',battery_src,battery_probe_src,rtc_src,rtc_probe_src,adsp_src,audio_src,audio_svc_src,*[c for c,_ in adsp_c]]
+         ROOT/'kits/pdx203/ButtonsCore.h',battery_src,battery_probe_src,rtc_src,rtc_probe_src,adsp_src,audio_src,hph_src,audio_svc_src,*[c for c,_ in adsp_c]]
 print(run(['python3',ROOT/'scripts/build-arm-driver.py','NativeGOPPresenter'],text=True),end='')
 gop=ROOT/'build/native-gop-presenter';gop_late=gop/'NativeGOPPresenter.late.o'
 run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_NativeGOPPresenter.cpp',

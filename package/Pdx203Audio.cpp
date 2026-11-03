@@ -47,6 +47,13 @@ extern volatile int32_t native_adsp_stats[16] __attribute__((weak_import));
 extern char native_adsp_text[96] __attribute__((weak_import));
 extern volatile int32_t native_qrtr_stats[16] __attribute__((weak_import));
 extern char native_qrtr_text[96] __attribute__((weak_import));
+// the headphone jack (Pdx203Hph.cpp): codec, SoundWire and RX macro; the DSP side is here
+int pdx203_hph_init(void);
+int pdx203_hph_jack(void);
+int pdx203_hph_on(void);
+void pdx203_hph_off(void);
+void pdx203_hph_print(const char *what);
+extern volatile int32_t pdx203_hph_stats[16];
 // [0] stage (positive progress, negative the step that failed), [1] SE2 protocol << 24 | M_CLK_CFG, [2] amplifiers that answered (bit
 // per amplifier), [3] I2C failures, [4] last I2C error status, [5] APR channel up, [6] APR messages in, [7] APR messages out,
 // [8] the DSP's audio state (-1 not asked yet), [9] state queries, [10] last APR opcode in, [11] last APR basic result (opcode << 0
@@ -311,6 +318,7 @@ constexpr uint32_t kAsmMap = 0x00010d92, kAsmMapRsp = 0x00010d93, kAsmUnmap = 0x
                    kAsmPause = 0x00010bd3, kAsmClose = 0x00010bcd;
 constexpr uint32_t kAdmOpen = 0x00010326, kAdmOpenRsp = 0x00010329, kAdmMap = 0x00010325, kAdmClose = 0x00010327;
 constexpr uint16_t kSenMi2sRx = 0x1018, kAsmPort = 0x0101;   // session 1, stream 1
+constexpr uint16_t kRxCdcDma0 = 0xb030;                      // RX_CODEC_DMA_RX_0: the RX macro, the WCD938x's headphone amplifiers
 constexpr uint32_t kAsmSession = 1;
 
 ShengAdspChannel *gApr;
@@ -469,10 +477,18 @@ int afeVote(uint32_t block, int32_t *handle) {
     p.u32(0x14, block); p.u32(0x18, (uint32_t)handle);
     return aprCall(p, 0);
 }
-int afeClock(bool enable) {   // AFE_SVC_CMD_SET_PARAM, module CLOCK_SET: SEN_MI2S_IBIT at 1.536 MHz
+int afeClockSet(uint32_t id, uint32_t hz, bool enable) {   // AFE_SVC_CMD_SET_PARAM, module CLOCK_SET, attri COUPLE_NO, root 0
     Packet p(kSvcAfe, 0, 0, 1024, kAfeSvcSetParam, 0x44);
     p.u32(0x14, 32); p.u32(0x24, 0x0001028f); p.u32(0x28, 0x00010290); p.u16(0x2c, 20);
-    p.u32(0x30, 1); p.u32(0x34, 0x10d); p.u32(0x38, 1536000); p.u16(0x3c, 1); p.u16(0x3e, 0); p.u32(0x40, enable ? 1 : 0);
+    p.u32(0x30, 1); p.u32(0x34, id); p.u32(0x38, hz); p.u16(0x3c, 1); p.u16(0x3e, 0); p.u32(0x40, enable ? 1 : 0);
+    return aprCall(p, 0);
+}
+int afeClock(bool enable) {return afeClockSet(0x10d, 1536000, enable);}   // SEN_MI2S_IBIT at 1.536 MHz
+// RX_CODEC_DMA_RX_0: AFE_PARAM_ID_CODEC_DMA_CONFIG {minor 1, 48 kHz, 16 bit, linear PCM, 2 channels, channels 0 and 1}
+int afeCdcConfig() {
+    Packet p(kSvcAfe, 0, 0, 0, kAfePortSetParam, 0x40);
+    p.u16(0x14, kRxCdcDma0); p.u16(0x16, 28); p.u32(0x24, 0x0001020c); p.u32(0x28, 0x000102b8); p.u16(0x2c, 16);
+    p.u32(0x30, 1); p.u32(0x34, 48000); p.u16(0x38, 16); p.u16(0x3a, 0); p.u16(0x3c, 2); p.u16(0x3e, 3);
     return aprCall(p, 0);
 }
 int afePortConfig() {   // AFE_PORT_CMD_SET_PARAM_V2, AFE_PARAM_ID_I2S_CONFIG: 16 bit, SD0, stereo, internal WS, 48 kHz, linear PCM
@@ -481,9 +497,9 @@ int afePortConfig() {   // AFE_PORT_CMD_SET_PARAM_V2, AFE_PARAM_ID_I2S_CONFIG: 1
     p.u32(0x30, 1); p.u16(0x34, 16); p.u16(0x36, 1); p.u16(0x38, 1); p.u16(0x3a, 1); p.u32(0x3c, 48000); p.u16(0x40, 0);
     return aprCall(p, 0);
 }
-int afePort(uint32_t opcode) {
+int afePort(uint32_t opcode, uint16_t dev = kSenMi2sRx) {
     Packet p(kSvcAfe, 0, 0, 0, opcode, 0x18);
-    p.u16(0x14, kSenMi2sRx);
+    p.u16(0x14, dev);
     return aprCall(p, 0);
 }
 int asmMap(int32_t *handle) {
@@ -499,9 +515,9 @@ int asmOpen() {   // legacy stream to the device matrix, 16 bit, the DSP's defau
     p.u32(0x14, 0); p.u16(0x18, 0); p.u16(0x1a, 16); p.u32(0x1c, 0x00010be4); p.u32(0x20, 0x00010da5);
     return aprCall(p, 0);
 }
-int admOpen(int32_t *copp) {   // COPP on the senary MI2S with the null topology, 2 channels, 16 bit, 48 kHz, FL/FR
-    Packet p(kSvcAdm, kSenMi2sRx, kSenMi2sRx, 0, kAdmOpen, 0x30);
-    p.u16(0x14, 0); p.u16(0x16, 1); p.u16(0x18, kSenMi2sRx); p.u16(0x1a, 0xffff); p.u32(0x1c, 0x00010312);
+int admOpen(int32_t *copp, uint16_t dev) {   // COPP on the device port with the null topology, 2 channels, 16 bit, 48 kHz, FL/FR
+    Packet p(kSvcAdm, dev, dev, 0, kAdmOpen, 0x30);
+    p.u16(0x14, 0); p.u16(0x16, 1); p.u16(0x18, dev); p.u16(0x1a, 0xffff); p.u32(0x1c, 0x00010312);
     p.u16(0x20, 2); p.u16(0x22, 16); p.u32(0x24, 48000); p.u8(0x28, 1); p.u8(0x29, 2);
     AprMessage m;
     const int rc = aprCall(p, kAdmOpenRsp, &m);
@@ -517,8 +533,8 @@ int admRoute(int32_t copp) {
     p.u32(0x14, 0); p.u32(0x18, 1); p.u16(0x1c, kAsmSession); p.u16(0x1e, 1); p.u16(0x20, (uint16_t)copp);
     return aprCall(p, 0);
 }
-int admClose(int32_t copp) {
-    Packet p(kSvcAdm, kSenMi2sRx, (uint16_t)copp, 0, kAdmClose, 0x14);
+int admClose(int32_t copp, uint16_t dev) {
+    Packet p(kSvcAdm, dev, (uint16_t)copp, 0, kAdmClose, 0x14);
     return aprCall(p, 0);
 }
 int asmFormat() {
@@ -566,6 +582,9 @@ constexpr int64_t kDriftLimit = 3 * kPeriodFrames;
 struct Path {
     int32_t macro = -1, dcodec = -1, map = -1, copp = -1;
     bool clock, port, ampsOn, opened, running, tone;
+    bool hphReady, hphOn, hphForce;   // the headphone codec is up; this run plays on it; pdx203-hph-force=1 treats the jack as in
+    int jack = -1;                    // -1 unknown, 0 out, 1 in
+    uint16_t dev = kSenMi2sRx;        // the AFE port this run plays on
     uint64_t next, done, first, stopAsked;
     uint32_t inFlight;
     IOBufferMemoryDescriptor *control, *outRing, *inRing;
@@ -680,11 +699,13 @@ void stopOutput() {
     if (gPath.opened) asmSimple(kAsmPause, 0x14);
     if (gPath.ampsOn) for (unsigned amp = 0; amp < 2; ++amp) ampStop(amp);
     gPath.ampsOn = false;
+    if (gPath.hphOn) pdx203_hph_off();   // the codec down while the DMA still runs (the PDM stream must outlive the amplifiers)
+    gPath.hphOn = false;
     if (gPath.opened) asmSimple(kAsmClose, 0x14);
     gPath.opened = false;
-    if (gPath.copp >= 0) admClose(gPath.copp);
+    if (gPath.copp >= 0) admClose(gPath.copp, gPath.dev);
     gPath.copp = -1;
-    if (gPath.port) afePort(kAfeStop);
+    if (gPath.port) afePort(kAfeStop, gPath.dev);
     gPath.port = false;
     if (gPath.clock) afeClock(false);
     gPath.clock = false;
@@ -695,18 +716,29 @@ bool startOutput() {
     if (gPath.running) return true;
     int rc = 0;
     auto failed = [&](int n) {gPlay[0] = -n; gPlay[1] = rc; gServe[2] = gServe[2] + 1; stopOutput(); printPlay("failed"); return false;};
-    if ((rc = afeClock(true))) return failed(4);
-    gPath.clock = true;
-    if ((rc = afePortConfig())) return failed(5);
-    if ((rc = afePort(kAfeStart))) return failed(5);
-    gPath.port = true;
-    IOSleep(5);   // the bit clock runs: the amplifiers' PLL locks to it
-    gPath.ampsOn = true;
-    for (unsigned amp = 0; amp < 2; ++amp) gPlay[10 + amp] = ampStart(amp);
+    const bool hph = gPath.hphReady && (gPath.jack == 1 || gPath.hphForce);
+    gPath.dev = hph ? kRxCdcDma0 : kSenMi2sRx;
+    if (hph) {
+        // the codec DMA port first (it streams zeros), then the codec path on top of it (lpass spec 1.5: BE prepare, then DAPM)
+        if ((rc = afeCdcConfig())) return failed(5);
+        if ((rc = afePort(kAfeStart, kRxCdcDma0))) return failed(5);
+        gPath.port = true;
+        gPath.hphOn = true;
+        if ((rc = pdx203_hph_on())) {pdx203_hph_print("power-up failed"); return failed(6);}
+    } else {
+        if ((rc = afeClock(true))) return failed(4);
+        gPath.clock = true;
+        if ((rc = afePortConfig())) return failed(5);
+        if ((rc = afePort(kAfeStart))) return failed(5);
+        gPath.port = true;
+        IOSleep(5);   // the bit clock runs: the amplifiers' PLL locks to it
+        gPath.ampsOn = true;
+        for (unsigned amp = 0; amp < 2; ++amp) gPlay[10 + amp] = ampStart(amp);
+    }
     if ((rc = asmOpen())) return failed(8);
     gPath.opened = true;
     int32_t copp = -1;
-    if ((rc = admOpen(&copp))) return failed(9);
+    if ((rc = admOpen(&copp, gPath.dev))) return failed(9);
     gPath.copp = copp;
     gPlay[5] = copp;
     if ((rc = admRoute(copp))) return failed(10);
@@ -722,6 +754,7 @@ bool startOutput() {
     __atomic_or_fetch(&gPath.ctl->state, ShengAudioOutputRunning, __ATOMIC_ACQ_REL);
     gServe[0] = gServe[0] + 1;
     gPlay[0] = 12;
+    printf("PDX203 PLAY route %s\n", hph ? "headphones" : "speakers");
     return true;
 }
 
@@ -747,6 +780,22 @@ bool bootPath() {
     gPlay[4] = gPath.map;
     gPlay[0] = 7;
     return true;
+}
+
+// pdx203-audio bit 8: the headphone codec, once at boot after the path. The macros run on the TX core clocks (AFE 0x30C, 0x30D at
+// 19.2 MHz), which stay on: every codec register, the jack switch included, is read over the TX SoundWire bus they clock.
+void bootHeadphones() {
+    unsigned force = 0;
+    PE_parse_boot_argn("pdx203-hph-force", &force, sizeof force);
+    gPath.hphForce = force == 1;
+    int rc = afeClockSet(0x30c, 19200000, true);
+    if (!rc) rc = afeClockSet(0x30d, 19200000, true);
+    if (rc) {printf("PDX203 HPH: TX core clocks refused (%d)\n", rc); return;}
+    rc = pdx203_hph_init();
+    gPath.hphReady = rc == 0;
+    IOSleep(150);   // insertion debounce (96 ms): a plug already in shows on the first poll
+    if (gPath.hphReady) gPath.jack = pdx203_hph_jack();
+    pdx203_hph_print(gPath.hphReady ? "ready" : "failed");
 }
 
 void printPlay(const char *what) {
@@ -883,6 +932,7 @@ void audioThread(void *, wait_result_t) {
     if (!(mode & 4) || !gApr || !__atomic_load_n(&gAprUp, __ATOMIC_ACQUIRE)) return;
     // Service mode (bit 4): the path, then the test beeps (pdx203-audio-beeps, 0 for none), then the audio service for iOS.
     if (!setupShared() || !bootPath()) return;
+    if (mode & 8) bootHeadphones();
     printPlay("ready");
     if (beeps) {
         uint64_t ns = 0;
@@ -919,6 +969,17 @@ void audioThread(void *, wait_result_t) {
         }
         AprMessage m;
         while (popMessage(m)) dispatch(m);
+        // the jack, every 100 ms: a change while playing moves the stream to the other output
+        static uint64_t nextJack;
+        if (gPath.hphReady && nowMs() >= nextJack) {
+            nextJack = nowMs() + 100;
+            const int jack = pdx203_hph_jack();
+            if (jack != gPath.jack) {
+                gPath.jack = jack;
+                pdx203_hph_print(jack == 1 ? "jack in" : "jack out");
+                if (gPath.running && !gPath.hphForce) {stopOutput(); startOutput(); printServe();}
+            }
+        }
         printPlugin();
         const uint32_t sig = (uint32_t)native_audio_service[1] << 24 ^ (uint32_t)native_audio_service[3] << 12 ^ gServe[0] ^ gServe[2] << 8;
         if (sig != lastServe || nowMs() >= nextRow) {
