@@ -291,6 +291,12 @@ text_fixups = [
   # SF symbol image through +[CUIShapeEffectStack sharedCIContext] after Setup, 15 times (2026-11-01, logs/usb-11/usb-12).
   # Answering false sends initWithOptions: down its own "no renderer" path, which returns nil instead.
   "dyld_shared_cache_arm64.07,2d00df8,fd7bbfa9fd030091,00008052c0035fd6",
+  # CoreMotion CLOrientationNotifier::onIohidEvent (0x1941e1788, .05 + 0x6749788): the orientation's timestamp comes from a vendor child
+  # (0xff15 usage 2, 8 bytes) only the AOP's events carry, so the board's orientation device (NativeHidInput, an IOHIDEventDriver orientation
+  # event without children) arrived with time 0 and notifyAOO skipped every one as stale ("Event has no children", "Skipping stale
+  # orientation (4 @ 0)", backboardd and SpringBoard, 2026-11-02). The bl handing the event's own IOHIDEventGetTimeStamp to a trace helper
+  # becomes mov x22, x0: that timestamp is what notifyAOO gets.
+  "dyld_shared_cache_arm64.05,6749788,f6ddf297,f60300aa",
 ]
 
 [payload.adt]
