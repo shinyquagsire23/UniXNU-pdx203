@@ -1698,7 +1698,7 @@ void displayRow() {
     }
     // the counters move every frame: print at most every 5 s (the caller's cadence decides), and only when something changed
     if (strncmp(row, gDisplayPrinted, sizeof row)) {strlcpy(gDisplayPrinted, row, sizeof gDisplayPrinted); printf("%s\n", row);}
-    if (&native_legacy_swap_summary) {char swaps[200]; native_legacy_swap_summary(swaps, sizeof swaps); printf("DISPLAY %s\n", swaps);}
+    if (&native_legacy_swap_summary) {char swaps[256]; native_legacy_swap_summary(swaps, sizeof swaps); printf("DISPLAY %s\n", swaps);}
     static uint32_t lastTimeouts = ~0u;
     if (&native_adreno_fence_wait && native_adreno_fence_wait[1] != lastTimeouts) {
         lastTimeouts = native_adreno_fence_wait[1];

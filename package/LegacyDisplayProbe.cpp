@@ -202,6 +202,10 @@ void native_legacy_frame_colors_observed(const uint32_t *colors,const uint64_t *
 }
 // The life of every accepted swap, from the kernel's side: validated (the client submitted it), offered to the GPU copy (or started on the CPU),
 // and retired. Times are microseconds since boot; the last 64 are kept.
+// The display refresh tick (NativeLegacyDisplay, sheng-vsync): vsync messages sent, arms, idle stops, late ticks, starts, refresh
+// properties reported at that rate, and the rate.
+static volatile uint64_t vsyncEvents[6];
+static volatile unsigned vsyncHz;
 // Stage 3 is the swap's retirement (native_legacy_retirement_observed): with sheng-early-retire it comes at the offer, before the copy is done.
 struct SwapEvent {uint64_t submitted,offered,done,retired;uint32_t number;};
 static SwapEvent swapEvents[64];static uint32_t swapEventCount;
@@ -243,10 +247,12 @@ extern "C" unsigned native_legacy_swap_summary(char *out,unsigned cap) {
         if(e.retired>e.submitted)retSum+=e.retired-e.submitted;
     }
     if(!n)return snprintf(out,cap,"swaps none");
-    return snprintf(out,cap,"swaps %llu gap avg/max %llu/%llu us offer %llu/%llu us done %llu/%llu us ret %llu nx %llu | v %u/%u/%u/%u/%u | er %u/%u",
+    return snprintf(out,cap,"swaps %llu gap avg/max %llu/%llu us offer %llu/%llu us done %llu/%llu us ret %llu nx %llu | v %u/%u/%u/%u/%u | er %u/%u | vs %u s%llu l%llu i%llu r%llu",
         (unsigned long long)n,(unsigned long long)(n>1?gapSum/(n-1):0),(unsigned long long)gapMax,(unsigned long long)(offerSum/n),
         (unsigned long long)offerMax,(unsigned long long)(doneSum/n),(unsigned long long)doneMax,(unsigned long long)(retSum/n),
-        (unsigned long long)(nextN?nextSum/nextN:0),bins[0],bins[1],bins[2],bins[3],bins[4],native_legacy_early_retires,native_legacy_early_failures);
+        (unsigned long long)(nextN?nextSum/nextN:0),bins[0],bins[1],bins[2],bins[3],bins[4],native_legacy_early_retires,native_legacy_early_failures,
+        // the vsync tick: its rate, messages sent to the compositor, late ticks, idle stops (no client), refresh properties reported
+        vsyncHz,(unsigned long long)vsyncEvents[1],(unsigned long long)vsyncEvents[3],(unsigned long long)vsyncEvents[2],(unsigned long long)vsyncEvents[5]);
 }
 extern "C" unsigned native_legacy_swap_timeline(char *out,unsigned cap) {
     unsigned at=0;out[0]=0;
@@ -260,10 +266,6 @@ extern "C" unsigned native_legacy_swap_timeline(char *out,unsigned cap) {
     }
     return at;
 }
-// The display refresh tick (NativeLegacyDisplay, sheng-vsync): vsync messages sent, arms, idle stops, late ticks, starts, refresh
-// properties reported at that rate, and the rate.
-static volatile uint64_t vsyncEvents[6];
-static volatile unsigned vsyncHz;
 void native_legacy_vsync_observed(unsigned event,unsigned hz) {
     if(event<6)vsyncEvents[event]=vsyncEvents[event]+1;
     vsyncHz=hz;
