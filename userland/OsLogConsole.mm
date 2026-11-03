@@ -13,6 +13,8 @@
 // "all" forwards every process at that level. Without the file a built-in list is used.
 #import <Foundation/Foundation.h>
 #include <dlfcn.h>
+#include <errno.h>
+#include <string.h>
 #include <fts.h>
 #include <signal.h>
 #include <sys/stat.h>
@@ -260,10 +262,21 @@ void installStagedSystemApps() {
                      upgrade ? ", as an upgrade" : "");
             emit(line);
             // What the staged directory holds (pdx203 usb-136: "Did not have a staged app/patch" for every app after the first run)
-            if (NSArray *names = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:@"/private/var/staged_system_apps" error:nil]) {
+            NSArray *names = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:@"/private/var/staged_system_apps" error:nil];
+            if (names) {
                 NSString *joined = [names componentsJoinedByString:@","];
                 snprintf(line, sizeof line, "OSLOG system apps: %lu staged: %.320s\n", (unsigned long)names.count, joined.UTF8String);
                 emit(line);
+            }
+            // SystemAppMigrator removes the staged directory's content once it has run, installed or not (usb-137: empty after the run of
+            // usb-135, which could not reach installcoordinationd). With nothing staged, the kernel's copy marker goes, so the next boot
+            // copies the apps again (zzy-staged-system-apps, sheng-staged-apps=1), and the migrator runs then.
+            if (!names.count) {
+                const int removed = unlink("/private/var/db/.sheng-staged-apps");
+                snprintf(line, sizeof line, "OSLOG system apps: nothing staged; kernel copy marker %s, the next boot copies them again\n",
+                         removed == 0 ? "removed" : strerror(errno));
+                emit(line);
+                return;
             }
             if (!migrator) return;
             if (upgrade && [migrator respondsToSelector:@selector(setDidUpgrade:)])
