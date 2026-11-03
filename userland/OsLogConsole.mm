@@ -241,7 +241,7 @@ void launchServicesDatabase() {
 // an OS update (didUpgrade).
 namespace {
 void installStagedSystemApps() {
-    constexpr const char *kMarker = "/private/var/ngpu/oslog/systemapps", *kDone = "/private/var/ngpu/oslog/systemapps.done";
+    constexpr const char *kMarker = "/private/var/ngpu/oslog/systemapps", *kDone = "/private/var/ngpu/oslog/systemapps2.done";
     if (access(kMarker, F_OK) != 0 || access(kDone, F_OK) == 0) return;
     char first[32] = {};
     if (FILE *file = fopen(kMarker, "r")) {fgets(first, sizeof first, file); fclose(file);}
@@ -261,6 +261,26 @@ void installStagedSystemApps() {
                      framework ? "loaded" : (dlerror() ?: "not loaded"), migrator ? object_getClassName(migrator) : "none",
                      upgrade ? ", as an upgrade" : "");
             emit(line);
+            // SystemAppMigrator checks every installed system app's code against the trust cache through MIS, which fails here ("Error from
+            // MIS ... An unknown error"), and demotes the app to a placeholder (pdx203 usb-139: the apps the previous run installed lost their
+            // bundles). A file named SystemAppMigratorIgnoreAppsNotInTrustCache in MobileInstallation's data directory turns that into
+            // "Explicitly ignoring trust cache failure"; it is made in both candidate directories, and stays.
+            dlopen("/System/Library/PrivateFrameworks/InstalledContentLibrary.framework/InstalledContentLibrary", RTLD_NOW);
+            if (Class configClass = objc_getClass("MIDaemonConfiguration")) {
+                id config = ((id (*)(Class, SEL))objc_msgSend)(configClass, @selector(sharedInstance));
+                for (NSString *selName in @[@"daemonUserDataLibraryDirectory", @"currentUserDataDirectory"]) {
+                    SEL sel = NSSelectorFromString(selName);
+                    if (!config || ![config respondsToSelector:sel]) continue;
+                    id dir = ((id (*)(id, SEL))objc_msgSend)(config, sel);
+                    NSString *path = [dir isKindOfClass:NSURL.class] ? [dir path] : [dir isKindOfClass:NSString.class] ? dir : nil;
+                    if (!path) continue;
+                    NSString *sentinel = [path stringByAppendingPathComponent:@"SystemAppMigratorIgnoreAppsNotInTrustCache"];
+                    [[NSFileManager defaultManager] createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:nil];
+                    const bool made = [[NSFileManager defaultManager] createFileAtPath:sentinel contents:[NSData data] attributes:nil];
+                    snprintf(line, sizeof line, "OSLOG system apps: trust cache sentinel %s: %s\n", sentinel.UTF8String, made ? "made" : "failed");
+                    emit(line);
+                }
+            }
             // What the staged directory holds (pdx203 usb-136: "Did not have a staged app/patch" for every app after the first run)
             NSArray *names = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:@"/private/var/staged_system_apps" error:nil];
             if (names) {
