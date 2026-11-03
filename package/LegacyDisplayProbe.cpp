@@ -795,8 +795,37 @@ uint64_t gFlipPhys[3];
 volatile void *gFlipVa[3];
 uint64_t gFlipBytes;
 int gFlipState = -1, gFlipShown = 0, gFlipPending = -1, gFlipBack = -1;
+// The USB control channel's SCREENSHOT (drivers/QcomXnuUsbDebug): the buffer the panel shows (the flip's shown one, else the GOP
+// buffer), BGRA read with aligned 32-bit loads (write-combined device memory), downscaled by pdx203-shot-scale (default 2, 1..4) so
+// the 192-byte SHOTNEXT chunks move it in seconds. Called on the USB worker thread: no locks, no logging; a flip latched meanwhile
+// can tear the picture, which only matters for a screenshot.
+extern "C" int qcom_usb_debug_register_screenshot(int (*)(void *, uint8_t *, size_t, uint32_t *, uint32_t *), void *) __attribute__((weak_import));
+int shotCapture(void *, uint8_t *rgb, size_t capacity, uint32_t *width, uint32_t *height) {
+    PE_Video video = {};
+    if (PE_current_console(&video) || !video.v_width || !video.v_height || video.v_rowBytes < video.v_width * 4) return 0;
+    const volatile uint8_t *base = gFlipState == 1 && gFlipShown >= 0 && gFlipShown < 3 && gFlipVa[gFlipShown]
+        ? reinterpret_cast<const volatile uint8_t *>(gFlipVa[gFlipShown]) : reinterpret_cast<const volatile uint8_t *>(native_legacy_gop_virtual);
+    if (!base) return 0;
+    unsigned scale = 2;
+    PE_parse_boot_argn("pdx203-shot-scale", &scale, sizeof scale);
+    if (scale < 1 || scale > 4) scale = 2;
+    const uint32_t w = (uint32_t)video.v_width / scale, h = (uint32_t)video.v_height / scale;
+    if ((uint64_t)w * h * 3 > capacity) return 0;
+    uint8_t *out = rgb;
+    for (uint32_t y = 0; y < h; ++y) {
+        const volatile uint32_t *row = reinterpret_cast<const volatile uint32_t *>(base + (uint64_t)y * scale * video.v_rowBytes);
+        for (uint32_t x = 0; x < w; ++x) {
+            const uint32_t p = row[x * scale];
+            *out++ = (uint8_t)(p >> 16); *out++ = (uint8_t)(p >> 8); *out++ = (uint8_t)p;
+        }
+    }
+    *width = w; *height = h;
+    return 1;
+}
 bool flipReady() {
     if (gFlipState >= 0) return gFlipState == 1;
+    static bool shotRegistered;
+    if (!shotRegistered && &qcom_usb_debug_register_screenshot) {shotRegistered = true; qcom_usb_debug_register_screenshot(shotCapture, nullptr);}
     unsigned on = 0;
     PE_parse_boot_argn("pdx203-flip", &on, sizeof on);
     auto off = [](int why) {gFlipState = why; native_legacy_flip_stats[0] = (uint32_t)why; return false;};

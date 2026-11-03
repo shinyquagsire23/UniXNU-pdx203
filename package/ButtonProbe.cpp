@@ -336,11 +336,37 @@ uint64_t psci(uint64_t function) {
     __asm__ volatile("smc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3) : "memory");
     return x0;
 }
-void haltRestart(int reboot) {
-    const uint8_t type = reboot ? 0x7 : 0x4;
-    uint8_t ctl = 0, ctl2 = 0;
-    printf("BOARD %s: PON apid %d, type %x\n", reboot ? "restart" : "shutdown", gPonWrite, type);
+// reboot 2: into fastboot (the USB control channel's REBOOT, boot_reset_bootloader below). As Linux's "reboot bootloader" on SM8250:
+// the IMEM restart reason (0x146bf65c = 0x77665500, qcom,msm-imem@146bf000 restart_reason@65c, ios-sweet docs/PDX203.md) and the
+// PM8150 PON's soft reboot spare (0x8F bits 7:1 = 2, qcom-pon mode-bootloader), then a warm reset (PS_HOLD_RST_CTL type 1), which
+// keeps both; a hard reset (7) would clear the IMEM cell. The IMEM page is mapped unmappable with VM_WIMG_IO (7): alioth found the
+// bootloader ignored the cell written through a plain ml_io_map mapping.
+extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
+void markBootloader(void) {
+    volatile uint32_t *imem = reinterpret_cast<volatile uint32_t *>(ml_io_map_unmappable(0x146bf000, 0x1000, 7));
+    uint32_t imemBefore = 0, imemAfter = 0;
+    if (imem) {
+        imemBefore = imem[0x65c / 4];
+        imem[0x65c / 4] = 0x77665500u;
+        __asm__ volatile("dsb sy" ::: "memory");
+        imemAfter = imem[0x65c / 4];
+    }
+    uint8_t spare = 0, spareAfter = 0;
+    int rc = -9;
+    if (gPonWrite >= 0) {
+        rc = read8(gPonWrite, 0x8F, &spare);
+        rc |= write8(gPonWrite, 0x8F, (uint8_t)((spare & 0x01) | (2u << 1)));
+        rc |= read8(gPonWrite, 0x8F, &spareAfter);
+    }
+    printf("BOARD bootloader: imem %08x>%08x pon spare %02x>%02x rc %d\n", imemBefore, imemAfter, spare, spareAfter, rc);
     haltSpin(50000);
+}
+void haltRestart(int reboot) {
+    const uint8_t type = reboot == 2 ? 0x1 : reboot ? 0x7 : 0x4;
+    uint8_t ctl = 0, ctl2 = 0;
+    printf("BOARD %s: PON apid %d, type %x\n", reboot == 2 ? "restart to fastboot" : reboot ? "restart" : "shutdown", gPonWrite, type);
+    haltSpin(50000);
+    if (reboot == 2) markBootloader();
     // usb-67: the first write through APID 1's channel wedged the CPU; that APID was picked by an ownership read at the wrong
     // offset. findWritableApid now takes the APID spmi-pmic-arb itself would write through.
     unsigned ponWrites = 1;   // the PON APID is now the one Linux writes through (ownership EE 0); pdx203-halt-pon=0 skips the writes
@@ -430,6 +456,29 @@ extern "C" int pdx203_spmi_write(uint32_t ppid, uint8_t addr, uint8_t value) {
     return write8(apid, addr, value);
 }
 
+// The USB control channel's REBOOT (drivers/QcomXnuUsbDebug qcom_usb_debug_control_reset_now): straight into fastboot, without the
+// filesystem unmount (which panics on this board). Returns only when it cannot (no PON channel or PS_HOLD yet).
+extern "C" int boot_reset_bootloader(char *text, unsigned size) {
+    void (*halt)(int) = native_board_halt_restart;
+    if (!halt) {
+        static const char why[] = "pdx203 board halt not installed";
+        if (text && size) {unsigned i = 0; for (; i + 1 < size && why[i]; ++i) text[i] = why[i]; text[i] = 0;}
+        return 1;
+    }
+    halt(2);
+    return 2;
+}
+// The control channel's KEY: buttons the host holds down (BT_REPORT_* bits), sent with the real ones. pdx203_buttons_inject
+// sends the combined mask at once.
+static volatile uint32_t gInjectedButtons;
+extern "C" int pdx203_buttons_inject(uint32_t bit, bool down) {
+    void (*sink)(void *, uint32_t) = __atomic_load_n(&gSink, __ATOMIC_ACQUIRE);
+    if (!sink) return -1;
+    const uint32_t mask = down ? __atomic_or_fetch(&gInjectedButtons, bit, __ATOMIC_ACQ_REL)
+                               : __atomic_and_fetch(&gInjectedButtons, ~bit, __ATOMIC_ACQ_REL);
+    sink(gSinkContext, (uint32_t)native_buttons_stats[3] | mask);
+    return 0;
+}
 extern "C" void native_buttons_set_sink(void (*sink)(void *, uint32_t), void *context) {
     gSinkContext = context;
     __atomic_store_n(&gSink, sink, __ATOMIC_RELEASE);

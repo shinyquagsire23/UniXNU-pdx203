@@ -29,6 +29,19 @@ def tool(name):
 def main():
     if not (MODULE / 'scripts/build.py').is_file():
         raise SystemExit('build-pdx203-usb-debug: %s missing; run git submodule update --init in the device repository' % MODULE)
+    # changes to the module ride as patches (patches/modules/QcomXnuUsbDebug/*.patch in the UniXNU fork, which the build tree links, in name order), as
+    # NativeMobileDisplay's do (build-pdx203-legacy-display.py): applied as a stack, the applied part being the longest prefix whose last
+    # patch reverses. 0001 adds the board input verbs (TOUCH, KEY) of the remote-control rig. One that applies neither way stops the build.
+    patches = sorted((ROOT / 'patches/modules/QcomXnuUsbDebug').glob('*.patch'))
+    applied = 0
+    for k in range(len(patches), 0, -1):
+        if subprocess.run(['git', '-C', str(MODULE), 'apply', '--reverse', '--check', str(patches[k - 1].resolve())],
+                          capture_output=True).returncode == 0:
+            applied = k
+            break
+    for patch in patches[applied:]:
+        subprocess.run(['git', '-C', str(MODULE), 'apply', str(patch.resolve())], check=True)
+        print('applied', patch.name, 'to drivers/QcomXnuUsbDebug')
     if not RECORD.is_file():
         raise SystemExit('build-pdx203-usb-debug: %s missing; the kernel bootstrap pass writes it' % RECORD)
     # the sm8250 profile: gcc usb30_prim branches at 0xf010.., legacy gdsc PWR_ON bit, stream 0 behind the apps smmu

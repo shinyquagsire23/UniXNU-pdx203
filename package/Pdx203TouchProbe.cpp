@@ -393,10 +393,28 @@ timingPublish(unsigned fingers)
 	t.lastPublish = fingers ? now : 0;
 }
 
+// The USB control channel's TOUCH (pdx203_touch_inject): one more finger, in the panel's touch space, merged into every report.
+// The touch thread and the control worker both publish, so the publishing itself is serialized.
+struct {volatile bool down; volatile int x, y;} gInjected;
+IOLock *volatile gPublishLock;
+void publishLocked(void);
 void publish(void)
 {
+	IOLock *lock = __atomic_load_n(&gPublishLock, __ATOMIC_ACQUIRE);
+	if (!lock) {
+		IOLock *fresh = IOLockAlloc();
+		IOLock *expected = nullptr;
+		if (fresh && !__atomic_compare_exchange_n(&gPublishLock, &expected, fresh, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) IOLockFree(fresh);
+		lock = __atomic_load_n(&gPublishLock, __ATOMIC_ACQUIRE);
+	}
+	if (lock) IOLockLock(lock);
+	publishLocked();
+	if (lock) IOLockUnlock(lock);
+}
+void publishLocked(void)
+{
 	unsigned n = 0;
-	int xs[kMaxFingers], ys[kMaxFingers], ids[kMaxFingers];
+	int xs[kMaxFingers + 1], ys[kMaxFingers + 1], ids[kMaxFingers + 1];
 	for (unsigned i = 0; i < kMaxFingers; ++i) {
 		if (!gFingers[i].down) {
 			continue;
@@ -404,6 +422,12 @@ void publish(void)
 		xs[n] = (int)((int64_t)gFingers[i].x * kHidX / kMaxX);
 		ys[n] = (int)((int64_t)gFingers[i].y * kHidY / kMaxY);
 		ids[n] = (int)i + 1;
+		++n;
+	}
+	if (gInjected.down) {
+		xs[n] = (int)((int64_t)gInjected.x * kHidX / kMaxX);
+		ys[n] = (int)((int64_t)gInjected.y * kHidY / kMaxY);
+		ids[n] = (int)kMaxFingers + 1;
 		++n;
 	}
 	native_touch_seq = native_touch_seq + 1;
@@ -608,6 +632,68 @@ void touchThread(void *, wait_result_t)
 
 // From native_legacy_display_late_probe on pdx203-touch=1: map the windows and start the polling thread, which does the bring-up
 // after pdx203-touch-delay seconds. Returns at once.
+// TOUCH from the USB control channel: phase 'd' (down), 'm' (move) or 'u' (up) at x, y in 1/10000 of the panel's width and height.
+extern "C" int pdx203_touch_inject(char phase, int x, int y)
+{
+	if (phase != 'u' && (x < 0 || x > 9999 || y < 0 || y > 9999)) return -2;
+	if (phase == 'u') gInjected.down = false;
+	else if (phase == 'd' || phase == 'm') {
+		gInjected.x = (int)((int64_t)x * kMaxX / 10000);
+		gInjected.y = (int)((int64_t)y * kMaxY / 10000);
+		gInjected.down = true;
+	} else return -1;
+	publish();
+	return 0;
+}
+
+// The control channel's board input (drivers/QcomXnuUsbDebug qcom_usb_debug_board_input): TOUCH:<d|m|u>,<x>,<y> and
+// KEY:<power|volup|voldown|home>,<d|u>. Runs on the USB worker thread; no USB logging from here.
+extern "C" int pdx203_buttons_inject(uint32_t bit, bool down);
+static bool argInt(const char *&p, int &value)
+{
+	if (*p < '0' || *p > '9') return false;
+	long v = 0;
+	while (*p >= '0' && *p <= '9' && v < 100000) v = v * 10 + (*p++ - '0');
+	value = (int)v;
+	return true;
+}
+static void reason(char *out, size_t cap, const char *why)
+{
+	size_t i = 0;
+	for (; out && i + 1 < cap && why[i]; ++i) out[i] = why[i];
+	if (out && cap) out[i] = 0;
+}
+extern "C" int qcom_usb_debug_board_input(const char *verb, const char *args, char *out, size_t cap)
+{
+	if (!verb || !args) {reason(out, cap, "badargs"); return 1;}
+	if (!strcmp(verb, "TOUCH")) {
+		const char *p = args;
+		const char phase = *p++;
+		int x = 0, y = 0;
+		if (phase == 'u' && !*p) return pdx203_touch_inject('u', 0, 0);
+		if (*p++ != ',' || !argInt(p, x) || *p++ != ',' || !argInt(p, y) || *p) {reason(out, cap, "badargs"); return 1;}
+		const int rc = pdx203_touch_inject(phase, x, y);
+		if (rc) reason(out, cap, rc == -2 ? "range" : "badphase");
+		return rc ? 1 : 0;
+	}
+	if (!strcmp(verb, "KEY")) {
+		static const struct {const char *name; uint32_t bit;} keys[] = {{"home", 1u << 0}, {"power", 1u << 1}, {"volup", 1u << 2},
+			{"voldown", 1u << 3}};
+		const char *comma = strchr(args, ',');
+		if (!comma || (strcmp(comma + 1, "d") && strcmp(comma + 1, "u"))) {reason(out, cap, "badargs"); return 1;}
+		for (auto &k : keys) {
+			if ((size_t)(comma - args) == strlen(k.name) && !strncmp(args, k.name, strlen(k.name))) {
+				if (pdx203_buttons_inject(k.bit, comma[1] == 'd')) {reason(out, cap, "nosink"); return 1;}
+				return 0;
+			}
+		}
+		reason(out, cap, "nokey");
+		return 1;
+	}
+	reason(out, cap, "noverb");
+	return 1;
+}
+
 extern "C" bool pdx203_touch_start(void)
 {
 	static bool started;
