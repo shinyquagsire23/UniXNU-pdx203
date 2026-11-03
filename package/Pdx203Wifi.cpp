@@ -294,11 +294,19 @@ void pPoll() {}
 void pHalt() {for (;;) IOSleep(1000);}
 // The module's log on the console: notices, warnings and errors always; debug lines (level 7) only with pdx203-wifi-verbose=1, minus the
 // per-frame and per-interrupt ones. A line equal to one of the last sixteen is only counted.
-unsigned gVerbose;
+unsigned gVerbose = 2;
 uint32_t gLogRepeats;
 bool has(const char *s, const char *w) {for (; *s; ++s) {size_t k = 0; while (w[k] && s[k] == w[k]) ++k; if (!w[k]) return true;} return false;}
+// pdx203-wifi-verbose: 0 none of the driver's debug lines, 2 (default) only those of the join path (vdev, peer, BSS, management transmit
+// and its completion, authentication/association frames received), 1 all but the per-frame ones.
+bool joinPath(const char *l) {
+    if (has(l, "event mgmt rx")) return has(l, "stype b0") || has(l, "stype 10") || has(l, "stype 30") || has(l, "stype c0") || has(l, "stype a0");
+    return has(l, "vdev") || has(l, "peer") || has(l, "bss") || has(l, "mgmt") || has(l, "assoc") || has(l, "auth") || has(l, "tx compl") ||
+           has(l, "chanctx") || has(l, "sta state") || has(l, "key");
+}
 void pLog(int level, const char *line) {
-    if (level >= 7 && (!gVerbose || has(line, "htc rx completion") || has(line, "rx ce pipe") || has(line, "ext irq:") ||
+    if (level >= 7 && gVerbose == 2) {if (!joinPath(line) || has(line, "chan info vdev_id")) {++gLogRepeats; return;}}
+    else if (level >= 7 && (!gVerbose || has(line, "htc rx completion") || has(line, "rx ce pipe") || has(line, "ext irq:") ||
                        has(line, "event mgmt rx") || has(line, "mgmt rx event") || has(line, "chan info vdev_id") ||
                        has(line, "chan scan list") || has(line, "mac channel ["))) {++gLogRepeats; return;}
     static uint32_t recent[16];
