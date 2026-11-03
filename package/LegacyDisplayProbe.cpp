@@ -217,6 +217,24 @@ extern "C" void native_legacy_swap_stage(unsigned stage) {
         if(stage==2 && !e.done){e.done=now;if(!e.offered)e.offered=now;return;}
     }
 }
+// Summary of the last 40 finished swaps for the periodic DISPLAY row (UI frame rate, 2026-11-03: ~23.5 presents/s): the interval between
+// submissions and the time from submission to the offer (hand-off start) and to retirement, average and maximum, in microseconds.
+extern "C" unsigned native_legacy_swap_summary(char *out,unsigned cap) {
+    uint32_t total=swapEventCount,first=total>40?total-40:0;
+    uint64_t n=0,gapSum=0,gapMax=0,offerSum=0,offerMax=0,doneSum=0,doneMax=0,prev=0;
+    for(uint32_t i=first;i<total;++i) {
+        const SwapEvent &e=swapEvents[i%64];
+        if(!e.done)continue;
+        if(prev && e.submitted>prev){uint64_t g=e.submitted-prev;gapSum+=g;if(g>gapMax)gapMax=g;}
+        prev=e.submitted;
+        uint64_t o=e.offered-e.submitted,d=e.done-e.submitted;
+        offerSum+=o;if(o>offerMax)offerMax=o;doneSum+=d;if(d>doneMax)doneMax=d;++n;
+    }
+    if(!n)return snprintf(out,cap,"swaps none");
+    return snprintf(out,cap,"swaps %llu gap avg/max %llu/%llu us offer %llu/%llu us done %llu/%llu us",(unsigned long long)n,
+        (unsigned long long)(n>1?gapSum/(n-1):0),(unsigned long long)gapMax,(unsigned long long)(offerSum/n),(unsigned long long)offerMax,
+        (unsigned long long)(doneSum/n),(unsigned long long)doneMax);
+}
 extern "C" unsigned native_legacy_swap_timeline(char *out,unsigned cap) {
     unsigned at=0;out[0]=0;
     uint32_t total=swapEventCount,first=total>40?total-40:0;
