@@ -193,7 +193,22 @@ void launchServicesDatabase() {
         }
         fts_close(fts);
     }
-    if (!rebuild || !removed) {snprintf(line, sizeof line, "OSLOG csstore: %u found, %u removed\n", found, removed); emit(line); return;}
+    if (rebuild && !removed) {
+        // No database file reachable from here (pdx203 usb-128/129: none found, likely the platform sandbox): LaunchServices' own rebuild,
+        // the call uicache makes (entitlement com.apple.lsapplicationworkspace.rebuildappdatabases).
+        Class workspaceClass = objc_getClass("LSApplicationWorkspace");
+        id workspace = workspaceClass ? ((id (*)(Class, SEL))objc_msgSend)(workspaceClass, @selector(defaultWorkspace)) : nil;
+        SEL rebuildSel = @selector(_LSPrivateRebuildApplicationDatabasesForSystemApps:internal:user:);
+        bool ok = false;
+        if (workspace && [workspace respondsToSelector:rebuildSel])
+            ok = ((BOOL (*)(id, SEL, BOOL, BOOL, BOOL))objc_msgSend)(workspace, rebuildSel, YES, YES, YES);
+        snprintf(line, sizeof line, "OSLOG csstore: %u found; LaunchServices rebuild through LSApplicationWorkspace: %s\n", found,
+                 !workspace ? "no workspace" : ![workspace respondsToSelector:rebuildSel] ? "no such call" : ok ? "done" : "refused");
+        emit(line);
+        if (ok) {int fd = open("/private/var/ngpu/oslog/lsrebuild2.done", O_CREAT | O_WRONLY, 0644); if (fd >= 0) close(fd);}
+        return;
+    }
+    if (!rebuild) {snprintf(line, sizeof line, "OSLOG csstore: %u found, %u removed\n", found, removed); emit(line); return;}
     int fd = open("/private/var/ngpu/oslog/lsrebuild2.done", O_CREAT | O_WRONLY, 0644);   // only once something was removed
     if (fd >= 0) close(fd);
     // lsd by name from the kernel's process table (sysctl kern.proc.all; proc_listallpids found nothing in usb-128)

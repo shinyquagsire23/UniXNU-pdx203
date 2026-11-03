@@ -19,11 +19,12 @@ out.mkdir(parents=True, exist_ok=True)
 sdk = subprocess.check_output(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'], text=True).strip()
 exe = out / 'IOMFB_FDR_Loader'
 subprocess.run(['xcrun', 'clang++', '-target', 'arm64-apple-ios17.0', '-isysroot', sdk, '-O2', '-Wall', '-Wextra', '-Werror', '-std=c++17',
-                '-x', 'objective-c++', '-fobjc-arc', str(ROOT / 'userland/OsLogConsole.mm'), '-framework', 'Foundation', '-framework', 'OSLog', '-o', str(exe)],
+                '-x', 'objective-c++', '-fobjc-arc', str(ROOT / 'userland/OsLogConsole.mm'), '-framework', 'Foundation', '-framework', 'OSLog', '-framework', 'MobileCoreServices', '-o', str(exe)],
                check=True)
 # The logging grants adrenoprobed carries for its OSLogStore export (UniXNU scripts/build-adreno-metal-plugin.py), outside every container.
 entitlements = out / 'entitlements.plist'
 entitlements.write_bytes(plistlib.dumps({'com.apple.private.security.no-container': True, 'com.apple.logging.local-store': True,
+                                         'com.apple.lsapplicationworkspace.rebuildappdatabases': True,
                                          'com.apple.private.logging.admin': True,
                                          'com.apple.private.logging.diagnostic': True, 'com.apple.private.logging.stream': True}))
 # The identifier of the program it stands in for, in case the launchd job's constraints name it.
