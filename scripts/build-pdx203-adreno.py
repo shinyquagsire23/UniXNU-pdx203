@@ -18,6 +18,20 @@ out.mkdir(parents=True, exist_ok=True)
 # The driver checkout is an input for the same reason as the kits: Adreno650 is not a
 # component in UniXNU's catalogue, so the tree has no drivers/Adreno650 unless this names it.
 driver = Path(os.environ.get('ADRENO650_DRIVER', str(ROOT / 'drivers/NativeAdreno')))
+# Changes to the driver ride as patches (patches/modules/NativeAdreno/*.patch in the UniXNU fork, which the build tree links), applied
+# as a stack like NativeMobileDisplay's (build-pdx203-legacy-display.py): the applied part is the longest prefix whose last patch
+# reverses; one that applies neither way stops the build.
+import subprocess as _subprocess
+_patches = sorted((ROOT / 'patches/modules/NativeAdreno').glob('*.patch'))
+_applied = 0
+for _k in range(len(_patches), 0, -1):
+    if _subprocess.run(['git', '-C', str(driver.resolve()), 'apply', '--reverse', '--check', str(_patches[_k - 1].resolve())],
+                       capture_output=True).returncode == 0:
+        _applied = _k
+        break
+for _patch in _patches[_applied:]:
+    _subprocess.run(['git', '-C', str(driver.resolve()), 'apply', str(_patch.resolve())], check=True)
+    print('applied', _patch.name, 'to drivers/NativeAdreno')
 # The three upstream kits this recipe compiles are not copied into the generated tree unless a
 # selected component asks for them, so the directory is an input rather than an assumption:
 # ADRENO650_KITS names it, and a build passes this repository's kits directory.

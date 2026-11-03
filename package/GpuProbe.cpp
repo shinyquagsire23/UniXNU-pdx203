@@ -1797,7 +1797,21 @@ void metalRows() {
 }
 char gAddonPrinted[160];
 char gDisplayPrinted[420];
+// NativeAdreno patch 0001: refused submissions (usb-168: one made Turnip lose its device). Printed when the count moves.
+extern "C" volatile uint32_t native_adreno_submit_reject[10] __attribute__((weak_import));
+extern "C" volatile uint32_t native_adreno_submit_core_reject[6] __attribute__((weak_import));
+void submitRejectRow() {
+    static uint32_t printed;
+    if (!&native_adreno_submit_reject || native_adreno_submit_reject[0] == printed) return;
+    const volatile uint32_t *r = native_adreno_submit_reject;
+    const volatile uint32_t *c = &native_adreno_submit_core_reject ? native_adreno_submit_core_reject : nullptr;
+    printed = r[0];
+    printf("SUBMITREJ n%u check %u buffer %u/%u handle %x%08x iova %x bytes %x status %x pid %u | core %u buffer %u iova %x bytes %x map %x+%x\n",
+           r[0], r[1], r[2], r[3], r[5], r[4], r[6], r[7], r[8], r[9], c ? c[0] : 0, c ? c[1] : 0, c ? c[2] : 0, c ? c[3] : 0,
+           c ? c[4] : 0, c ? c[5] : 0);
+}
 void displayRow() {
+    submitRejectRow();
     if (!&native_legacy_transfer_calls || !&native_legacy_copy_n) return;
     char row[420];
     const volatile uint32_t *flip = &native_legacy_flip_stats ? native_legacy_flip_stats : nullptr;
