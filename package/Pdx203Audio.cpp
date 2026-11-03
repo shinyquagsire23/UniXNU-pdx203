@@ -843,6 +843,10 @@ void printPlugin() {
         const uint32_t kind = w & 0xffff;
         if (kind & 8)
             printf("PDX203 HAL trace %u: VirtualAudio throw at +0x%x info %x\n", traceShown, v, w);
+        else if (kind & 16)
+            printf("PDX203 HAL trace %u: thrown value %x '%c%c%c%c'\n", traceShown, v, fourcc(v, 24), fourcc(v, 16), fourcc(v, 8), fourcc(v, 0));
+        else if (kind & 32)
+            printf("PDX203 HAL trace %u: thrown type '%c%c%c%c...'\n", traceShown, fourcc(v, 24), fourcc(v, 16), fourcc(v, 8), fourcc(v, 0));
         else
             printf("PDX203 HAL trace %u: '%c%c%c%c' object %u scope '%c' %s%s%s\n", traceShown, fourcc(v, 24), fourcc(v, 16), fourcc(v, 8),
                    fourcc(v, 0), w >> 24, fourcc(w, 16), (kind & 4) ? "va-call" : (kind & 1) ? "set" : "get", (kind & 2) ? " FAILED" : "",

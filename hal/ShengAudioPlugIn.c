@@ -464,6 +464,14 @@ static void hookThrow(void *thrown, void *type, void (*destroy)(void *)) {
     if (gControl) {
         const AudioObjectPropertyAddress t = {(UInt32)at, kAudioObjectPropertyScopeGlobal, 0};
         trace(0, &t, 8, (OSStatus)(first | 1));
+        // pdx203: the thrown object's first word (a CAException's OSStatus, often a fourcc) as its own entry, kind 16, right after the
+        // throw's offset (the throw entry itself keeps only whether it was nonzero), and the first four bytes of the type's name.
+        const AudioObjectPropertyAddress v = {first, kAudioObjectPropertyScopeGlobal, 0};
+        trace(0, &v, 16, 0);
+        UInt32 tag = 0;
+        for (unsigned i = 0; i < 4 && name && name[i]; ++i) tag |= (UInt32)(unsigned char)name[i] << (24 - 8 * i);
+        const AudioObjectPropertyAddress n = {tag, kAudioObjectPropertyScopeGlobal, 0};
+        trace(0, &n, 32, 0);
     }
     os_log_error(OS_LOG_DEFAULT, "ShengAudio: va throw at 0x%lx type %{public}s first 0x%08x", (unsigned long)at, name, first);
     __attribute__((musttail)) return gRealThrow(thrown, type, destroy);

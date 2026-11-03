@@ -9,6 +9,7 @@ the ufs host, the splash framebuffer and the mpidr numbering. everything else is
 from pathlib import Path
 import argparse
 import os
+import base64
 import struct
 import zlib
 
@@ -239,6 +240,11 @@ def build(args, seed=None):
                             # (usb-29..33), which CAEnableDeepFramebuffer=false in any preference domain did not change
                             ('artwork-display-gamut', cstr('sRGB')),
                             ('compatible-device-fallback', cstr('iPad6,7')),
+                            # the J120's own product-id (its DeviceTree in the 21H461 IPSW): libMobileGestalt finds the device in its
+                            # product table by these 20 bytes for MGGetProductType (0x80ac7ae0 for J120). Without it the answer is -1,
+                            # VirtualAudio in the audio server finds no routing database ("Unknown product ID") and throws
+                            # kVirtualAudioObjectCategoryNotSupportedError for every audio category, so no output ever starts (usb-77).
+                            ('product-id', base64.b64decode('6f7+9ub50SpboaJVGGbLvXSfDsM=')),
                             ('thin-bezel', u32(1))] if args.ipad_identity else [])]),
         node('arm-io', [('device_type', cstr('arm-io')),
                         ('#address-cells', u32(2)),
