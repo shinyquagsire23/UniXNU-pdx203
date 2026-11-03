@@ -12,8 +12,10 @@
 // level forwarded (0 any, 1 debug, 2 info, 3 notice/default, 4 error, 5 fault; default 3); "rate N" caps lines per second (default 60);
 // "all" forwards every process at that level. Without the file a built-in list is used.
 #import <Foundation/Foundation.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <objc/message.h>
+#include <objc/runtime.h>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -82,7 +84,12 @@ int main() {
         snprintf(line, sizeof line, "OSLOG forwarder started (pid %d): %zu names, %zu prefixes%s, level %ld, rate %ld/s\n", getpid(),
                  filter.exact.size(), filter.prefix.size(), filter.all ? ", all processes" : "", filter.level, filter.rate);
         emit(line);
-        Class storeClass = NSClassFromString(@"OSLogStore");
+        // OSLogStore lives in OSLog.framework (linked); load it by path as well and say what dyld answers if the class is still missing.
+        void *oslog = dlopen("/System/Library/Frameworks/OSLog.framework/OSLog", RTLD_NOW);
+        Class storeClass = NSClassFromString(@"OSLogStore") ?: objc_getClass("OSLogStore");
+        snprintf(line, sizeof line, "OSLOG OSLog.framework %s%s, OSLogStore %s\n", oslog ? "loaded" : "not loaded: ", oslog ? "" : (dlerror() ?: "?"),
+                 storeClass ? "found" : "missing");
+        emit(line);
         NSDate *since = [NSDate dateWithTimeIntervalSinceNow:-120];   // the boot's last two minutes before this started
         unsigned long dropped = 0;
         for (unsigned pass = 0;; ++pass) {
