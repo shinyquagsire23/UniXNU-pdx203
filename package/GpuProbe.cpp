@@ -1699,6 +1699,8 @@ extern volatile uint64_t native_gop_gpu_offers __attribute__((weak_import)), nat
 // NativeMobileDisplay patch 0002: swaps the family cancelled after its 5 s wait, and retirements of requests the family had already dropped.
 extern "C" volatile uint32_t native_legacy_swap_timeouts __attribute__((weak_import)), native_legacy_orphan_retires __attribute__((weak_import)),
     native_legacy_gpu_dropped __attribute__((weak_import));
+extern "C" volatile uint32_t native_legacy_async_copies __attribute__((weak_import)), native_legacy_async_drops __attribute__((weak_import));
+extern "C" volatile uint64_t native_legacy_async_max_us __attribute__((weak_import));
 // NativeAdrenoSubmit.cpp: [0] waits, [1] timeouts, [2] the fence of the last timed-out wait, [3] the GPU's fence then, [4] the newest
 // fence handed out, [5] the newest completed, [6] waits for a fence no job holds, [7] the last fence refused as never submitted
 extern volatile uint32_t native_adreno_fence_wait[8] __attribute__((weak_import));
@@ -1794,10 +1796,10 @@ void metalRows() {
     }
 }
 char gAddonPrinted[160];
-char gDisplayPrinted[340];
+char gDisplayPrinted[420];
 void displayRow() {
     if (!&native_legacy_transfer_calls || !&native_legacy_copy_n) return;
-    char row[340];
+    char row[420];
     const volatile uint32_t *flip = &native_legacy_flip_stats ? native_legacy_flip_stats : nullptr;
     snprintf(row, sizeof row, "DISPLAY validate %u ok %u rej %u | transfer %u status %x | copies %llu last %llu us max %llu us | gpufb %u | retire %u gen %u/%u | flip %u n %u wait %u to %u max %u us shown %u",
              native_legacy_swap_validation_calls, native_legacy_swap_accepted_count, native_legacy_swap_rejected_count,
@@ -1817,6 +1819,10 @@ void displayRow() {
         snprintf(row + more, sizeof row - more, " | swapto %u orph %u drop %u",
                  &native_legacy_swap_timeouts ? native_legacy_swap_timeouts : 0u, &native_legacy_orphan_retires ? native_legacy_orphan_retires : 0u,
                  &native_legacy_gpu_dropped ? native_legacy_gpu_dropped : 0u);
+        const size_t more2 = strlen(row);
+        snprintf(row + more2, sizeof row - more2, " | async %u/%u max %llu us",
+                 &native_legacy_async_copies ? native_legacy_async_copies : 0u, &native_legacy_async_drops ? native_legacy_async_drops : 0u,
+                 &native_legacy_async_max_us ? (unsigned long long)native_legacy_async_max_us : 0ull);
     }
     // the counters move every frame: print at most every 5 s (the caller's cadence decides), and only when something changed
     if (strncmp(row, gDisplayPrinted, sizeof row)) {strlcpy(gDisplayPrinted, row, sizeof gDisplayPrinted); printf("%s\n", row);}
