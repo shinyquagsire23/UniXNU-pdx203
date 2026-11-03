@@ -63,6 +63,8 @@ volatile uint32_t native_ufs_uic_status = 0;
 volatile uint32_t native_ufs_uic_result = 0;
 }
 
+void native_ufs_start_stats_row (void);   // the storage row (doAsyncReadWrite's counters), started with the first block device
+
 class NativeUfs : public IOService {
   OSDeclareDefaultStructors (NativeUfs)
   OSSharedPtr<IOMemoryMap> fMap;
@@ -857,6 +859,40 @@ struct UfsHost {
 };
 UfsHost gHost = { OSSharedPtr<IOMemoryMap> (), OSSharedPtr<IOMemoryMap> (), 0, nullptr, nullptr, 0, nullptr, false };
 
+// The link the boot loader left: PA_PWRMODE (rx<<4|tx: 1 fast, 2 slow, 4 fastauto, 5 slowauto), the HS series, the gears and the active
+// lanes, read once with DME_GET when the host comes up (no command is in flight then), logged and kept for the storage rows. A link left in
+// a slow (PWM) mode, or a low HS gear, makes every page-in crawl.
+extern "C" {volatile uint32_t native_ufs_link[8];}
+static bool dmeGet (uint16_t attribute, uint32_t *value)
+{
+  uintptr_t hc = gHost.hc;
+  for (unsigned i = 0; i < 1000 && !(read32 (hc, 0x30) & (1U << 3)); i++) IODelay (10);   // HCS.UCRDY
+  write32 (hc, 0x20, 1U << 10);                                                         // clear IS.UCCS
+  write32 (hc, 0x94, static_cast<uint32_t> (attribute) << 16);                         // UCMDARG1: attribute, selector 0
+  write32 (hc, 0x98, 0); write32 (hc, 0x9c, 0);
+  write32 (hc, 0x90, 0x01);                                                             // UICCMD: DME_GET
+  for (unsigned i = 0; i < 10000; i++) {
+    if (read32 (hc, 0x20) & (1U << 10)) {
+      write32 (hc, 0x20, 1U << 10);
+      if (read32 (hc, 0x98) & 0xff) return false;                                       // configuration result code
+      *value = read32 (hc, 0x9c);
+      return true;
+    }
+    IODelay (10);
+  }
+  return false;
+}
+static void linkReport (void)
+{
+  static const uint16_t attributes[7] = { 0x1571, 0x156a, 0x1568, 0x1583, 0x1560, 0x1580, 0x1569 };
+  bool ok = true;
+  for (unsigned i = 0; i < 7; i++) { uint32_t v = 0xffffffffU; if (!dmeGet (attributes[i], &v)) ok = false; native_ufs_link[i] = v; }
+  native_ufs_link[7] = ok;
+  IOLog ("NativeUfs: link pwrmode %x hs-series %u tx gear %u rx gear %u lanes tx %u rx %u termination %u%s\n", native_ufs_link[0],
+         native_ufs_link[1], native_ufs_link[2], native_ufs_link[3], native_ufs_link[4], native_ufs_link[5], native_ufs_link[6],
+         ok ? "" : " (a query failed)");
+}
+
 static IOReturn recordTransport (IOReturn result, uint32_t ocs)
 {
   gRootDiagnostic.result = static_cast<uint32_t> (result);
@@ -998,6 +1034,7 @@ static bool hostBringUp (const char **why)
     *why = "NOP OUT";
     return false;
   }
+  linkReport ();
   uint32_t power = 0;
   gRootDiagnostic.stage = "power mode query";
   if (hostQueryRead (0x03, 0x02, &power) != kIOReturnSuccess) {
@@ -1437,7 +1474,7 @@ volatile uint32_t native_ufs_integrity_failures = 0;
 // Time spent hashing/verifying and reading from the UFS transport, in generic-timer ticks (diagnostic only).
 // The read path uses these in every mode, so they live outside the verified block guard.
 volatile uint64_t native_ufs_verify_ticks = 0, native_ufs_read_ticks = 0;
-static inline uint64_t timerTicks (void) {uint64_t v; __asm__ volatile ("isb\n\tmrs %0, cntpct_el0" : "=r" (v)); return v;}
+__attribute__((unused)) static inline uint64_t timerTicks (void) {uint64_t v; __asm__ volatile ("isb\n\tmrs %0, cntpct_el0" : "=r" (v)); return v;}
 
 #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
 bool NativeUfsBlock::configureVerification ()
@@ -1571,7 +1608,47 @@ bool NativeUfsBlock::start (IOService *provider)
   }
   online = true;
   registerService ();
+  native_ufs_start_stats_row ();
   return true;
+}
+
+// Every transport read of the root (any build): requests, 4 KiB blocks, generic-timer ticks spent and the slowest request; the storage
+// row (statsRowThread) logs them every 5 s while they change.
+extern "C" {volatile uint64_t native_ufs_io[4];}
+static inline uint64_t ioTicks (void) {uint64_t v; __asm__ volatile ("isb\n\tmrs %0, cntpct_el0" : "=r" (v)); return v;}
+static inline void ioCount (uint64_t t0, uint32_t blocks)
+{
+  const uint64_t spent = ioTicks () - t0;
+  __atomic_fetch_add (&native_ufs_io[0], 1, __ATOMIC_RELAXED);
+  __atomic_fetch_add (&native_ufs_io[1], blocks, __ATOMIC_RELAXED);
+  __atomic_fetch_add (&native_ufs_io[2], spent, __ATOMIC_RELAXED);
+  uint64_t max = native_ufs_io[3];
+  while (spent > max && !__atomic_compare_exchange_n (&native_ufs_io[3], &max, spent, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+}
+static void statsRowThread (void *, wait_result_t)
+{
+  uint64_t last = ~0ULL;
+  for (;;) {
+    IOSleep (5000);
+    if (native_ufs_io[0] == last) continue;
+    last = native_ufs_io[0];
+    uint64_t freq = 0; __asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (freq)); if (!freq) freq = 19200000;
+    uint64_t verify = 0;
+#if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+    verify = native_ufs_verify_ticks * 1000 / freq;
+#endif
+    IOLog ("UFSROW reads %llu MiB %llu read ms %llu verify ms %llu slowest us %llu | link %x g%u/%u l%u/%u\n", native_ufs_io[0],
+           native_ufs_io[1] / 256, native_ufs_io[2] * 1000 / freq, verify, native_ufs_io[3] * 1000000 / freq, native_ufs_link[0],
+           native_ufs_link[2], native_ufs_link[3], native_ufs_link[4], native_ufs_link[5]);
+  }
+}
+void native_ufs_start_stats_row (void)
+{
+  static bool started;
+  if (started) return;
+  started = true;
+  thread_t thread = nullptr;
+  if (kernel_thread_start (statsRowThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate (thread);
 }
 
 IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count,
@@ -1596,9 +1673,9 @@ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 bl
     void lock () { IOLockLock (mutex); }
     void unlock () { IOLockUnlock (mutex); }
     IOReturn read (uint64_t lba, uint32_t blocks, void *out) {
-      uint64_t t0 = timerTicks ();
+      uint64_t t0 = ioTicks ();
       IOReturn r = hostRead4k (0, lba, blocks, out);
-      __atomic_fetch_add (&native_ufs_read_ticks, timerTicks () - t0, __ATOMIC_RELAXED);
+      ioCount (t0, blocks);
       return r;
     }
     IOReturn verify (uint64_t index, const void *data, size_t length) {

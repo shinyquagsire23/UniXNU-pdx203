@@ -313,8 +313,11 @@ bool joinPath(const char *l) {
            has(l, "chanctx") || has(l, "sta state") || has(l, "key");
 }
 void pLog(int level, const char *line) {
-    if (level >= 7 && gVerbose == 2) {if (!joinPath(line) || has(line, "chan info vdev_id")) {++gLogRepeats; return;}}
-    else if (level >= 7 && (!gVerbose || has(line, "htc rx completion") || has(line, "rx ce pipe") || has(line, "ext irq:") ||
+    // a channel's survey at the end of its dwell (noise floor, busy and cycle counts) passes at any verbosity: it tells a busy or noisy
+    // channel from a deaf receiver (2026-11-02: 2.4 GHz beacons lost at -60 dBm while 5 GHz ones arrived at -69)
+    const bool survey = has(line, "chan info vdev_id") && has(line, "cmd_flags 1");
+    if (level >= 7 && gVerbose == 2 && !survey) {if (!joinPath(line) || has(line, "chan info vdev_id")) {++gLogRepeats; return;}}
+    else if (level >= 7 && !survey && (!gVerbose || has(line, "htc rx completion") || has(line, "rx ce pipe") || has(line, "ext irq:") ||
                        has(line, "event mgmt rx") || has(line, "mgmt rx event") || has(line, "chan info vdev_id") ||
                        has(line, "chan scan list") || has(line, "mac channel ["))) {++gLogRepeats; return;}
     static uint32_t recent[16];
