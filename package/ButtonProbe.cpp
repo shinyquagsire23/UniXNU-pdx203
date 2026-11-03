@@ -52,6 +52,7 @@ uint32_t gVersion;
 struct bt_layout gLayout;
 uint32_t gApidStride, gAccEnable, gIrqStatus, gIrqClear, gApidMap, gObsStride;
 volatile uint32_t gEvents;
+extern "C" void native_hid_orientation_step(intptr_t step) __attribute__((weak_import));
 void (*volatile gSink)(void *, uint32_t);
 void *volatile gSinkContext;
 unsigned gMode;
@@ -288,8 +289,17 @@ void buttonsThread(void *, wait_result_t) {
             native_buttons_stats[3] = (int32_t)mask;
             printf("BUTTONS pressed %x%s%s%s%s\n", mask, (mask & BT_REPORT_HOME) ? " home" : "", (mask & BT_REPORT_POWER) ? " power" : "",
                 (mask & BT_REPORT_VOLUME_UP) ? " vol+" : "", (mask & BT_REPORT_VOLUME_DOWN) ? " vol-" : "");
+            // Volume up + down held together: the next screen orientation (NativeHidInput's orientation device), and neither key
+            // reaches the system as a volume press while the chord lasts (the first key's own press already did).
+            static bool chord;
+            const uint32_t volumes = BT_REPORT_VOLUME_UP | BT_REPORT_VOLUME_DOWN;
+            uint32_t sent = mask;
+            if ((mask & volumes) == volumes) {
+                if (!chord) {chord = true; if (&native_hid_orientation_step) native_hid_orientation_step(1);}
+            } else if (!(mask & volumes)) chord = false;
+            if (chord) sent &= ~volumes;
             void (*sink)(void *, uint32_t) = __atomic_load_n(&gSink, __ATOMIC_ACQUIRE);
-            if (sink) {sink(gSinkContext, mask); native_buttons_stats[2] = native_buttons_stats[2] + 1;}
+            if (sink) {sink(gSinkContext, sent); native_buttons_stats[2] = native_buttons_stats[2] + 1;}
         }
         if (gPolled) {IOSleep(kPollMs); continue;}
         assert_wait((event_t)&gEvents, THREAD_UNINT);

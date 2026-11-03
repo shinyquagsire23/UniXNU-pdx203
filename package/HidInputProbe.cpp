@@ -32,6 +32,7 @@ extern kmod_info_t g_kernel_kmod_info;
 extern "C" void native_hid_static_init(void) __asm__("__GLOBAL__sub_I_NativeHidInput.cpp");
 extern "C" IOService *native_hid_input_allocate(void);
 extern "C" IOService *native_hid_touch_allocate(void);
+extern "C" IOService *native_hid_orientation_allocate(void);
 extern "C" kern_return_t OSKextLoadKextWithIdentifier(const char *);
 extern "C" size_t qcom_usb_debug_write(const void *, size_t);
 
@@ -44,6 +45,7 @@ volatile uint32_t native_hid_class_sizes[5];
 volatile uint64_t native_hid_input_object, native_hid_touch_object;
 // 0 not asked for, 1 started, 2 the device refused to start.
 volatile uint32_t native_hid_touch_status;
+volatile uint32_t native_hid_orientation_status;   // same values, the orientation device
 // The publisher's tick asks whether it should run. The touch core feeds it directly through
 // the sink, so nothing has to poll: answer yes once the board has asked for the digitizer.
 volatile uint32_t native_hid_input_command;
@@ -136,6 +138,17 @@ extern "C" int native_hid_input_probe(void) {
       native_hid_touch_object = 0;
     }
     native_hid_touch_status = touchStarted ? 1 : 2;
+  }
+  // The orientation device (NativeHidInput setOrientationOnly): locationd's always-on-orientation path reads it on a J120 identity and
+  // the UI rotates with what it reports; the volume up + down chord steps it (ButtonProbe.cpp). pdx203-orient=0 leaves it out.
+  unsigned orient = 1;
+  PE_parse_boot_argn("pdx203-orient", &orient, sizeof orient);
+  if (orient) {
+    IOService *device2 = native_hid_orientation_allocate();
+    bool ok = device2 && device2->metaCast("IOHIDDevice") && device2->init() && device2->attach(resource) && device2->start(resource);
+    if (!ok && device2) {device2->detach(resource); OSSafeReleaseNULL(device2);}
+    native_hid_orientation_status = ok ? 1 : 2;
+    IOLog("HidInputProbe: orientation device %s\n", ok ? "started" : "refused to start");
   }
   result = 0;
   OSSafeReleaseNULL(resource);
