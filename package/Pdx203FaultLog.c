@@ -199,6 +199,7 @@ pdx203_exit_fault(char *out, unsigned long capacity)
  * addresses, as FREEZETHR rows after a FREEZETRACE row with the slide, then one EXITMAP row of the distinct PCs (the regions name the
  * Metal plugin, Turnip or the dyld cache). Called from proc_prepareexit (the fork's zzzzzzzzzf-freeze-trace.patch) with the exiting
  * process current. */
+extern unsigned native_legacy_swapwait_dump(char *out, unsigned cap) __attribute__((weak_import));
 #define FREEZE_THREADS 64
 static struct {uint64_t pc, lr, fp, tid; char name[32];} freeze_threads[FREEZE_THREADS];
 static volatile int freeze_busy;
@@ -275,6 +276,24 @@ pdx203_exit_threads(const char *name, int pid, int rv, int current)
 	pdx203_exit_map(pcs, pcCount < 10 ? pcCount : 10);
 	if (pcCount > 10) {
 		pdx203_exit_map(pcs + 10, pcCount - 10 < 10 ? pcCount - 10 : 10);
+	}
+	/* usb-154: the display thread was blocked in kern_SwapWait with every swap retired: the swap waits it made (LegacyDisplayProbe.cpp) */
+	if (&native_legacy_swapwait_dump) {
+		static char waits[6144];
+		native_legacy_swapwait_dump(waits, sizeof(waits));
+		for (char *line = waits; *line;) {
+			char *end = strchr(line, '\n');
+			if (end) {
+				*end = 0;
+			}
+			if (*line) {
+				printf("%s\n", line);
+			}
+			if (!end) {
+				break;
+			}
+			line = end + 1;
+		}
 	}
 	__atomic_store_n(&freeze_busy, 0, __ATOMIC_RELEASE);
 }

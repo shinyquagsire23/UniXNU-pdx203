@@ -370,9 +370,46 @@ static ClientStat *statFor(IOUserClient *client) {
     for(unsigned i=0;i<seenClientCount;++i)if(seenClients[i].object==(uintptr_t)client)return &seenClients[i];
     return nullptr;
 }
+// pdx203 (usb-154): the render server's freezes are its display thread blocked in kern_SwapWait (selector 6, from
+// IOMFBDisplay::can_update_) while every swap had been validated, transferred and retired. The last 32 selector-6 calls of any
+// client: arguments, when it began (ms since boot), how long it took (or that it is still waiting), its return, and the completed and
+// presented generations (+5820, +5824) at entry and exit. Printed by native_legacy_swapwait_dump (FBWAIT rows) when backboardd or
+// SpringBoard exits on a signal (the board's Pdx203FaultLog.c) and with the FBCLI rows.
+struct SwapWaitCall {uint64_t args[3],beganUs,endedUs;int pid;uint32_t status,doneIn,presentedIn,doneOut,presentedOut;bool ended;};
+static SwapWaitCall swapWaits[32];static uint32_t swapWaitCount;
+static void swapGenerations(uint32_t *done,uint32_t *presented) {
+    const unsigned char *object=reinterpret_cast<const unsigned char *>(native_legacy_object);
+    *done=*presented=0;if(object){memcpy(done,object+5820,4);memcpy(presented,object+5824,4);}
+}
+extern "C" unsigned native_legacy_swapwait_dump(char *out,unsigned cap) {
+    unsigned at=0;if(!out || !cap)return 0;out[0]=0;
+    const uint64_t now=probeNowUs();
+    uint32_t done=0,presented=0;swapGenerations(&done,&presented);
+    at+=snprintf(out+at,cap-at,"FBWAIT now %llu ms gen %u/%u calls %u\n",(unsigned long long)(now/1000),done,presented,swapWaitCount);
+    const uint32_t total=swapWaitCount,first=total>32?total-32:0;
+    for(uint32_t i=first;i<total && at+140<cap;++i) {
+        const SwapWaitCall &c=swapWaits[i%32];
+        at+=snprintf(out+at,cap-at,"FBWAIT #%u pid %d args %llx %llx %llx at %llu ms %s %llu us -> %x gen %u/%u -> %u/%u\n",i,c.pid,
+            (unsigned long long)c.args[0],(unsigned long long)c.args[1],(unsigned long long)c.args[2],(unsigned long long)(c.beganUs/1000),
+            c.ended?"took":"WAITING",(unsigned long long)((c.ended?c.endedUs:now)-c.beganUs),c.status,c.doneIn,c.presentedIn,c.doneOut,c.presentedOut);
+    }
+    return at;
+}
 static IOReturn wrappedExternal(IOUserClient *client,uint32_t selector,IOExternalMethodArguments *args,IOExternalMethodDispatch *dispatch,OSObject *target,void *ref) {
     ClientStat *stat=statFor(client);
+    SwapWaitCall *wait=nullptr;
+    if(selector==6 && args && args->scalarInput && args->scalarInputCount>=3) {
+        wait=&swapWaits[swapWaitCount%32];++swapWaitCount;
+        memset(wait,0,sizeof *wait);memcpy(wait->args,args->scalarInput,sizeof wait->args);
+        wait->pid=stat?stat->pid:-1;wait->beganUs=probeNowUs();swapGenerations(&wait->doneIn,&wait->presentedIn);
+    }
     IOReturn status=stat?reinterpret_cast<ExternalFn>(stat->original_external)(client,selector,args,dispatch,target,ref):kIOReturnNotAttached;
+    if(wait) {
+        // a newer call may have reused the slot while this one waited (32 calls later): then only that one is kept
+        if(!wait->ended && !memcmp(wait->args,args->scalarInput,sizeof wait->args)) {
+            wait->endedUs=probeNowUs();wait->status=(uint32_t)status;swapGenerations(&wait->doneOut,&wait->presentedOut);wait->ended=true;
+        }
+    }
     if(stat) {
         if(selector==6 && args && args->scalarInput && args->scalarInputCount>=3) {
             const uint64_t *in=args->scalarInput;
