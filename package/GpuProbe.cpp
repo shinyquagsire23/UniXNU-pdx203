@@ -1577,6 +1577,7 @@ extern volatile uint32_t native_legacy_swap_validation_calls __attribute__((weak
 extern volatile int native_legacy_transfer_status __attribute__((weak_import));
 extern volatile uint32_t native_legacy_flip_stats[6] __attribute__((weak_import));
 extern "C" unsigned native_legacy_swap_summary(char *out, unsigned cap) __attribute__((weak_import));
+extern "C" unsigned native_legacy_clients_dump(char *out, unsigned cap) __attribute__((weak_import));
 extern volatile uint64_t native_gop_gpu_offers __attribute__((weak_import)), native_gop_gpu_completions __attribute__((weak_import)),
     native_gop_gpu_failures __attribute__((weak_import)), native_gop_gpu_abandoned __attribute__((weak_import));
 // NativeAdrenoSubmit.cpp: [0] waits, [1] timeouts, [2] the fence of the last timed-out wait, [3] the GPU's fence then, [4] the newest
@@ -1699,6 +1700,22 @@ void displayRow() {
     // the counters move every frame: print at most every 5 s (the caller's cadence decides), and only when something changed
     if (strncmp(row, gDisplayPrinted, sizeof row)) {strlcpy(gDisplayPrinted, row, sizeof gDisplayPrinted); printf("%s\n", row);}
     if (&native_legacy_swap_summary) {char swaps[256]; native_legacy_swap_summary(swaps, sizeof swaps); printf("DISPLAY %s\n", swaps);}
+    // pdx203: the framebuffer's user clients (LegacyDisplayProbe.cpp native_legacy_clients_dump): every selector each called with its
+    // count, failures and last status, and the notification ports it registered. The render server never registered for vsync
+    // (DISPLAY swaps "vs ... s0") and the UI runs at 24 frames a second: which selectors does it call, and which fail? Every 12th call
+    // (about a minute), as FBCLI lines.
+    static unsigned clientTurn;
+    if (&native_legacy_clients_dump && clientTurn++ % 12 == 0) {
+        static char dump[4096];
+        native_legacy_clients_dump(dump, sizeof dump);
+        for (char *line = dump; *line;) {
+            char *end = strchr(line, '\n');
+            if (end) *end = 0;
+            if (*line) printf("FBCLI %s\n", line);
+            if (!end) break;
+            line = end + 1;
+        }
+    }
     static uint32_t lastTimeouts = ~0u;
     if (&native_adreno_fence_wait && native_adreno_fence_wait[1] != lastTimeouts) {
         lastTimeouts = native_adreno_fence_wait[1];
