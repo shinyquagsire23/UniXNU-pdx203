@@ -191,3 +191,90 @@ pdx203_exit_fault(char *out, unsigned long capacity)
 	}
 	return used;
 }
+
+/* The render server's freezes (pdx203 2026-11-03, usb-149..153): backboardd stops presenting with the GPU idle and every swap retired, and
+ * something sends it SIGTERM a while later; it respawns and the screen comes back. Nothing in the log says what it waited on. When
+ * backboardd or SpringBoard exits on a signal, every one of its threads is still where the freeze left it (the exit runs on the thread
+ * that took the signal; the others are held): each thread's name, user PC and LR and a frame-pointer backtrace of up to 10 return
+ * addresses, as FREEZETHR rows after a FREEZETRACE row with the slide, then one EXITMAP row of the distinct PCs (the regions name the
+ * Metal plugin, Turnip or the dyld cache). Called from proc_prepareexit (the fork's zzzzzzzzzf-freeze-trace.patch) with the exiting
+ * process current. */
+#define FREEZE_THREADS 64
+static struct {uint64_t pc, lr, fp, tid; char name[32];} freeze_threads[FREEZE_THREADS];
+static volatile int freeze_busy;
+extern void bsd_getthreadname(void *uth, char *buffer);
+
+void
+pdx203_exit_threads(const char *name, int pid, int rv, int current)
+{
+	const int sig = rv & 0x7f;
+	if (!current || !name || sig == 0 || sig == 0x7f) {   /* not a signal exit, or not on the process's own thread */
+		return;
+	}
+	if (strncmp(name, "backboardd", sizeof("backboardd")) != 0 && strncmp(name, "SpringBoard", sizeof("SpringBoard")) != 0) {
+		return;
+	}
+	if (__atomic_exchange_n(&freeze_busy, 1, __ATOMIC_ACQUIRE)) {
+		return;
+	}
+	task_t task = current_task();
+	unsigned count = 0, total = 0;
+	thread_t thread;
+	char thread_name[64];
+	task_lock(task);
+	queue_iterate(&task->threads, thread, thread_t, task_threads) {
+		++total;
+		if (count == FREEZE_THREADS) {
+			continue;
+		}
+		arm_saved_state_t *state = get_user_regs(thread);
+		if (!state || !is_saved_state64(state)) {
+			continue;
+		}
+		freeze_threads[count].pc = (uint64_t)get_saved_state_pc(state);
+		freeze_threads[count].lr = (uint64_t)get_saved_state_lr(state);
+		freeze_threads[count].fp = (uint64_t)get_saved_state_fp(state);
+		freeze_threads[count].tid = thread_tid(thread);
+		thread_name[0] = 0;
+		void *uth = get_bsdthread_info(thread);
+		if (uth) {
+			bsd_getthreadname(uth, thread_name);
+		}
+		strlcpy(freeze_threads[count].name, thread_name, sizeof(freeze_threads[count].name));
+		++count;
+	}
+	task_unlock(task);
+	printf("FREEZETRACE %s[%d] sig %d threads %u slide 0x%llx\n", name, pid, sig, total, (unsigned long long)task->task_shared_region_slide);
+	uint64_t pcs[24];
+	unsigned pcCount = 0;
+	for (unsigned i = 0; i < count; ++i) {
+		char row[400];
+		int at = snprintf(row, sizeof(row), "FREEZETHR %s[%d] %u %llu \"%.31s\" pc 0x%llx lr 0x%llx bt", name, pid, i,
+		    (unsigned long long)freeze_threads[i].tid, freeze_threads[i].name, freeze_threads[i].pc, freeze_threads[i].lr);
+		uint64_t fp = freeze_threads[i].fp;
+		for (unsigned depth = 0; depth < 10 && fp && !(fp & 15) && at > 0 && (unsigned)at + 24 < sizeof(row); ++depth) {
+			uint64_t pair[2];
+			if (copyin((user_addr_t)fp, pair, sizeof(pair))) {
+				break;
+			}
+			at += snprintf(row + at, sizeof(row) - at, " 0x%llx", pair[1]);
+			if (pair[0] <= fp || pair[0] - fp > 1048576) {
+				break;
+			}
+			fp = pair[0];
+		}
+		printf("%s\n", row);
+		bool seen = false;
+		for (unsigned k = 0; k < pcCount; ++k) {
+			seen = seen || pcs[k] == freeze_threads[i].pc;
+		}
+		if (!seen && pcCount < 24) {
+			pcs[pcCount++] = freeze_threads[i].pc;
+		}
+	}
+	pdx203_exit_map(pcs, pcCount < 10 ? pcCount : 10);
+	if (pcCount > 10) {
+		pdx203_exit_map(pcs + 10, pcCount - 10 < 10 ? pcCount - 10 : 10);
+	}
+	__atomic_store_n(&freeze_busy, 0, __ATOMIC_RELEASE);
+}
