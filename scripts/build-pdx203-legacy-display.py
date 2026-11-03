@@ -25,6 +25,14 @@ def run(cmd,**kw):return subprocess.check_output([str(x) for x in cmd],timeout=9
 def require(v,why):
     if not v:raise SystemExit(why)
 def sha(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+# The fork's changes to the NativeMobileDisplay module ride as patches (patches/modules/NativeMobileDisplay/*.patch, in name order) rather
+# than as commits of the submodule, as NativeMetal's do (UniXNU scripts/build-adreno-metal-plugin.py). One already applied is left alone;
+# one that applies neither way stops the build.
+for module_patch in sorted((ROOT/'patches/modules/NativeMobileDisplay').glob('*.patch')):
+    module=(ROOT/'drivers/NativeMobileDisplay').resolve()
+    if subprocess.run(['git','-C',module,'apply','--reverse','--check',module_patch.resolve()],capture_output=True).returncode==0:continue
+    subprocess.run(['git','-C',module,'apply',module_patch.resolve()],check=True)
+    print('applied',module_patch.name,'to drivers/NativeMobileDisplay')
 # the audit accepts the original class identity (IOMobileFramebufferLegacy, parent 0xfffffff006b31400, 0x18a0 bytes) from a live
 # qemu observation of the unchanged kernelcache, or, when that observation was pruned, from its recorded hash in an earlier
 # output. a fresh tree has neither, so the output starts as that recorded hash alone, as the sheng and uke trees carry it

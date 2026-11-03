@@ -202,38 +202,51 @@ void native_legacy_frame_colors_observed(const uint32_t *colors,const uint64_t *
 }
 // The life of every accepted swap, from the kernel's side: validated (the client submitted it), offered to the GPU copy (or started on the CPU),
 // and retired. Times are microseconds since boot; the last 64 are kept.
-struct SwapEvent {uint64_t submitted,offered,done;uint32_t number;};
+// Stage 3 is the swap's retirement (native_legacy_retirement_observed): with sheng-early-retire it comes at the offer, before the copy is done.
+struct SwapEvent {uint64_t submitted,offered,done,retired;uint32_t number;};
 static SwapEvent swapEvents[64];static uint32_t swapEventCount;
+extern "C" {volatile uint32_t native_legacy_early_retires,native_legacy_early_failures;}
 extern "C" void native_legacy_swap_stage(unsigned stage) {
     const uint64_t now=probeNowUs();
     uint32_t total=swapEventCount;
     if(stage==0) {
-        SwapEvent &e=swapEvents[total%64];e={now,0,0,total+1};swapEventCount=total+1;return;
+        SwapEvent &e=swapEvents[total%64];e={now,0,0,0,total+1};swapEventCount=total+1;return;
     }
     uint32_t first=total>64?total-64:0;
     for(uint32_t i=first;i<total;++i) {
         SwapEvent &e=swapEvents[i%64];
         if(stage==1 && !e.offered && !e.done){e.offered=now;return;}
         if(stage==2 && !e.done){e.done=now;if(!e.offered)e.offered=now;return;}
+        if(stage==3 && !e.retired){e.retired=now;return;}
     }
 }
 // Summary of the last 40 finished swaps for the periodic DISPLAY row (UI frame rate, 2026-11-03: ~23.5 presents/s): the interval between
 // submissions and the time from submission to the offer (hand-off start) and to retirement, average and maximum, in microseconds.
 extern "C" unsigned native_legacy_swap_summary(char *out,unsigned cap) {
     uint32_t total=swapEventCount,first=total>40?total-40:0;
-    uint64_t n=0,gapSum=0,gapMax=0,offerSum=0,offerMax=0,doneSum=0,doneMax=0,prev=0;
+    // Also: submission to retirement (ret), retirement to the next submission (the compositor's turn, nx), and the gaps by display
+    // refreshes (16.7 ms): at most 1, 2, 3, 4 and more (pdx203 usb-146: the gaps ran 32-44 ms; whole refreshes would mean the swaps wait
+    // for the panel, anything between the compositor). Then the early retirements and the copies that failed after one.
+    uint64_t n=0,gapSum=0,gapMax=0,offerSum=0,offerMax=0,doneSum=0,doneMax=0,prev=0,retSum=0,nextSum=0,nextN=0,prevRetired=0;
+    uint32_t bins[5]={};
     for(uint32_t i=first;i<total;++i) {
         const SwapEvent &e=swapEvents[i%64];
         if(!e.done)continue;
-        if(prev && e.submitted>prev){uint64_t g=e.submitted-prev;gapSum+=g;if(g>gapMax)gapMax=g;}
-        prev=e.submitted;
+        if(prev && e.submitted>prev) {
+            uint64_t g=e.submitted-prev;gapSum+=g;if(g>gapMax)gapMax=g;
+            const uint64_t r=(g+16666/2)/16667;++bins[r<1?0:r>4?4:r-1];
+        }
+        if(prevRetired && e.submitted>prevRetired){nextSum+=e.submitted-prevRetired;++nextN;}
+        prev=e.submitted;prevRetired=e.retired;
         uint64_t o=e.offered-e.submitted,d=e.done-e.submitted;
         offerSum+=o;if(o>offerMax)offerMax=o;doneSum+=d;if(d>doneMax)doneMax=d;++n;
+        if(e.retired>e.submitted)retSum+=e.retired-e.submitted;
     }
     if(!n)return snprintf(out,cap,"swaps none");
-    return snprintf(out,cap,"swaps %llu gap avg/max %llu/%llu us offer %llu/%llu us done %llu/%llu us",(unsigned long long)n,
-        (unsigned long long)(n>1?gapSum/(n-1):0),(unsigned long long)gapMax,(unsigned long long)(offerSum/n),(unsigned long long)offerMax,
-        (unsigned long long)(doneSum/n),(unsigned long long)doneMax);
+    return snprintf(out,cap,"swaps %llu gap avg/max %llu/%llu us offer %llu/%llu us done %llu/%llu us ret %llu nx %llu | v %u/%u/%u/%u/%u | er %u/%u",
+        (unsigned long long)n,(unsigned long long)(n>1?gapSum/(n-1):0),(unsigned long long)gapMax,(unsigned long long)(offerSum/n),
+        (unsigned long long)offerMax,(unsigned long long)(doneSum/n),(unsigned long long)doneMax,(unsigned long long)(retSum/n),
+        (unsigned long long)(nextN?nextSum/nextN:0),bins[0],bins[1],bins[2],bins[3],bins[4],native_legacy_early_retires,native_legacy_early_failures);
 }
 extern "C" unsigned native_legacy_swap_timeline(char *out,unsigned cap) {
     unsigned at=0;out[0]=0;
@@ -265,9 +278,11 @@ void native_legacy_swap_validation_observed(bool accepted,unsigned reason,const 
     if(accepted)native_legacy_swap_stage(0);
     if(accepted)native_legacy_swap_accepted_count=native_legacy_swap_accepted_count+1;
     // pdx203: the first accepted swap and every 4096th, with the refusals so far (GPUREJ prints those)
-    if(accepted && (native_legacy_swap_accepted_count==1 || !(native_legacy_swap_accepted_count%4096)))
-        printf("GPUSWAP accepted %u reason %u rejected %u\n",native_legacy_swap_accepted_count,reason,native_legacy_swap_rejected_count);
-    else {native_legacy_swap_rejected_count=native_legacy_swap_rejected_count+1;recordRejectedSwap(reason,request,surface);}
+    // (Until 2026-11-03 the else below belonged to the print's condition: every accepted swap but the first and each 4096th counted as rejected.)
+    if(accepted) {
+        if(native_legacy_swap_accepted_count==1 || !(native_legacy_swap_accepted_count%4096))
+            printf("GPUSWAP accepted %u reason %u rejected %u\n",native_legacy_swap_accepted_count,reason,native_legacy_swap_rejected_count);
+    } else {native_legacy_swap_rejected_count=native_legacy_swap_rejected_count+1;recordRejectedSwap(reason,request,surface);}
     native_legacy_swap_validation_calls=native_legacy_swap_validation_calls+1;
     native_legacy_swap_validation_result=accepted;native_legacy_swap_validation_reason=reason;
     native_legacy_swap_request=(uintptr_t)request;native_legacy_swap_surface=(uintptr_t)surface;
@@ -304,6 +319,7 @@ __attribute__((noinline)) void native_legacy_retirement_observed(IOService *disp
     native_legacy_retired_current=current;native_legacy_retired_pending=pending;
     native_legacy_retired_generation=completed;native_legacy_presented_generation=presented;native_legacy_retired_frames=frames;
     native_legacy_retirement_calls=native_legacy_retirement_calls+1;
+    native_legacy_swap_stage(3);
 }
 // The display object's properties as they are now (the registration copy above predates setDisplayRefreshProperties and the rest): for the
 // UFS log. Returns the bytes written (NUL-terminated).
