@@ -558,11 +558,17 @@ void autoJoin(void *, wait_result_t) {
     nw_wifi_status st; nw_wifi_status_get(&st);
     if (st.state == NW_STA_UP) continue;   // the traffic thread logs the address and the packets
     if (st.state >= NW_STA_AUTH) continue;
-    bool found = false; nw_bss_info b;
+    bool found = false, five = false; nw_bss_info b;
     for (int i = 0, n = nw_wifi_bss_count(); i < n; ++i)
-      if (!nw_wifi_bss_get(i, &b) && b.ssid_len == sl && !memcmp(b.ssid, ssid, sl)) { found = true; break; }
-    log(6, "wifi-net: auto join round %u: %d networks seen, wanted one %s", round, nw_wifi_bss_count(), found ? "found" : "not found");
-    if (found) { gKeyed = hasPsk; const int r = nw_wifi_connect(reinterpret_cast<const uint8_t *>(ssid), sl, nullptr, hasPsk ? psk : nullptr, hasPsk ? pl : 0); log(6, "wifi-net: auto join requested: %d", r); }
+      if (!nw_wifi_bss_get(i, &b) && b.ssid_len == sl && !memcmp(b.ssid, ssid, sl)) { found = true; if (b.freq_mhz >= 4900) five = true; }
+    // 2.4 GHz only after six rounds without the network's 5 GHz side: this board's 2.4 GHz link fails (reason 34) and a burst of 2.4 GHz
+    // joins followed by a 5 GHz one crashed the firmware (pdx203 usb-128). After a failed join the next try waits a round more.
+    const bool wait5 = found && !five && round < 6;
+    log(6, "wifi-net: auto join round %u: %d networks seen, wanted one %s%s", round, nw_wifi_bss_count(), found ? (five ? "found (5 GHz)" : "found (2.4 GHz)") : "not found",
+        wait5 ? ", waiting for its 5 GHz side" : "");
+    if (found && !wait5) {
+      gKeyed = hasPsk; const int r = nw_wifi_connect(reinterpret_cast<const uint8_t *>(ssid), sl, nullptr, hasPsk ? psk : nullptr, hasPsk ? pl : 0);
+      log(6, "wifi-net: auto join requested: %d", r); IOSleep(3000); }
     else nw_wifi_scan(nullptr, 0);
   }
   memset(psk, 0, sizeof psk);

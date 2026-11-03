@@ -16,9 +16,7 @@
 #include <fts.h>
 #include <signal.h>
 #include <sys/stat.h>
-// libproc (in libSystem on iOS too; the iOS SDK leaves the header out)
-extern "C" int proc_listallpids(void *buffer, int buffersize);
-extern "C" int proc_name(int pid, void *buffer, uint32_t buffersize);
+#include <sys/sysctl.h>
 #include <fcntl.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -176,14 +174,15 @@ bool startLiveStream() {
 namespace {
 void launchServicesDatabase() {
     char line[600];
-    const bool rebuild = access("/private/var/ngpu/oslog/lsrebuild", F_OK) == 0 && access("/private/var/ngpu/oslog/lsrebuild.done", F_OK) != 0;
-    char *roots[] = {(char *)"/private/var/containers/Data/System", (char *)"/private/var/mobile/Containers/Data/InternalDaemon",
-                     (char *)"/private/var/mobile/Library/Caches", (char *)"/private/var/db", (char *)"/private/var/root/Library/Caches", nullptr};
+    const bool rebuild = access("/private/var/ngpu/oslog/lsrebuild", F_OK) == 0 && access("/private/var/ngpu/oslog/lsrebuild2.done", F_OK) != 0;
+    // every container tree (the system group containers included), the daemons' caches and /var/db; usb-128 found none in the narrower set
+    char *roots[] = {(char *)"/private/var/containers", (char *)"/private/var/mobile/Containers", (char *)"/private/var/mobile/Library",
+                     (char *)"/private/var/root/Library", (char *)"/private/var/db", nullptr};
     FTS *fts = fts_open(roots, FTS_PHYSICAL | FTS_NOCHDIR | FTS_XDEV, nullptr);
     unsigned found = 0, removed = 0;
     if (fts) {
         while (FTSENT *e = fts_read(fts)) {
-            if (e->fts_level > 6 && e->fts_info == FTS_D) {fts_set(fts, e, FTS_SKIP); continue;}
+            if (e->fts_level > 7 && e->fts_info == FTS_D) {fts_set(fts, e, FTS_SKIP); continue;}
             if (e->fts_info != FTS_F) continue;
             const size_t n = strlen(e->fts_name);
             if (n < 8 || strcmp(e->fts_name + n - 8, ".csstore")) continue;
@@ -194,18 +193,25 @@ void launchServicesDatabase() {
         }
         fts_close(fts);
     }
-    if (!rebuild) {snprintf(line, sizeof line, "OSLOG csstore: %u found\n", found); emit(line); return;}
-    int fd = open("/private/var/ngpu/oslog/lsrebuild.done", O_CREAT | O_WRONLY, 0644);
+    if (!rebuild || !removed) {snprintf(line, sizeof line, "OSLOG csstore: %u found, %u removed\n", found, removed); emit(line); return;}
+    int fd = open("/private/var/ngpu/oslog/lsrebuild2.done", O_CREAT | O_WRONLY, 0644);   // only once something was removed
     if (fd >= 0) close(fd);
-    pid_t pids[2048];
-    const int bytes = proc_listallpids(pids, sizeof pids);
-    unsigned killed = 0;
-    for (int i = 0; i < bytes / (int)sizeof(pid_t); ++i) {
-        char name[64] = {};
-        if (proc_name(pids[i], name, sizeof name) > 0 && !strcmp(name, "lsd") && kill(pids[i], SIGKILL) == 0) ++killed;
+    // lsd by name from the kernel's process table (sysctl kern.proc.all; proc_listallpids found nothing in usb-128)
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+    size_t size = 0;
+    unsigned killed = 0, seen = 0;
+    if (sysctl(mib, 3, nullptr, &size, nullptr, 0) == 0 && size) {
+        size += size / 4;
+        struct kinfo_proc *procs = (struct kinfo_proc *)malloc(size);
+        if (procs && sysctl(mib, 3, procs, &size, nullptr, 0) == 0) {
+            seen = (unsigned)(size / sizeof *procs);
+            for (unsigned i = 0; i < seen; ++i)
+                if (!strcmp(procs[i].kp_proc.p_comm, "lsd") && kill(procs[i].kp_proc.p_pid, SIGKILL) == 0) ++killed;
+        }
+        free(procs);
     }
-    snprintf(line, sizeof line, "OSLOG csstore: %u found, %u removed, lsd stopped %u times: LaunchServices rebuilds its database\n", found, removed,
-             killed);
+    snprintf(line, sizeof line, "OSLOG csstore: %u found, %u removed, lsd stopped %u times (%u processes): LaunchServices rebuilds its database\n",
+             found, removed, killed, seen);
     emit(line);
 }
 }  // namespace
