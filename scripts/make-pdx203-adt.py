@@ -140,6 +140,8 @@ def build(args, seed=None):
         # datamigrator skips every migration and the staged system apps never install
         *([('ephemeral-storage', u32(1))] if data_disk and not args.persistent_data else []),
         *([('darwinboot-memory-size', u64(args.owned_memory_size))] if args.owned_memory_size else []),
+        # darwinboot reserves this much RAM outside the window and writes {base, bytes} here (NativeAdreno's buffer pool)
+        *([('darwinboot-gpu-pool', u64(0, args.gpu_pool_size))] if args.gpu_pool_size else []),
         ('dram-base', u64(DRAM_BASE)),
         ('dram-size', u64(args.dram_size)),
         *([('embedded-panic-log-size', u32(PANIC_LOG_SIZE))] if args.panic_log else []),
@@ -262,6 +264,8 @@ def parse_args(argv=None):
                         help='size of the upper ddr bank xnu manages, 0xfcc00000 on this phone')
     parser.add_argument('--owned-memory-size', type=lambda value: int(value, 0), default=None,
                         help='darwinboot contiguous window request, 256 MiB to 8 GiB in 2 MiB steps')
+    parser.add_argument('--gpu-pool-size', type=lambda value: int(value, 0), default=None,
+                        help='/chosen/darwinboot-gpu-pool: RAM darwinboot reserves outside the window for the GPU buffer pool')
     parser.add_argument('--root-match-volume-uuid', default=None,
                         help='/chosen/root-matching: the IOMedia uuid of the root volume')
     parser.add_argument('--unique-chip-id', type=hexint, default=None,

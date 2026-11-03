@@ -304,6 +304,9 @@ chip_id = "207"
 # address order, so a window bigger than every low-bank run lands in the upper bank (0x1_00000000 + 0xfcc00000, where
 # ios-sweet ran xnu on this phone) and leaves ~950 MiB of it to the firmware's own top-down allocations
 owned_memory_size = "0xc0000000"
+# darwinboot reserves this much outside the window (top down) for NativeAdreno's buffer pool, the same size every boot; a contiguous
+# allocation inside the window came up at 32 to 512 MiB of the 512 asked (2026-11-02, usb-105: 32 MiB, 1052 BOs fell back, GPU hang)
+gpu_pool_size = "0x30000000"
 root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"   # the OS volume of the 21H461 ipad7,1 image, as on sheng
 # mount(8) phase 1 names /private/preboot/<hash> from /chosen/boot-manifest-hash, launchd's mount[3] exited with
 # status 66 without it (2026-11-01, uke saw the same). there is no apple personalization manifest here, so this is an
