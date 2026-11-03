@@ -115,6 +115,32 @@ pdx203_exit_reason(void)
 	__atomic_store_n(&reason_busy, 0, __ATOMIC_RELEASE);
 }
 
+/* Where a code address lies (pdx203 usb-137/138: backboardd faulted at addresses outside the dyld cache, likely in the Metal plugin
+ * bundle): the start and size of the mapped region holding it and its offset there. A dylib's __TEXT is one region, so its start is the
+ * image's load address and the offset matches the binary's own addresses (+ its __TEXT vmaddr). Printed as one EXITMAP row. */
+static void
+pdx203_exit_map(const uint64_t *addrs, unsigned count)
+{
+	char row[600];
+	int at = snprintf(row, sizeof(row), "EXITMAP");
+	vm_map_t map = current_map();
+	for (unsigned i = 0; i < count && at > 0 && (unsigned)at + 64 < sizeof(row); ++i) {
+		vm_map_offset_t addr = addrs[i];
+		vm_map_size_t size = 0;
+		natural_t depth = 0;
+		vm_region_submap_info_data_64_t info;
+		mach_msg_type_number_t infoCount = VM_REGION_SUBMAP_INFO_V2_COUNT_64;
+		if (!addrs[i] || vm_map_region_recurse_64(map, &addr, &size, &depth, (vm_region_submap_info_64_t)&info, &infoCount) != KERN_SUCCESS ||
+		    addrs[i] < addr || addrs[i] >= addr + size) {
+			at += snprintf(row + at, sizeof(row) - at, " %llx:-", addrs[i]);
+			continue;
+		}
+		at += snprintf(row + at, sizeof(row) - at, " %llx:%llx+%llx/%llx%s", addrs[i], (unsigned long long)addr,
+		    (unsigned long long)(addrs[i] - addr), (unsigned long long)size, (info.protection & VM_PROT_EXECUTE) ? "x" : "");
+	}
+	printf("%s\n", row);
+}
+
 unsigned long
 pdx203_exit_fault(char *out, unsigned long capacity)
 {
@@ -140,10 +166,15 @@ pdx203_exit_fault(char *out, unsigned long capacity)
 		return 0;
 	}
 	unsigned long used = (unsigned long)n < capacity ? (unsigned long)n : capacity - 1;
+	uint64_t frames[14] = {pc, lr};
+	unsigned frameCount = 2;
 	for (unsigned depth = 0; depth < 12 && fp && !(fp & 15) && used + 20 < capacity; ++depth) {
 		uint64_t pair[2];
 		if (copyin((user_addr_t)fp, pair, sizeof(pair))) {
 			break;
+		}
+		if (frameCount < 14) {
+			frames[frameCount++] = pair[1];
 		}
 		n = snprintf(out + used, capacity - used, " 0x%llx", pair[1]);
 		if (n <= 0) {
@@ -154,6 +185,9 @@ pdx203_exit_fault(char *out, unsigned long capacity)
 			break;
 		}
 		fp = pair[0];
+	}
+	if (((esr >> 26) & 0x3f) != 0x15) {   /* a fault: name the regions of its code addresses */
+		pdx203_exit_map(frames, frameCount);
 	}
 	return used;
 }
