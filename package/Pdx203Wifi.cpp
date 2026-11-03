@@ -41,9 +41,9 @@ void pdx203_wifi_probe(void);
 
 namespace {
 struct Window {IOMemoryMap *map; volatile uint32_t *va;};
-bool mapWindow(Window &w, uint64_t base, uint64_t size) {
+bool mapWindow(Window &w, uint64_t base, uint64_t size, IOOptionBits cache = kIOMapInhibitCache) {
     IODeviceMemory *memory = IODeviceMemory::withRange(base, size);
-    w.map = memory ? memory->map(kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
+    w.map = memory ? memory->map(kIOMapAnywhere | cache) : nullptr;
     if (memory) memory->release();
     w.va = w.map ? reinterpret_cast<volatile uint32_t *>(w.map->getVirtualAddress()) : nullptr;
     return w.va != nullptr;
@@ -210,7 +210,8 @@ void print(const char *what);
 // ---- stage 4: the WiFi module (Ath11kWifi) on this board, as sheng's stage 6. The board gives it the endpoint's registers and configuration
 // space, DMA memory, firmware files, a clock and a log; the module does the chip's power-up, the MHI firmware boot, QRTR/QMI and ath11k. ----
 // DMA: 32 MiB of the PIL CDSP + SLPI carve-outs (0x87800000, 20 + 21 MiB, reserved in the UEFI memory map; this board never starts either
-// DSP), below 4 GiB as ath11k's 32-bit coherent mask wants, mapped uncached; the endpoint's SMMU stream (BDF 1:0.0 -> 0x1c01, the BDF->SID
+// DSP), below 4 GiB as ath11k's 32-bit coherent mask wants, mapped normal non-cacheable (write-combine: a device mapping faults bzero's
+// DC ZVA and unaligned accesses, pdx203-wifi2 panic); the endpoint's SMMU stream (BDF 1:0.0 -> 0x1c01, the BDF->SID
 // table set in stage 2) passes through to physical addresses (SmmuBypass.h, as the audio buffer's stream). The first page is the MSI sink.
 constexpr uint64_t kArenaPhys = 0x87800000, kArenaBytes = 32u << 20, kSmmu = 0x15000000;
 constexpr uint16_t kStream = 0x1c01;
@@ -230,7 +231,7 @@ bool smmuPassThrough() {
 }
 bool arenaInit() {
     if (!gArena.blocks) gArena.blocks = static_cast<Arena::Block *>(IOMallocData(kArenaBlocks * sizeof(Arena::Block)));
-    if (!gArena.blocks || (!gArenaMap.va && !mapWindow(gArenaMap, kArenaPhys, kArenaBytes))) return false;
+    if (!gArena.blocks || (!gArenaMap.va && !mapWindow(gArenaMap, kArenaPhys, kArenaBytes, kIOMapWriteCombineCache))) return false;
     gArena.va = reinterpret_cast<uint8_t *>(const_cast<uint32_t *>(gArenaMap.va));
     gArena.iova = kArenaPhys; gArena.bytes = kArenaBytes;
     gArena.blocks[0] = {4096, (uint32_t)(gArena.bytes - 4096), false}; gArena.count = 1;   // the first page is the interrupt sink
