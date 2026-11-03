@@ -29,6 +29,10 @@ extern "C" int sheng_fw_open(const char *path, void **handle, uint64_t *size);
 extern "C" int sheng_fw_read(void *handle, uint64_t offset, void *to, size_t length);
 extern "C" void sheng_fw_close(void *handle);
 extern "C" int armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint32_t *, uint64_t *) __attribute__((weak_import));
+// the boot add-on's staging into /private/var/ngpu (zzy-native-gpu-addon-mount.patch): files in the add-on, then each written, already the
+// same or failed
+extern "C" volatile int native_gpu_addon_files __attribute__((weak_import)), native_gpu_addon_written __attribute__((weak_import)),
+    native_gpu_addon_same __attribute__((weak_import)), native_gpu_addon_failed __attribute__((weak_import));
 
 extern "C" int pdx203_rpmh_find(const char *name, uint32_t *address, uint32_t level, uint32_t *index) __attribute__((weak_import));
 extern "C" int pdx203_rpmh_send(const uint32_t *addresses, const uint32_t *values, unsigned count) __attribute__((weak_import));
@@ -496,9 +500,19 @@ void wifiStack(volatile uint32_t *config, volatile uint32_t *dbi) {
     gCfg = config; gDbi = dbi;
     PE_parse_boot_argn("pdx203-wifi-verbose", &gVerbose, sizeof gVerbose);
     publishMac();
-    // the firmware arrives with the data volume: wait for it (up to ten minutes)
-    const uint8_t *fw = nullptr; size_t fwBytes = 0;
+    // The firmware arrives with the data volume, staged from the boot add-on. /private/var/ngpu keeps the last boot's files, so wait until
+    // this boot's staging has gone through every file (pdx203-wifi9: the driver read the previous board.bin while the new one was still
+    // being written); without staging at all (no add-on), go on after two minutes.
     unsigned waited = 0;
+    if (&native_gpu_addon_files) {
+        for (; waited < 600; ++waited) {
+            const int files = native_gpu_addon_files;
+            if (files >= 0 && native_gpu_addon_written + native_gpu_addon_same + native_gpu_addon_failed >= files) break;
+            if (files < 0 && waited >= 120) break;
+            IOSleep(1000);
+        }
+    }
+    const uint8_t *fw = nullptr; size_t fwBytes = 0;
     for (; waited < 600 && pFwGet("amss.bin", &fw, &fwBytes); ++waited) IOSleep(1000);
     if (!fw) {pLog(3, "wifi: no firmware in /private/var/ngpu/wifi"); fail(40); print("failed"); return;}
     S[0] = 40;
