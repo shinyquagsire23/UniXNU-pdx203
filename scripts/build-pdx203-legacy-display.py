@@ -26,11 +26,16 @@ def require(v,why):
     if not v:raise SystemExit(why)
 def sha(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
 # The fork's changes to the NativeMobileDisplay module ride as patches (patches/modules/NativeMobileDisplay/*.patch, in name order) rather
-# than as commits of the submodule, as NativeMetal's do (UniXNU scripts/build-adreno-metal-plugin.py). One already applied is left alone;
-# one that applies neither way stops the build.
-for module_patch in sorted((ROOT/'patches/modules/NativeMobileDisplay').glob('*.patch')):
-    module=(ROOT/'drivers/NativeMobileDisplay').resolve()
-    if subprocess.run(['git','-C',module,'apply','--reverse','--check',module_patch.resolve()],capture_output=True).returncode==0:continue
+# than as commits of the submodule, as NativeMetal's do (UniXNU scripts/build-adreno-metal-plugin.py). They are applied as a stack, in
+# order: a later patch may change lines an earlier one added (then the earlier one no longer reverses alone), so the applied part is the
+# longest prefix whose last patch reverses; the rest is applied. One that applies neither way stops the build.
+module_patches=sorted((ROOT/'patches/modules/NativeMobileDisplay').glob('*.patch'))
+module=(ROOT/'drivers/NativeMobileDisplay').resolve()
+applied=0
+for k in range(len(module_patches),0,-1):
+    if subprocess.run(['git','-C',module,'apply','--reverse','--check',module_patches[k-1].resolve()],capture_output=True).returncode==0:
+        applied=k;break
+for module_patch in module_patches[applied:]:
     subprocess.run(['git','-C',module,'apply',module_patch.resolve()],check=True)
     print('applied',module_patch.name,'to drivers/NativeMobileDisplay')
 # the audit accepts the original class identity (IOMobileFramebufferLegacy, parent 0xfffffff006b31400, 0x18a0 bytes) from a live
@@ -111,6 +116,8 @@ for i in range(168,358):
     elif i==337:header+=' virtual IOReturn collectCompletionReports(uint32_t,void *,uint32_t *,uint32_t)=0;\n'
     elif i==288:header+=' virtual bool startHardware();\n'
     elif i==301:header+=' virtual bool getRefreshAttributes(uint64_t *,bool);\n'
+    # The family's swap timeout (swap_wait_gated, 5 s) calls slot 345 before cancelling its queue; the driver forgets its swaps there.
+    elif i==345:header+=' virtual bool cancelSwapsAfterTimeout()=0;\n'
     elif i in pure:header+=f' virtual __attribute__((noreturn)) void opaque{i}()=0;\n'
     else:header+=f' virtual __attribute__((deprecated("Unclassified ABI: never call from source"))) void opaque{i}();\n'
 header+='};\nstatic_assert(sizeof(IOMobileFramebufferLegacy)==0x18a0,"Actual original instance extent");\n'

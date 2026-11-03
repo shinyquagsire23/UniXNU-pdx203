@@ -1580,6 +1580,8 @@ extern "C" unsigned native_legacy_swap_summary(char *out, unsigned cap) __attrib
 extern "C" unsigned native_legacy_clients_dump(char *out, unsigned cap) __attribute__((weak_import));
 extern volatile uint64_t native_gop_gpu_offers __attribute__((weak_import)), native_gop_gpu_completions __attribute__((weak_import)),
     native_gop_gpu_failures __attribute__((weak_import)), native_gop_gpu_abandoned __attribute__((weak_import));
+// NativeMobileDisplay patch 0002: swaps the family cancelled after its 5 s wait, and retirements of requests the family had already dropped.
+extern "C" volatile uint32_t native_legacy_swap_timeouts __attribute__((weak_import)), native_legacy_orphan_retires __attribute__((weak_import));
 // NativeAdrenoSubmit.cpp: [0] waits, [1] timeouts, [2] the fence of the last timed-out wait, [3] the GPU's fence then, [4] the newest
 // fence handed out, [5] the newest completed, [6] waits for a fence no job holds, [7] the last fence refused as never submitted
 extern volatile uint32_t native_adreno_fence_wait[8] __attribute__((weak_import));
@@ -1696,6 +1698,9 @@ void displayRow() {
                  &native_gop_gpu_completions ? (unsigned long long)native_gop_gpu_completions : 0ull,
                  &native_gop_gpu_failures ? (unsigned long long)native_gop_gpu_failures : 0ull,
                  &native_gop_gpu_abandoned ? (unsigned long long)native_gop_gpu_abandoned : 0ull);
+        const size_t more = strlen(row);
+        snprintf(row + more, sizeof row - more, " | swapto %u orph %u",
+                 &native_legacy_swap_timeouts ? native_legacy_swap_timeouts : 0u, &native_legacy_orphan_retires ? native_legacy_orphan_retires : 0u);
     }
     // the counters move every frame: print at most every 5 s (the caller's cadence decides), and only when something changed
     if (strncmp(row, gDisplayPrinted, sizeof row)) {strlcpy(gDisplayPrinted, row, sizeof gDisplayPrinted); printf("%s\n", row);}

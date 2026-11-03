@@ -537,6 +537,10 @@ __attribute__((noinline)) bool native_legacy_gop_mapping_observed(IOService *obj
 }
 __attribute__((noreturn,noinline)) void native_legacy_backend_guard(unsigned slot,void *object,void *caller) {
     native_legacy_guard_slot=slot;native_legacy_guard_object=(uintptr_t)object;native_legacy_guard_caller=(uintptr_t)caller;
+    // The panic text has not reached the USB log on pdx203 (usb-157: the display thread entered slot 345 and the system ran on without a
+    // panic line). Print the leaf first and give the log's drain a moment (a spin: the caller may hold a gate or run unpreemptible).
+    printf("NativeLegacyDisplay: leaf=%u caller=%llx object=%llx\n",slot,(uint64_t)(uintptr_t)caller,(uint64_t)(uintptr_t)object);
+    IODelay(300000);
     panic("NativeLegacyDisplay: leaf=%u caller=%llx stage=%u PM=%u swap=%u/%u copy=%08x bytes=%llu retire=%u handoff=%u/%u",
       slot,(uint64_t)(uintptr_t)caller,native_legacy_stage,native_legacy_pm_stage,
       native_legacy_swap_validation_result,native_legacy_swap_validation_reason,
