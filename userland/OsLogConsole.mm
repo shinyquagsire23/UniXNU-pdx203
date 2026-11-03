@@ -259,12 +259,28 @@ void installStagedSystemApps() {
                      framework ? "loaded" : (dlerror() ?: "not loaded"), migrator ? object_getClassName(migrator) : "none",
                      upgrade ? ", as an upgrade" : "");
             emit(line);
+            // What the staged directory holds (pdx203 usb-136: "Did not have a staged app/patch" for every app after the first run)
+            if (NSArray *names = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:@"/private/var/staged_system_apps" error:nil]) {
+                NSString *joined = [names componentsJoinedByString:@","];
+                snprintf(line, sizeof line, "OSLOG system apps: %lu staged: %.320s\n", (unsigned long)names.count, joined.UTF8String);
+                emit(line);
+            }
             if (!migrator) return;
             if (upgrade && [migrator respondsToSelector:@selector(setDidUpgrade:)])
                 ((void (*)(id, SEL, BOOL))objc_msgSend)(migrator, @selector(setDidUpgrade:), YES);
             const BOOL ok = ((BOOL (*)(id, SEL))objc_msgSend)(migrator, @selector(performMigration));
             snprintf(line, sizeof line, "OSLOG system apps: SystemAppMigrator performMigration %s\n", ok ? "succeeded" : "failed");
             emit(line);
+            if ([migrator respondsToSelector:@selector(itemsToInstall)]) {
+                NSDictionary *items = ((id (*)(id, SEL))objc_msgSend)(migrator, @selector(itemsToInstall));
+                NSString *text = [[items.description componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]
+                    componentsJoinedByString:@" "];
+                for (NSUInteger at = 0; at < text.length && at < 6000; at += 300) {
+                    NSString *part = [text substringWithRange:NSMakeRange(at, MIN((NSUInteger)300, text.length - at))];
+                    snprintf(line, sizeof line, "OSLOG system apps: items %s\n", part.UTF8String);
+                    emit(line);
+                }
+            }
             if (ok) {int fd = open(kDone, O_CREAT | O_WRONLY, 0644); if (fd >= 0) close(fd);}
         }
     });

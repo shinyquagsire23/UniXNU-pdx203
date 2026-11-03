@@ -21,6 +21,7 @@
 #include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <kern/thread.h>
+#include <kern/clock.h>
 #include <pexpert/pexpert.h>
 #include <libkern/c++/OSSharedPtr.h>
 #include <sys/errno.h>
@@ -311,6 +312,87 @@ struct Finger {
 };
 Finger gFingers[kMaxFingers];
 
+// Touch timing for the boot log (UI smoothness, 2026-11-03): while a finger is down, the intervals between publishes (what the HID
+// layer sees as samples) and between polls, printed every two seconds as "PDX203 TOUCH timing ...". Stays quiet when nothing is touched.
+struct TouchTiming {
+	uint64_t lastPublish, lastPoll, windowStart;
+	uint64_t pubCount, pubSum, pubMin, pubMax, pubLate;   // late: over 20 ms
+	uint64_t pollCount, pollSum, pollMax;
+};
+TouchTiming gTiming;
+
+uint64_t
+nowNs(void)
+{
+	uint64_t ns = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns;
+}
+
+void
+timingReport(uint64_t now)
+{
+	TouchTiming &t = gTiming;
+	if (!t.windowStart) {
+		t.windowStart = now;
+	}
+	if (now - t.windowStart < 2000000000ull) {
+		return;
+	}
+	if (t.pubCount) {
+		printf("PDX203 TOUCH timing: %llu samples, interval min/avg/max %llu.%02llu/%llu.%02llu/%llu.%02llu ms, %llu over 20 ms; "
+		    "%llu polls, period avg/max %llu.%02llu/%llu.%02llu ms\n", t.pubCount, t.pubMin / 1000000, t.pubMin / 10000 % 100,
+		    t.pubSum / t.pubCount / 1000000, t.pubSum / t.pubCount / 10000 % 100, t.pubMax / 1000000, t.pubMax / 10000 % 100, t.pubLate,
+		    t.pollCount, t.pollCount ? t.pollSum / t.pollCount / 1000000 : 0, t.pollCount ? t.pollSum / t.pollCount / 10000 % 100 : 0,
+		    t.pollMax / 1000000, t.pollMax / 10000 % 100);
+	}
+	const uint64_t lastPublish = t.lastPublish, lastPoll = t.lastPoll;
+	t = TouchTiming{};
+	t.lastPublish = lastPublish;
+	t.lastPoll = lastPoll;
+	t.windowStart = now;
+}
+
+// One poll of the loop; counts the period only while a finger is down.
+void
+timingPoll(bool touching)
+{
+	const uint64_t now = nowNs();
+	TouchTiming &t = gTiming;
+	if (touching && t.lastPoll) {
+		const uint64_t d = now - t.lastPoll;
+		t.pollCount++;
+		t.pollSum += d;
+		if (d > t.pollMax) {
+			t.pollMax = d;
+		}
+	}
+	t.lastPoll = touching ? now : 0;
+	timingReport(now);
+}
+
+void
+timingPublish(unsigned fingers)
+{
+	const uint64_t now = nowNs();
+	TouchTiming &t = gTiming;
+	if (fingers && t.lastPublish) {
+		const uint64_t d = now - t.lastPublish;
+		if (!t.pubCount || d < t.pubMin) {
+			t.pubMin = d;
+		}
+		if (d > t.pubMax) {
+			t.pubMax = d;
+		}
+		t.pubCount++;
+		t.pubSum += d;
+		if (d > 20000000ull) {
+			t.pubLate++;
+		}
+	}
+	t.lastPublish = fingers ? now : 0;
+}
+
 void publish(void)
 {
 	unsigned n = 0;
@@ -336,6 +418,7 @@ void publish(void)
 	native_touch_seq = native_touch_seq + 1;
 	statAdd(4);
 	pdx203_touch_stats[8] = (int32_t)n;
+	timingPublish(n);
 	void (*sink)(void *) = __atomic_load_n(&gTouchSink, __ATOMIC_ACQUIRE);
 	if (sink) {
 		sink(gTouchSinkContext);
@@ -513,6 +596,7 @@ void touchThread(void *, wait_result_t)
 		if (changed) {
 			publish();
 		}
+		timingPoll(pdx203_touch_stats[8] > 0);
 		IOSleep(10);
 	}
 	releaseAll();
