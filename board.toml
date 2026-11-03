@@ -297,6 +297,11 @@ text_fixups = [
   # orientation (4 @ 0)", backboardd and SpringBoard, 2026-11-02). The bl handing the event's own IOHIDEventGetTimeStamp to a trace helper
   # becomes mov x22, x0: that timestamp is what notifyAOO gets.
   "dyld_shared_cache_arm64.05,6749788,f6ddf297,f60300aa",
+  # QuartzCore CADeviceUseVBL's once block (0x189582620, .03 + 0x27d6620): use_vbl is set only by CA_FORCE_TIMER or ChipID 0x7000/0x8010,
+  # so the render server never asked the framebuffer for vsync (IOMFBServer::add_vsync_source: a _CADisplayTimer instead of
+  # IOMobileFramebufferGetVSyncRunLoopSource and set_vsync_enabled; DISPLAY swaps "vs 60 s0") and display-link content ran at 24 frames
+  # a second (2026-11-03, usb-149..151). The cbz past CA_FORCE_TIMER's value becomes a branch to its "mov w8, #1": use_vbl is always set.
+  "dyld_shared_cache_arm64.03,27d6634,a00000b4,03000014",
 ]
 
 [payload.adt]
