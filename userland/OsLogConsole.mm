@@ -308,7 +308,10 @@ void installStagedSystemApps() {
                     emit(line);
                 }
             }
-            if (ok) {int fd = open(kDone, O_CREAT | O_WRONLY, 0644); if (fd >= 0) close(fd);}
+            // Done after any run that had staged apps: the migrator reports failure for side issues (usb-142: "Failed to mark com.apple.Fitness
+            // as uninstalled") with every app installed, and each rerun costs a staged copy of 231 MB two boots later.
+            {int fd = open(kDone, O_CREAT | O_WRONLY, 0644); if (fd >= 0) close(fd);}
+            (void)ok;
         }
     });
 }
