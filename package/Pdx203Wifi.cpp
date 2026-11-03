@@ -423,7 +423,13 @@ struct FwCache {char name[32]; uint8_t *data; size_t size; bool tried;} gFw[8];
 int pFwGet(const char *path, const uint8_t **data, size_t *size) {
     const char *base = path;
     for (const char *c = path; *c; ++c) if (*c == '/') base = c + 1;
-    if (!strcmp(base, "wlan_mac.bin")) return macFile(data, size);
+    // wlan_mac.bin: the add-on's own when it carries one (to try another address), else made from the chip id
+    if (!strcmp(base, "wlan_mac.bin")) {
+        static uint8_t *own; static size_t ownBytes; static bool looked;
+        if (!looked) {looked = true; if (!addonFile(base, &own, &ownBytes)) own = nullptr;}
+        if (own) {*data = own; *size = ownBytes; return 0;}
+        return macFile(data, size);
+    }
     FwCache *slot = nullptr;
     for (auto &f : gFw) if (f.tried && !strncmp(f.name, base, sizeof f.name)) {slot = &f; break;}
     if (!slot) for (auto &f : gFw) if (!f.tried) {slot = &f; strlcpy(f.name, base, sizeof f.name); f.tried = true; break;}
@@ -554,6 +560,8 @@ void netStart() {
 void wifiStack(volatile uint32_t *config, volatile uint32_t *dbi) {
     gCfg = config; gDbi = dbi;
     PE_parse_boot_argn("pdx203-wifi-verbose", &gVerbose, sizeof gVerbose);
+    // verbose.txt in the add-on's wifi/ (a digit) overrides it: the command line has no room left for the argument
+    {uint8_t *v = nullptr; size_t vb = 0; if (addonFile("verbose.txt", &v, &vb)) {if (vb && v[0] >= '0' && v[0] <= '9') gVerbose = v[0] - '0'; IOFreeData(v, vb);}}
     publishMac();
     // The firmware arrives with the data volume, staged from the boot add-on. /private/var/ngpu keeps the last boot's files, so wait until
     // this boot's staging has gone through every file (pdx203-wifi9: the driver read the previous board.bin while the new one was still
