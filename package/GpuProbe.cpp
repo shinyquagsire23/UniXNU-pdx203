@@ -1441,14 +1441,18 @@ const char *crashBlock(uint32_t id, uint32_t pf) {
     if (id == 1) return "UCHE";
     return "unknown";
 }
+// Rows of zeros are skipped (GPUIB ... zeros n), and an unmapped page ends the dump.
 void crashWords(const char *label, uint64_t from, unsigned count) {
     NativeAdrenoVm *vm = NativeAdrenoGpuContextVm();
     if (!vm) return;
     from &= ~3ull;
+    unsigned zeros = 0;
     for (unsigned at = 0; at < count; at += 8) {
         uint32_t w[8] = {};
         const uint64_t iova = from + 4ull * at;
-        if (vm->peekWordsUncached(iova, w, 8)) {printf("GPUIB %s %llx unmapped\n", label, (unsigned long long)iova); continue;}
+        if (vm->peekWordsUncached(iova, w, 8)) {printf("GPUIB %s %llx unmapped\n", label, (unsigned long long)iova); break;}
+        if (!(w[0] | w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7])) {++zeros; continue;}
+        if (zeros) {printf("GPUIB %s zeros %u\n", label, zeros); zeros = 0;}
         printf("GPUIB %s %llx %08x %08x %08x %08x %08x %08x %08x %08x\n", label, (unsigned long long)iova,
                w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
     }
@@ -1494,8 +1498,17 @@ void crashReport(const char *why) {
                native_adreno_ib_log[i][3], crashOwner(iova));
         if (native_adreno_ib_log[i][0] == hung) hungSlot = int(i);
     }
-    if (ib1) crashWords("ib1", ib1 >= 512 ? ib1 - 512 : 0, 256);
-    if (ib2) crashWords("ib2", ib2 >= 512 ? ib2 - 512 : 0, 256);
+    // usb-161: CP_IB1_BASE and CP_IB2_BASE are the IBs' starts (REM_SIZE counts down), so each IB is dumped from its start: the IB that
+    // called the next one gives that one's size, the ring the IB1's.
+    if (ib1) crashWords("ib1", ib1, 8192);
+    if (ib2) crashWords("ib2", ib2, 4096);
+    // The CP's draw state groups as Linux's a6xx crash state reads them (CP_DRAW_STATE_ADDR 0x803, then CP_DRAW_STATE_DATA 0x804).
+    gw(0x803, 0);
+    for (unsigned i = 0; i < 0x100; i += 8) {
+        uint32_t d[8];
+        for (unsigned j = 0; j < 8; ++j) d[j] = gpuRead(0x804);
+        printf("GPUDS %02x %08x %08x %08x %08x %08x %08x %08x %08x\n", i, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
+    }
     if (hungSlot >= 0) {
         const uint64_t iova = native_adreno_ib_log[hungSlot][1] | uint64_t(native_adreno_ib_log[hungSlot][2]) << 32;
         const uint32_t bytes = native_adreno_ib_log[hungSlot][3];
