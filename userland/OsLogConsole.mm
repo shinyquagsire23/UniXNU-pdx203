@@ -263,23 +263,17 @@ void installStagedSystemApps() {
             emit(line);
             // SystemAppMigrator checks every installed system app's code against the trust cache through MIS, which fails here ("Error from
             // MIS ... An unknown error"), and demotes the app to a placeholder (pdx203 usb-139: the apps the previous run installed lost their
-            // bundles). A file named SystemAppMigratorIgnoreAppsNotInTrustCache in MobileInstallation's data directory turns that into
-            // "Explicitly ignoring trust cache failure"; it is made in both candidate directories, and stays.
-            dlopen("/System/Library/PrivateFrameworks/InstalledContentLibrary.framework/InstalledContentLibrary", RTLD_NOW);
-            if (Class configClass = objc_getClass("MIDaemonConfiguration")) {
-                id config = ((id (*)(Class, SEL))objc_msgSend)(configClass, @selector(sharedInstance));
-                for (NSString *selName in @[@"daemonUserDataLibraryDirectory", @"currentUserDataDirectory"]) {
-                    SEL sel = NSSelectorFromString(selName);
-                    if (!config || ![config respondsToSelector:sel]) continue;
-                    id dir = ((id (*)(id, SEL))objc_msgSend)(config, sel);
-                    NSString *path = [dir isKindOfClass:NSURL.class] ? [dir path] : [dir isKindOfClass:NSString.class] ? dir : nil;
-                    if (!path) continue;
-                    NSString *sentinel = [path stringByAppendingPathComponent:@"SystemAppMigratorIgnoreAppsNotInTrustCache"];
-                    [[NSFileManager defaultManager] createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:nil];
-                    const bool made = [[NSFileManager defaultManager] createFileAtPath:sentinel contents:[NSData data] attributes:nil];
-                    snprintf(line, sizeof line, "OSLOG system apps: trust cache sentinel %s: %s\n", sentinel.UTF8String, made ? "made" : "failed");
-                    emit(line);
-                }
+            // bundles). Its own escape (a SystemAppMigratorIgnoreAppsNotInTrustCache file in installd's data container) needs
+            // containermanagerd, which this root job cannot reach (usb-140: MIDaemonConfiguration aborted the forwarder). The plugin runs in
+            // this process, so the two methods answer here instead: every installed app counts as in the trust cache, and failures are ignored.
+            if (Class appMigrator = objc_getClass("MISystemAppMigrator")) {
+                const bool a = class_replaceMethod(appMigrator, @selector(shouldIgnoreAppsNotInTrustCache),
+                                                   imp_implementationWithBlock(^BOOL(id) { return YES; }), "B16@0:8") != nullptr;
+                const bool b = class_replaceMethod(appMigrator, NSSelectorFromString(@"isCurrentlyInstalledAppInTrustCacheForBundleID:"),
+                                                   imp_implementationWithBlock(^BOOL(id, id) { return YES; }), "B24@0:8@16") != nullptr;
+                snprintf(line, sizeof line, "OSLOG system apps: trust cache checks answered here (replaced %s, %s)\n", a ? "ignore" : "-",
+                         b ? "in-cache" : "-");
+                emit(line);
             }
             // What the staged directory holds (pdx203 usb-136: "Did not have a staged app/patch" for every app after the first run)
             NSArray *names = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:@"/private/var/staged_system_apps" error:nil];
