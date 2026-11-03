@@ -19,6 +19,7 @@
 #include <libkern/c++/OSData.h>
 #include <string.h>
 #include <stdarg.h>
+#include <libkern/zlib.h>
 #include <mach/kmod.h>
 #include <libkern/c++/OSMetaClass.h>
 extern "C" {
@@ -31,6 +32,9 @@ extern "C" void sheng_fw_close(void *handle);
 extern "C" int armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint32_t *, uint64_t *) __attribute__((weak_import));
 // the boot add-on's staging into /private/var/ngpu (zzy-native-gpu-addon-mount.patch): files in the add-on, then each written, already the
 // same or failed
+// the boot add-on as the payload's RAM block holds it (NativeRamBlock): NGPUADD2, then per file u32 name bytes, u32 mode, u64 size,
+// u64 packed size, the name padded to 8, the zlib stream padded to 8 (make-gpu-addon.py)
+extern "C" int native_ram_block_gpu_addon(const uint8_t **data, uint64_t *bytes) __attribute__((weak_import));
 extern "C" volatile int native_gpu_addon_files __attribute__((weak_import)), native_gpu_addon_written __attribute__((weak_import)),
     native_gpu_addon_same __attribute__((weak_import)), native_gpu_addon_failed __attribute__((weak_import));
 
@@ -371,6 +375,50 @@ int macFile(const uint8_t **data, size_t *size) {
 // Firmware: the files the boot add-on carries in wifi/ (make-gpu-addon.py --wifi; linux-firmware ath11k/QCA6390/hw2.0, local only), which the
 // kernel stages below /private/var/ngpu once the data volume is mounted. Each is read once and kept.
 constexpr const char *kFwDir = "/private/var/ngpu/wifi/";
+// wifi/<name> straight from the add-on in RAM: always this boot's file (pdx203-wifi10: the staged copy below /private/var/ngpu read back
+// as the previous add-on's board.bin), and there before the data volume is.
+voidpf zAlloc(voidpf, uInt items, uInt size) {
+    const size_t n = (size_t)items * size + 16;
+    uint8_t *p = static_cast<uint8_t *>(IOMallocData(n));
+    if (!p) return Z_NULL;
+    memcpy(p, &n, sizeof n);
+    return p + 16;
+}
+void zFree(voidpf, voidpf ptr) {
+    if (!ptr) return;
+    uint8_t *p = static_cast<uint8_t *>(ptr) - 16;
+    size_t n; memcpy(&n, p, sizeof n);
+    IOFreeData(p, n);
+}
+bool addonFile(const char *base, uint8_t **out, size_t *outBytes) {
+    const uint8_t *a = nullptr; uint64_t bytes = 0;
+    if (!native_ram_block_gpu_addon || !native_ram_block_gpu_addon(&a, &bytes) || bytes < 24 || memcmp(a, "NGPUADD2", 8)) return false;
+    uint32_t count; memcpy(&count, a + 8, 4);
+    char want[64]; snprintf(want, sizeof want, "wifi/%s", base);
+    uint64_t at = 24;
+    for (uint32_t i = 0; i < count && at + 24 <= bytes; ++i) {
+        uint32_t nb; uint64_t size, packed;
+        memcpy(&nb, a + at, 4); memcpy(&size, a + at + 8, 8); memcpy(&packed, a + at + 16, 8);
+        at += 24;
+        const char *name = reinterpret_cast<const char *>(a + at);
+        at += (nb + 7) & ~7ull;
+        if (packed > bytes - at) return false;
+        if (nb >= 2 && !strncmp(name, want, nb) && size && size < (64u << 20)) {
+            uint8_t *buf = static_cast<uint8_t *>(IOMallocData(size));
+            if (!buf) return false;
+            z_stream z; memset(&z, 0, sizeof z);
+            z.zalloc = zAlloc; z.zfree = zFree;
+            z.next_in = const_cast<Bytef *>(a + at); z.avail_in = (uInt)packed; z.next_out = buf; z.avail_out = (uInt)size;
+            int r = inflateInit(&z);
+            if (r == Z_OK) {r = inflate(&z, Z_FINISH); inflateEnd(&z);}
+            if (r == Z_STREAM_END && z.total_out == size) {*out = buf; *outBytes = (size_t)size; return true;}
+            IOFreeData(buf, size);
+            return false;
+        }
+        at += (packed + 7) & ~7ull;
+    }
+    return false;
+}
 struct FwCache {char name[32]; uint8_t *data; size_t size; bool tried;} gFw[8];
 int pFwGet(const char *path, const uint8_t **data, size_t *size) {
     const char *base = path;
@@ -381,6 +429,13 @@ int pFwGet(const char *path, const uint8_t **data, size_t *size) {
     if (!slot) for (auto &f : gFw) if (!f.tried) {slot = &f; strlcpy(f.name, base, sizeof f.name); f.tried = true; break;}
     if (!slot) return -1;
     if (!slot->data) {
+        uint8_t *mem = nullptr; size_t memBytes = 0;
+        if (addonFile(base, &mem, &memBytes)) {
+            slot->data = mem; slot->size = memBytes;
+            char line[96]; snprintf(line, sizeof line, "firmware %s: %zu bytes (add-on in RAM)", base, slot->size); pLog(6, line);
+            *data = slot->data; *size = slot->size;
+            return 0;
+        }
         char full[96];
         snprintf(full, sizeof full, "%s%s", kFwDir, base);
         void *h = nullptr; uint64_t bytes = 0;
@@ -504,7 +559,10 @@ void wifiStack(volatile uint32_t *config, volatile uint32_t *dbi) {
     // this boot's staging has gone through every file (pdx203-wifi9: the driver read the previous board.bin while the new one was still
     // being written); without staging at all (no add-on), go on after two minutes.
     unsigned waited = 0;
-    if (&native_gpu_addon_files) {
+    uint8_t *probe = nullptr; size_t probeBytes = 0;
+    const bool inRam = addonFile("amss.bin", &probe, &probeBytes);
+    if (probe) IOFreeData(probe, probeBytes);
+    if (!inRam && &native_gpu_addon_files) {
         for (; waited < 600; ++waited) {
             const int files = native_gpu_addon_files;
             if (files >= 0 && native_gpu_addon_written + native_gpu_addon_same + native_gpu_addon_failed >= files) break;
