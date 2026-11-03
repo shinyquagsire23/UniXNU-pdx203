@@ -544,7 +544,8 @@ void trafficLog(void *, wait_result_t) {
 void autoJoin(void *, wait_result_t) {
   char ssid[33] = {}, psk[65] = {};
   const uint8_t *file = nullptr; size_t length = 0;
-  if (sheng_wifi_file("join.txt", &file, &length) || !file || !length) { thread_terminate(current_thread()); return; }
+  // An empty file or one starting with '#' turns the auto join off (the addon cannot delete the copy staged on Data, so it overwrites it).
+  if (sheng_wifi_file("join.txt", &file, &length) || !file || !length || file[0] == '#') { thread_terminate(current_thread()); return; }
   { size_t i = 0, o = 0; while (i < length && file[i] != '\n' && o < 32) ssid[o++] = static_cast<char>(file[i++]);
     while (i < length && file[i] != '\n') ++i; ++i; o = 0;
     while (i < length && file[i] != '\n' && o < 64) psk[o++] = static_cast<char>(file[i++]); }
