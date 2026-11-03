@@ -419,7 +419,7 @@ bool addonFile(const char *base, uint8_t **out, size_t *outBytes) {
     }
     return false;
 }
-struct FwCache {char name[32]; uint8_t *data; size_t size; bool tried;} gFw[8];
+struct FwCache {char name[32]; uint8_t *data; size_t size; bool tried;} gFw[32];   // every name asked for takes a slot, found or not
 int pFwGet(const char *path, const uint8_t **data, size_t *size) {
     const char *base = path;
     for (const char *c = path; *c; ++c) if (*c == '/') base = c + 1;
@@ -433,7 +433,7 @@ int pFwGet(const char *path, const uint8_t **data, size_t *size) {
     FwCache *slot = nullptr;
     for (auto &f : gFw) if (f.tried && !strncmp(f.name, base, sizeof f.name)) {slot = &f; break;}
     if (!slot) for (auto &f : gFw) if (!f.tried) {slot = &f; strlcpy(f.name, base, sizeof f.name); f.tried = true; break;}
-    if (!slot) return -1;
+    if (!slot) {char line[96]; snprintf(line, sizeof line, "firmware %s: no cache slot left", base); pLog(4, line); return -1;}
     if (!slot->data) {
         uint8_t *mem = nullptr; size_t memBytes = 0;
         if (addonFile(base, &mem, &memBytes)) {
