@@ -231,8 +231,8 @@ kernel_args = [
   # the jack). ADSP / QRTR / AUDIO / APR / PLAY / SERVE / HPH rows on the console.
   "pdx203-audio=15",
   # WiFi (package/Pdx203Wifi.cpp): 1 survey, 2 the QCA6390's rails, WLAN_EN and the PCIe0 link to its ID, 3 also BAR0 and its MHI
-  # registers. WIFI rows on the console.
-  "pdx203-wifi=3",
+  # registers, 4 also the WiFi module (Ath11kWifi; firmware from the add-on's wifi/). WIFI rows on the console.
+  "pdx203-wifi=4",
   # the AppleKeyStore stand-in (package/KeyStoreProbe.cpp + drivers/NativeKeyStoreEvents, alioth's pair). without a SEP and
   # its keybag the lock screen asks for a passcode nothing can satisfy (2026-11-01, touch boot); this owned AppleKeyStore
   # answers "no passcode, nothing locked". alioth: add sheng-aks-sls=3 only if the prompt survives

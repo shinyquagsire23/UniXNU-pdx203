@@ -6,6 +6,7 @@
 //   2  power and link: the chip's rails over RPMh (through AdspProbe's TCS 1 helper; needs pdx203-adsp), CX at NOM for Gen3, WLAN_EN,
 //      GDSC, clocks, resets, PARF, the QMP PHY (the DT's 99-write sequence), PERST#, LTSSM, link up, the endpoint's ID (17cb:1101)
 //   3  also the endpoint: memory window, BAR0, the MHI and BHI registers (no firmware yet)
+//   4  also the WiFi module (Ath11kWifi: ath11k, MHI, QRTR/QMI) with DMA, firmware (/private/var/ngpu/wifi) and MSIs from this board
 // pdx203-wifi-gen1=1 forces a Gen1 link (no CX vote, refgen at 19.2 MHz). Rows print as "PDX203 WIFI".
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -13,6 +14,18 @@
 #include <kern/thread.h>
 #include <kern/clock.h>
 #include <pexpert/pexpert.h>
+#include <IOKit/IORegistryEntry.h>
+#include <IOKit/IODeviceTreeSupport.h>
+#include <libkern/c++/OSData.h>
+#include <string.h>
+extern "C" {
+#include "SmmuBypass.h"
+#include "nw_abi.h"
+}
+extern "C" int sheng_fw_open(const char *path, void **handle, uint64_t *size);
+extern "C" int sheng_fw_read(void *handle, uint64_t offset, void *to, size_t length);
+extern "C" void sheng_fw_close(void *handle);
+extern "C" int armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint32_t *, uint64_t *) __attribute__((weak_import));
 
 extern "C" int pdx203_rpmh_find(const char *name, uint32_t *address, uint32_t level, uint32_t *index) __attribute__((weak_import));
 extern "C" int pdx203_rpmh_send(const uint32_t *addresses, const uint32_t *values, unsigned count) __attribute__((weak_import));
@@ -150,6 +163,8 @@ void survey(volatile uint32_t *g, volatile uint32_t *t) {
     S[4] = (int32_t)pins(t);
 }
 
+Window gBar;
+uint64_t gBarBytes;
 void endpoint(volatile uint32_t *a, volatile uint32_t *c, volatile uint32_t *d) {
     step("bar0");
     // outbound iATU region 1: the memory window, CPU address = PCI address; the root port's memory base/limit
@@ -188,7 +203,303 @@ void endpoint(volatile uint32_t *a, volatile uint32_t *c, volatile uint32_t *d) 
     dsb();
     S[19] = (int32_t)m[(0x80000 + (0x1f8031cu & 0x7ffff)) / 4];
     S[0] = 31;
-    release(bar);
+    gBar = bar; gBarBytes = size < 0x100000 ? size : 0x100000;   // kept for stage 4
+}
+
+void print(const char *what);
+// ---- stage 4: the WiFi module (Ath11kWifi) on this board, as sheng's stage 6. The board gives it the endpoint's registers and configuration
+// space, DMA memory, firmware files, a clock and a log; the module does the chip's power-up, the MHI firmware boot, QRTR/QMI and ath11k. ----
+// DMA: 32 MiB of the PIL CDSP + SLPI carve-outs (0x87800000, 20 + 21 MiB, reserved in the UEFI memory map; this board never starts either
+// DSP), below 4 GiB as ath11k's 32-bit coherent mask wants, mapped uncached; the endpoint's SMMU stream (BDF 1:0.0 -> 0x1c01, the BDF->SID
+// table set in stage 2) passes through to physical addresses (SmmuBypass.h, as the audio buffer's stream). The first page is the MSI sink.
+constexpr uint64_t kArenaPhys = 0x87800000, kArenaBytes = 32u << 20, kSmmu = 0x15000000;
+constexpr uint16_t kStream = 0x1c01;
+constexpr unsigned kArenaBlocks = 16384;
+struct Arena {uint8_t *va; uint64_t iova; size_t bytes; struct Block {uint32_t off, size; bool used;} *blocks; unsigned count;} gArena;
+Window gArenaMap, gSmmuMap;
+const char *gSmmuError = "";
+uint32_t smmuRd(void *ctx, unsigned at) {return *reinterpret_cast<volatile uint32_t *>(reinterpret_cast<uintptr_t>(ctx) + at);}
+void smmuWr(void *ctx, unsigned at, uint32_t value) {*reinterpret_cast<volatile uint32_t *>(reinterpret_cast<uintptr_t>(ctx) + at) = value; dsb();}
+// The audio thread maps its stream the same way at its boot; this runs only once the firmware files exist on the data volume, long after.
+bool smmuPassThrough() {
+    if (!gSmmuMap.va && !mapWindow(gSmmuMap, kSmmu, 0x100000)) {gSmmuError = "map"; return false;}
+    const smmu_io io = {const_cast<uint32_t *>(gSmmuMap.va), smmuRd, smmuWr};
+    const smmu_plan plan = smmu_plan_bypass(&io, kStream, kArenaPhys, kArenaBytes);
+    if (const char *error = smmu_configure_bypass(&io, &plan, kStream)) {gSmmuError = error; return false;}
+    return true;
+}
+bool arenaInit() {
+    if (!gArena.blocks) gArena.blocks = static_cast<Arena::Block *>(IOMallocData(kArenaBlocks * sizeof(Arena::Block)));
+    if (!gArena.blocks || (!gArenaMap.va && !mapWindow(gArenaMap, kArenaPhys, kArenaBytes))) return false;
+    gArena.va = reinterpret_cast<uint8_t *>(const_cast<uint32_t *>(gArenaMap.va));
+    gArena.iova = kArenaPhys; gArena.bytes = kArenaBytes;
+    gArena.blocks[0] = {4096, (uint32_t)(gArena.bytes - 4096), false}; gArena.count = 1;   // the first page is the interrupt sink
+    bzero(gArena.va, gArena.bytes);
+    return true;
+}
+void pLog(int level, const char *line);
+// sheng's allocator: buffers of a page or more are aligned to their size rounded up to a power of two (the boot loader refuses an image
+// address that is only page aligned; an IOMMU-backed allocator aligns that way too).
+void *arenaAlloc(size_t n, uint64_t *bus) {
+    n = (n + 63) & ~(size_t)63;
+    if (n >= 4096) n = (n + 4095) & ~(size_t)4095;
+    uint32_t align = 64;
+    if (n >= 4096) {align = 4096; while (align < n) align <<= 1;}
+    for (unsigned i = 0; i < gArena.count; ++i) {
+        Arena::Block &b = gArena.blocks[i];
+        if (b.used) continue;
+        const uint32_t start = (b.off + align - 1) & ~(align - 1), pad = start - b.off;
+        if (b.size < pad + n) continue;
+        const bool tail = b.size > pad + n;
+        const unsigned extra = (pad ? 1u : 0u) + (tail ? 1u : 0u);
+        if (gArena.count + extra > kArenaBlocks) continue;
+        const Arena::Block whole = b;
+        memmove(&gArena.blocks[i + extra], &gArena.blocks[i], (gArena.count - i) * sizeof(Arena::Block));
+        gArena.count += extra;
+        unsigned at = i;
+        if (pad) {gArena.blocks[at] = {whole.off, pad, false}; ++at;}
+        gArena.blocks[at] = {start, (uint32_t)n, true};
+        if (tail) gArena.blocks[at + 1] = {start + (uint32_t)n, whole.size - pad - (uint32_t)n, false};
+        uint8_t *p = gArena.va + start;
+        bzero(p, n);
+        if (bus) *bus = gArena.iova + start;
+        return p;
+    }
+    uint32_t freeTotal = 0, freeMax = 0;
+    for (unsigned i = 0; i < gArena.count; ++i) if (!gArena.blocks[i].used) {freeTotal += gArena.blocks[i].size; if (gArena.blocks[i].size > freeMax) freeMax = gArena.blocks[i].size;}
+    char line[96];
+    snprintf(line, sizeof line, "dma window full: want %zu free %u largest %u blocks %u", n, freeTotal, freeMax, gArena.count);
+    pLog(3, line);
+    return nullptr;
+}
+void arenaFree(void *p) {
+    if (!p || (uint8_t *)p < gArena.va || (uint8_t *)p >= gArena.va + gArena.bytes) return;
+    const uint32_t off = (uint32_t)((uint8_t *)p - gArena.va);
+    for (unsigned i = 0; i < gArena.count; ++i) {
+        if (gArena.blocks[i].off != off || !gArena.blocks[i].used) continue;
+        gArena.blocks[i].used = false;
+        if (i + 1 < gArena.count && !gArena.blocks[i + 1].used) {gArena.blocks[i].size += gArena.blocks[i + 1].size; memmove(&gArena.blocks[i + 1], &gArena.blocks[i + 2], (gArena.count - i - 2) * sizeof(Arena::Block)); --gArena.count;}
+        if (i > 0 && !gArena.blocks[i - 1].used) {gArena.blocks[i - 1].size += gArena.blocks[i].size; memmove(&gArena.blocks[i], &gArena.blocks[i + 1], (gArena.count - i - 1) * sizeof(Arena::Block)); --gArena.count;}
+        return;
+    }
+}
+
+uint64_t pNow() {uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &ns); return ns / 1000000;}
+void pSleep(unsigned ms) {IOSleep(ms);}
+void pPoll() {}
+void pHalt() {for (;;) IOSleep(1000);}
+// The module's log on the console: notices, warnings and errors always; debug lines (level 7) only with pdx203-wifi-verbose=1, minus the
+// per-frame and per-interrupt ones. A line equal to one of the last sixteen is only counted.
+unsigned gVerbose;
+uint32_t gLogRepeats;
+bool has(const char *s, const char *w) {for (; *s; ++s) {size_t k = 0; while (w[k] && s[k] == w[k]) ++k; if (!w[k]) return true;} return false;}
+void pLog(int level, const char *line) {
+    if (level >= 7 && (!gVerbose || has(line, "htc rx completion") || has(line, "rx ce pipe") || has(line, "ext irq:") ||
+                       has(line, "event mgmt rx") || has(line, "mgmt rx event") || has(line, "chan info vdev_id") ||
+                       has(line, "chan scan list") || has(line, "mac channel ["))) {++gLogRepeats; return;}
+    static uint32_t recent[16];
+    uint32_t h = 2166136261u;
+    for (const char *c = line; *c; ++c) h = (h ^ static_cast<uint8_t>(*c)) * 16777619u;
+    h ^= static_cast<uint32_t>(level);
+    for (uint32_t r : recent) if (r == h) {++gLogRepeats; return;}
+    memmove(&recent[1], &recent[0], sizeof recent - sizeof recent[0]);
+    recent[0] = h;
+    static uint64_t first;
+    const uint64_t now = pNow();
+    if (!first) first = now;
+    printf("PDX203 WIFI [%u %d] %.150s\n", (uint32_t)(now - first), level, line);
+}
+void *hAlloc(size_t n) {
+    uint8_t *p = static_cast<uint8_t *>(IOMallocData(n + 16));
+    if (!p) return nullptr;
+    *reinterpret_cast<size_t *>(p) = n + 16;
+    return p + 16;
+}
+void hFree(void *q) {
+    if (!q) return;
+    uint8_t *p = static_cast<uint8_t *>(q) - 16;
+    IOFreeData(p, *reinterpret_cast<size_t *>(p));
+}
+void *pDmaAlloc(size_t n, uint64_t *bus) {return arenaAlloc(n, bus);}
+void pDmaFree(size_t, void *p, uint64_t) {arenaFree(p);}
+uint64_t pDmaMap(void *p, size_t, int) {
+    if ((uint8_t *)p < gArena.va || (uint8_t *)p >= gArena.va + gArena.bytes) return 0;
+    return gArena.iova + ((uint8_t *)p - gArena.va);
+}
+void pDmaSync(uint64_t, size_t, int) {dsb();}   // the arena is mapped uncached
+
+// The radio's address: locally administered, from /chosen/unique-chip-id (FNV-1a), the same at every boot (sheng's boardMac).
+bool boardMac(uint8_t m[6]) {
+    IORegistryEntry *chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane);
+    OSData *id = chosen ? OSDynamicCast(OSData, chosen->getProperty("unique-chip-id")) : nullptr;
+    uint64_t seed = 0;
+    if (id && id->getLength() >= sizeof seed) memcpy(&seed, id->getBytesNoCopy(), sizeof seed);
+    OSSafeReleaseNULL(chosen);
+    if (!seed) return false;
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (unsigned i = 0; i < 8; ++i) h = (h ^ ((seed >> (8 * i)) & 0xff)) * 0x100000001b3ull;
+    for (unsigned i = 0; i < 6; ++i) m[i] = (uint8_t)(h >> (8 * i));
+    m[0] = (uint8_t)((m[0] & 0xfe) | 0x02);
+    return true;
+}
+int macFile(const uint8_t **data, size_t *size) {
+    static char text[40]; static size_t len;
+    if (!len) {
+        uint8_t m[6];
+        if (!boardMac(m)) return -1;
+        len = (size_t)snprintf(text, sizeof text, "address=%02x%02x%02x%02x%02x%02x\n", m[0], m[1], m[2], m[3], m[4], m[5]);
+    }
+    *data = (const uint8_t *)text; *size = len;
+    return 0;
+}
+// Firmware: the files the boot add-on carries in wifi/ (make-gpu-addon.py --wifi; linux-firmware ath11k/QCA6390/hw2.0, local only), which the
+// kernel stages below /private/var/ngpu once the data volume is mounted. Each is read once and kept.
+constexpr const char *kFwDir = "/private/var/ngpu/wifi/";
+struct FwCache {char name[32]; uint8_t *data; size_t size; bool tried;} gFw[8];
+int pFwGet(const char *path, const uint8_t **data, size_t *size) {
+    const char *base = path;
+    for (const char *c = path; *c; ++c) if (*c == '/') base = c + 1;
+    if (!strcmp(base, "wlan_mac.bin")) return macFile(data, size);
+    FwCache *slot = nullptr;
+    for (auto &f : gFw) if (f.tried && !strncmp(f.name, base, sizeof f.name)) {slot = &f; break;}
+    if (!slot) for (auto &f : gFw) if (!f.tried) {slot = &f; strlcpy(f.name, base, sizeof f.name); f.tried = true; break;}
+    if (!slot) return -1;
+    if (!slot->data) {
+        char full[96];
+        snprintf(full, sizeof full, "%s%s", kFwDir, base);
+        void *h = nullptr; uint64_t bytes = 0;
+        if (sheng_fw_open(full, &h, &bytes) || !bytes || bytes > (64u << 20)) {if (h) sheng_fw_close(h); return -1;}
+        uint8_t *buf = static_cast<uint8_t *>(IOMallocData((size_t)bytes));
+        if (!buf || sheng_fw_read(h, 0, buf, (size_t)bytes)) {if (buf) IOFreeData(buf, (size_t)bytes); sheng_fw_close(h); return -1;}
+        sheng_fw_close(h);
+        slot->data = buf; slot->size = (size_t)bytes;
+        char line[96]; snprintf(line, sizeof line, "firmware %s: %zu bytes", base, slot->size); pLog(6, line);
+    }
+    *data = slot->data; *size = slot->size;
+    return 0;
+}
+// The system's record of the WiFi address, as a boot loader leaves it: wifid derives each network's private address from it.
+void publishMac() {
+    uint8_t m[6];
+    if (!boardMac(m)) return;
+    if (IORegistryEntry *chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane)) {
+        if (!chosen->getProperty("mac-address-wifi0")) chosen->setProperty("mac-address-wifi0", m, sizeof m);
+        chosen->release();
+    }
+}
+
+// Configuration space of the endpoint through the iATU window; offsets with bit 31 set are relative to the PCI Express capability.
+volatile uint32_t *gCfg, *gDbi;
+uint32_t gPcieCap, gMsiCap;
+bool findCaps() {
+    uint8_t cap = (uint8_t)(gCfg[0x34 / 4] & 0xff);
+    for (unsigned guard = 0; cap >= 0x40 && guard < 48; ++guard) {
+        const uint32_t w = gCfg[cap / 4];
+        if ((uint8_t)w == 0x10) gPcieCap = cap;
+        if ((uint8_t)w == 0x05) gMsiCap = cap;
+        cap = (uint8_t)(w >> 8);
+    }
+    return gPcieCap && gMsiCap;
+}
+int pCfgRead(int off, int size, uint32_t *v) {
+    uint32_t o = (uint32_t)off;
+    if (o & 0x80000000u) o = gPcieCap + (o & 0x7fffffffu);
+    const uint32_t w = gCfg[(o & ~3u) / 4];
+    *v = size == 4 ? w : size == 2 ? (w >> ((o & 2) * 8)) & 0xffff : (w >> ((o & 3) * 8)) & 0xff;
+    return 0;
+}
+int pCfgWrite(int off, int size, uint32_t v) {
+    uint32_t o = (uint32_t)off;
+    if (o & 0x80000000u) o = gPcieCap + (o & 0x7fffffffu);
+    if (size == 4) {gCfg[o / 4] = v; dsb(); return 0;}
+    const unsigned shift = (size == 2 ? (o & 2) : (o & 3)) * 8;
+    const uint32_t mask = (size == 2 ? 0xffffu : 0xffu) << shift;
+    gCfg[(o & ~3u) / 4] = (gCfg[(o & ~3u) / 4] & ~mask) | ((v << shift) & mask);
+    dsb();
+    return 0;
+}
+int pMsiTarget(uint32_t *lo, uint32_t *hi, uint32_t *data) {*lo = (uint32_t)gArena.iova; *hi = (uint32_t)(gArena.iova >> 32); *data = 0; return 0;}
+
+// The endpoint's MSIs: the root complex's DesignWare iMSI takes inbound writes to MSI_ADDR (the arena's first page, the address the endpoint
+// is given) instead of memory, sets bit <data> of group 0's status and raises "msi0" (SPI 141, level). The handler clears the status and
+// wakes the thread; without the line the loop polls every millisecond.
+constexpr uint32_t kMsiAddrLo = 0x820, kMsiAddrHi = 0x824, kMsiEnable0 = 0x828, kMsiMask0 = 0x82c, kMsiStatus0 = 0x830, kMsiSpi = 141;
+volatile uint32_t gMsiCount, gMsiBits, gMsiWake;
+bool gMsiAttached;
+void msiIrq(void *) {
+    const uint32_t status = gDbi[kMsiStatus0 / 4];
+    if (status) gDbi[kMsiStatus0 / 4] = status;
+    gMsiCount = gMsiCount + 1;
+    gMsiBits = gMsiBits | status;
+    static uint32_t empty;
+    empty = status ? 0 : empty + 1;
+    if (empty > 100000) {gDbi[kMsiEnable0 / 4] = 0; gMsiAttached = false;}   // a line with nothing to clear would storm
+    gMsiWake = 1;
+    thread_wakeup(event_t(&gMsiWake));
+}
+int msiAttach() {
+    gDbi[kMsiAddrLo / 4] = uint32_t(gArena.iova);
+    gDbi[kMsiAddrHi / 4] = uint32_t(gArena.iova >> 32);
+    gDbi[kMsiMask0 / 4] = 0;
+    gDbi[kMsiEnable0 / 4] = 0xffffffffu;
+    dsb();
+    if (!armcpu_spi_attach) return -78;
+    const int rc = armcpu_spi_attach(32 + kMsiSpi, false, msiIrq, nullptr, nullptr, nullptr);
+    gMsiAttached = rc == 0;
+    return rc;
+}
+void msiWait(unsigned ms) {
+    if (__atomic_exchange_n(&gMsiWake, 0u, __ATOMIC_ACQ_REL)) return;
+    assert_wait_timeout(event_t(&gMsiWake), THREAD_UNINT, ms, NSEC_PER_MSEC);
+    if (__atomic_exchange_n(&gMsiWake, 0u, __ATOMIC_ACQ_REL)) {clear_wait(current_thread(), THREAD_AWAKENED); return;}
+    thread_block(THREAD_CONTINUE_NULL);
+    gMsiWake = 0;
+}
+
+void wifiStack(volatile uint32_t *config, volatile uint32_t *dbi) {
+    gCfg = config; gDbi = dbi;
+    PE_parse_boot_argn("pdx203-wifi-verbose", &gVerbose, sizeof gVerbose);
+    publishMac();
+    // the firmware arrives with the data volume: wait for it (up to ten minutes)
+    const uint8_t *fw = nullptr; size_t fwBytes = 0;
+    unsigned waited = 0;
+    for (; waited < 600 && pFwGet("amss.bin", &fw, &fwBytes); ++waited) IOSleep(1000);
+    if (!fw) {pLog(3, "wifi: no firmware in /private/var/ngpu/wifi"); fail(40); print("failed"); return;}
+    S[0] = 40;
+    if (!smmuPassThrough()) {char t[96]; snprintf(t, sizeof t, "wifi: SMMU stream 0x1c01: %s", gSmmuError); pLog(3, t); fail(41); print("failed"); return;}
+    if (!arenaInit()) {pLog(3, "wifi: DMA arena not mapped"); fail(42); print("failed"); return;}
+    if (!findCaps()) {pLog(3, "wifi: no PCIe/MSI capability"); fail(43); print("failed"); return;}
+    S[0] = 43;
+    print("module start");
+    static const struct lx_platform plat = {pNow, pSleep, pPoll, pLog, pHalt, hAlloc, hFree, pDmaAlloc, pDmaFree, pDmaMap, pDmaSync, pFwGet};
+    static struct nw_board board;
+    board.bar = const_cast<uint32_t *>(gBar.va); board.bar_len = gBarBytes; board.device_id = (uint16_t)(gCfg[0] >> 16);
+    board.msi_cap = (uint16_t)gMsiCap; board.irq_base = 1000;
+    board.cfg_read = pCfgRead; board.cfg_write = pCfgWrite; board.msi_target = pMsiTarget; board.map_phys = nullptr;
+    const int msi = msiAttach();
+    char t[112];
+    snprintf(t, sizeof t, "wifi: arena %llx+%lluM, stream %x bypassed, MSI %s (%d), waited %us for firmware", (unsigned long long)kArenaPhys,
+             (unsigned long long)(kArenaBytes >> 20), kStream, msi ? "polled" : "on SPI 141", msi, waited);
+    pLog(6, t);
+    const int r = nw_wifi_start(&plat, &board);
+    S[0] = r ? -44 : 44;
+    snprintf(t, sizeof t, "wifi: module start %d", r);
+    pLog(r ? 3 : 6, t);
+    uint32_t lastStage = 0xffffffffu;
+    uint64_t nextReport = 0;
+    for (;;) {
+        const int busy = nw_wifi_step();
+        if (!busy) {if (gMsiAttached) msiWait(10); else IOSleep(1);}
+        const uint64_t now = pNow();
+        if (nw_wifi_stats.stage != lastStage || now >= nextReport) {
+            lastStage = nw_wifi_stats.stage;
+            nextReport = now + 60000;
+            snprintf(t, sizeof t, "wifi: stage %u scans %u frames %u beacons %u bss %u err %d | msi %u bits %08x | repeats %u", nw_wifi_stats.stage,
+                     nw_wifi_stats.scans, nw_wifi_stats.frames, nw_wifi_stats.beacons, nw_wifi_stats.bss_seen, nw_wifi_stats.last_err, gMsiCount,
+                     gMsiBits, gLogRepeats);
+            pLog(6, t);
+        }
+    }
 }
 
 void bringUp(volatile uint32_t *g, volatile uint32_t *t, unsigned stage, bool gen3) {
@@ -326,6 +637,11 @@ void bringUp(volatile uint32_t *g, volatile uint32_t *t, unsigned stage, bool ge
         if (id == 0x110117cbu) {S[0] = 20; if (stage >= 3) endpoint(a, config.va, d);}
         else fail(19);
     } else fail(19);
+    if (stage >= 4 && S[0] == 31) {
+        wifiStack(config.va, dbi.va);   // runs for the rest of the boot; the windows stay mapped
+        return;
+    }
+    release(gBar);
     release(config); release(atu); release(phy); release(dbi); release(parf);
 }
 

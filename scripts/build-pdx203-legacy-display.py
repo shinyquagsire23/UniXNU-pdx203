@@ -13,6 +13,7 @@ checks it against build-report.json.
 """
 import hashlib
 import json
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -209,7 +210,7 @@ def code(data,info):
     sec=next(s for g in info['segments'] for s in g['sections'] if s['name']=='__text');return data[sec['fileoff']:sec['fileoff']+sec['size']]
 require(code(raw,image)==code(late.read_bytes(),macho(late.read_bytes())),'Only owned initializer section registration changes')
 r=json.loads((ROOT/'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json').read_text().strip().rstrip(','))
-def board_cpp(name):
+def board_cpp(name,extra=()):
     """compile a board C++ source of kits/pdx203 with the kernel's IOKit C++ line into OUT/<stem>.o"""
     cmd=[];args=r['arguments'];i=0;src=ROOT/'kits/pdx203'/name;obj=OUT/(Path(name).stem+'.o')
     while i<len(args):
@@ -220,7 +221,7 @@ def board_cpp(name):
         elif not value.startswith('-W'):cmd.append(value)
         i+=1
     cmd+=['-Wall','-Wextra','-Werror','-Wno-unused-parameter','-Wno-unnecessary-virtual-specifier','-Wno-c99-designator','-Wno-reorder-init-list',
-          '-Wno-deprecated-enum-enum-conversion','-Wno-missing-designated-field-initializers','-I',str(ROOT/'.cache/xnu-work/osfmk')]
+          '-Wno-deprecated-enum-enum-conversion','-Wno-missing-designated-field-initializers','-I',str(ROOT/'.cache/xnu-work/osfmk'),*extra]
     run(cmd,cwd=r['directory'])
     return src,obj
 source,probe=board_cpp('LegacyDisplayProbe.cpp')
@@ -258,8 +259,14 @@ adsp_src,adsp_probe=board_cpp('AdspProbe.cpp')
 audio_src,audio_probe=board_cpp('Pdx203Audio.cpp')
 # the headphone jack (WCD938x over SoundWire, the LPASS RX/TX macros), driven from Pdx203Audio.cpp
 hph_src,hph_obj=board_cpp('Pdx203Hph.cpp')
-# the WiFi chip's PCIe bring-up (QCA6390 on PCIe0)
-wifi_src,wifi_obj=board_cpp('Pdx203Wifi.cpp')
+# the WiFi chip's PCIe bring-up (QCA6390 on PCIe0) and the WiFi module it starts (Ath11kWifi, a checkout next to the device repository or
+# $ATH11K_WIFI_DIR): scripts/build-ath11k-wifi.py compiles the module to kernel objects with every global but the nw_wifi_* ABI renamed
+wifi_module=Path(os.environ['ATH11K_WIFI_DIR']) if os.environ.get('ATH11K_WIFI_DIR') else (ROOT/'kits/pdx203').resolve().parent.parent/'Ath11kWifi'
+require((wifi_module/'include/nw_abi.h').exists(),f'Ath11kWifi checkout at {wifi_module}')
+wifi_src,wifi_obj=board_cpp('Pdx203Wifi.cpp',['-I',str(wifi_module/'include')])
+wifi_module_objs=[Path(l[4:]) for l in subprocess.check_output(['python3',str(ROOT/'scripts/build-ath11k-wifi.py'),'--module',str(wifi_module),'--tree',str(ROOT)],text=True,timeout=1800).splitlines()
+                  if l.startswith('OBJ ')]
+require(len(wifi_module_objs)>30,'Ath11kWifi objects built')
 # the audio service iOS's audio server plug-in opens (sheng's ShengAudioService.cpp): its classes register late from Pdx203Audio.cpp
 audio_svc_src,audio_svc_obj=board_cpp('ShengAudioService.cpp')
 audio_svc_late=OUT/'ShengAudioService.late.o'
@@ -291,7 +298,7 @@ require(code((keyevents/'NativeKeyStoreEvents.o').read_bytes(),macho((keyevents/
         code(keyevents_late.read_bytes(),macho(keyevents_late.read_bytes())),'Owned keystore instructions unchanged by late init staging')
 archive=OUT/'libNativeLegacyDisplay.late.a';archive.unlink(missing_ok=True)
 run(['xcrun','ar','rcs',archive,late,OUT/'original-bindings.o',probe,hid_probe,touch_probe,hid/'NativeHidInput.late.o',hid/'hid-original-bindings.o',
-     keystore_probe,keyevents_late,cpufreq_probe,buttons_probe,battery_late,battery_probe,rtc_late,rtc_probe,adsp_probe,audio_probe,hph_obj,wifi_obj,audio_svc_late,*[o for _,o in adsp_c]])
+     keystore_probe,keyevents_late,cpufreq_probe,buttons_probe,battery_late,battery_probe,rtc_late,rtc_probe,adsp_probe,audio_probe,hph_obj,wifi_obj,*wifi_module_objs,audio_svc_late,*[o for _,o in adsp_c]])
 sources=[ROOT/'drivers/NativeMobileDisplay/NativeLegacyDisplay.cpp',ROOT/'drivers/NativeMobileDisplay/NativeLegacyRequest.h',source,
          hid_src,touch_src,ROOT/'drivers/NativeHidInput/NativeHidInput.cpp',keystore_src,ROOT/'drivers/NativeKeyStoreEvents/NativeKeyStoreEvents.cpp',cpufreq_src,buttons_src,
          ROOT/'kits/pdx203/ButtonsCore.h',battery_src,battery_probe_src,rtc_src,rtc_probe_src,adsp_src,audio_src,hph_src,wifi_src,audio_svc_src,*[c for c,_ in adsp_c]]
