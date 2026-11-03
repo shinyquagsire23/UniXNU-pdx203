@@ -97,6 +97,7 @@ volatile uint64_t native_gpu_idle_sleeps, native_gpu_idle_spins;
 #include "NativeAdrenoTimer.h"
 #include "NativeAdrenoABI.h"
 #include "NativeAdrenoUserClient.h"
+#include "NativeAdrenoVm.h"
 extern "C" {
 NativeAdrenoVm *NativeAdrenoGpuContextVm();
 IOReturn native_adreno_publish(NativeAdrenoVm *, NativeAdrenoSubmit *, NativeAdrenoRing *, const NativeAdrenoRingClock *,
@@ -1407,6 +1408,102 @@ void hangRows(unsigned t) {
     changed();
 }
 
+// One GPUCRASH report, the first time the GPU's SMMU context reports a fault or the CP has stood still for 4 s with work outstanding.
+// usb-157/158: the GPU read address 0 (cb0 FSR 80000402, FAR 0), the CP then sat on a zero packet header (CP_INTERRUPT_STATUS bit 0,
+// opcode error) and nothing completed again (no reset path); backboardd's frames waited behind it until its watchdog killed it, and
+// the relaunched one found the same dead GPU. This names the block that faulted (as Linux's a6xx_fault_block does: FSYNR1's low byte is
+// the master id; 0 CP, 4 CCU, 6 CDP prefetch, 7 GMU; 1..3 come through UCHE, whose UCHE_CLIENT_PF 0xe19 says which client), the
+// process whose window holds the CP's IBs, the CP's state, then raw words: 256 around each IB fetch pointer and the hung job's first IB
+// (native_adreno_ib_log), 8 to a GPUIB row, for decoding against the a6xx packet and register database.
+extern "C" volatile uint32_t native_adreno_ib_log[4][4+28], native_adreno_ib_log_count;
+extern "C" volatile uint32_t native_adreno_stall[2+NativeAdrenoRingStallWords];
+struct Pdx203ClientRecord {char name[20]; uint32_t opens, refused, closes, slot, peak_mib, last_refusal;};
+extern "C" struct Pdx203ClientRecord native_adreno_client_log[8] __attribute__((weak_import));
+// NativeAdrenoPublish.cpp kClientWindows: slot 0 the render server's 1 GiB, three more of 170 MiB.
+static const struct {uint64_t start, bytes;} kCrashWindows[4] = {
+    {0x20000000ull, 0x40000000ull}, {0x60000000ull, 0x0AAA9000ull}, {0x6AAA9000ull, 0x0AAA9000ull}, {0x75552000ull, 0x0AAA9000ull}};
+const char *crashOwner(uint64_t iova) {
+    for (unsigned slot = 0; slot < 4; ++slot) {
+        if (iova < kCrashWindows[slot].start || iova - kCrashWindows[slot].start >= kCrashWindows[slot].bytes) continue;
+        if (&native_adreno_client_log) for (auto &r : native_adreno_client_log) if (r.name[0] && r.slot == slot) return r.name;
+        return "slot-unnamed";
+    }
+    return iova ? "outside-windows" : "none";
+}
+const char *crashBlock(uint32_t id, uint32_t pf) {
+    static const char *uche[7] = {"VFD", "SP", "VSC", "VPC", "HLSQ", "PC", "LRZ"};
+    if (id == 0) return "CP";
+    if (id == 4) return "CCU";
+    if (id == 6) return "CDP-prefetch";
+    if (id == 7) return "GMU";
+    if (id == 3) return (pf & 7) < 7 ? uche[pf & 7] : "UCHE?";
+    if (id == 2) return (pf & 7) == 0 ? "TP" : "TP|VFD";
+    if (id == 1) return "UCHE";
+    return "unknown";
+}
+void crashWords(const char *label, uint64_t from, unsigned count) {
+    NativeAdrenoVm *vm = NativeAdrenoGpuContextVm();
+    if (!vm) return;
+    from &= ~3ull;
+    for (unsigned at = 0; at < count; at += 8) {
+        uint32_t w[8] = {};
+        const uint64_t iova = from + 4ull * at;
+        if (vm->peekWordsUncached(iova, w, 8)) {printf("GPUIB %s %llx unmapped\n", label, (unsigned long long)iova); continue;}
+        printf("GPUIB %s %llx %08x %08x %08x %08x %08x %08x %08x %08x\n", label, (unsigned long long)iova,
+               w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+    }
+}
+void crashReport(const char *why) {
+    static bool done;
+    if (done) return;
+    done = true;
+    const uint32_t bank0 = smmuBank0();
+    const uint32_t fsr = smmuRead(bank0 + 0x58), fsynr0 = smmuRead(bank0 + 0x68), fsynr1 = smmuRead(bank0 + 0x6c);
+    const uint64_t far = smmuRead(bank0 + 0x60) | uint64_t(smmuRead(bank0 + 0x64)) << 32;
+    const uint32_t pf = gpuRead(0xe19);
+    const uint64_t ib1 = gpuRead(0x928) | uint64_t(gpuRead(0x929)) << 32, ib2 = gpuRead(0x92b) | uint64_t(gpuRead(0x92c)) << 32;
+    const uint32_t rem1 = gpuRead(0x92a), rem2 = gpuRead(0x92d);
+    gw(0x908, 0);
+    const uint32_t pc = gpuRead(0x909), op = gpuRead(0x909);
+    const NativeAdrenoSubmitStats st = gSubmit ? gSubmit->stats() : NativeAdrenoSubmitStats{};
+    printf("GPUCRASH %s | fsr %x far %llx fsynr %x/%x block %s (pf %x) | rbbm %08x %x/%x/%x cpi %x hw %x prot %x | sqe pc %x op %08x\n",
+           why, fsr, (unsigned long long)far, fsynr0, fsynr1, crashBlock(fsynr1 & 0xff, pf), pf, gpuRead(0x210), gpuRead(0x211),
+           gpuRead(0x212), gpuRead(0x213), gpuRead(0x823), gpuRead(0x821), gpuRead(0x824), pc, op);
+    printf("GPUCRASH ib1 %llx+%x (%s) ib2 %llx+%x (%s) | rb r%x w%x | sub %u/%u | irq seen %x last %x n%u\n",
+           (unsigned long long)ib1, rem1, crashOwner(ib1), (unsigned long long)ib2, rem2, crashOwner(ib2), gpuRead(0x806), gpuRead(0x807),
+           st.submissions, st.completed, gIrqSeen, gIrqLast, gIrqCount);
+    for (unsigned slot = 0; slot < 4; ++slot) {
+        const char *name = "-";
+        if (&native_adreno_client_log) for (auto &r : native_adreno_client_log) if (r.name[0] && r.slot == slot) name = r.name;
+        printf("GPUCRASH slot %u %llx+%llx %s\n", slot, (unsigned long long)kCrashWindows[slot].start,
+               (unsigned long long)kCrashWindows[slot].bytes, name);
+    }
+    {
+        char row[400]; size_t at = 0;
+        at += snprintf(row + at, sizeof row - at, "GPUCRASH stall");
+        for (unsigned i = 0; i < 2 + NativeAdrenoRingStallWords && at < sizeof row; ++i)
+            at += snprintf(row + at, sizeof row - at, " %x", native_adreno_stall[i]);
+        printf("%s\n", row);
+    }
+    // The last submissions' first IBs: fence, iova, bytes and owner; the hung job's (the fence after the last completed) is dumped whole.
+    const uint32_t hung = st.completed + 1;
+    int hungSlot = -1;
+    for (unsigned i = 0; i < 4; ++i) {
+        const uint64_t iova = native_adreno_ib_log[i][1] | uint64_t(native_adreno_ib_log[i][2]) << 32;
+        printf("GPUCRASH job fence %u ib %llx bytes %x (%s)\n", native_adreno_ib_log[i][0], (unsigned long long)iova,
+               native_adreno_ib_log[i][3], crashOwner(iova));
+        if (native_adreno_ib_log[i][0] == hung) hungSlot = int(i);
+    }
+    if (ib1) crashWords("ib1", ib1 >= 512 ? ib1 - 512 : 0, 256);
+    if (ib2) crashWords("ib2", ib2 >= 512 ? ib2 - 512 : 0, 256);
+    if (hungSlot >= 0) {
+        const uint64_t iova = native_adreno_ib_log[hungSlot][1] | uint64_t(native_adreno_ib_log[hungSlot][2]) << 32;
+        const uint32_t bytes = native_adreno_ib_log[hungSlot][3];
+        crashWords("job", iova, (bytes > 16384 ? 16384 : bytes) / 4);
+    }
+    printf("GPUCRASH end\n");
+}
+
 // The live row, every 2 s once the device is published: interrupts (count, last status, all seen, masked), submissions (submitted,
 // completed, timeouts, poisoned), user clients opened/closed, the BO pool (MiB in use, peak, size; BOs that did not fit and fell
 // back to scattered pages, scattered BOs in all), and the GPU's busy share of the last beat in per mille. Only changed values reach
@@ -1431,7 +1528,12 @@ void hangRows(unsigned t) {
         lastBusy = busy; lastNs = ns;
         const NativeAdrenoSubmitStats st = gSubmit->stats();
         const uint32_t rptr = gpuRead(0x806), ib1 = gpuRead(0x928), rem1 = gpuRead(0x92a);
-        if (st.submissions != st.completed && rptr == lastRptr && ib1 == lastIb1 && rem1 == lastRem1) hangRows(t);
+        // Three beats in a row (4 to 6 s) with the CP on the same IB position and work outstanding: report it once.
+        static unsigned stuckBeats;
+        if (st.submissions != st.completed && rptr == lastRptr && ib1 == lastIb1 && rem1 == lastRem1) {
+            hangRows(t);
+            if (++stuckBeats >= 3) crashReport("cp-stopped");
+        } else stuckBeats = 0;
         lastRptr = rptr; lastIb1 = ib1; lastRem1 = rem1;
         uint32_t closed = 0;
         const uint32_t opened = native_adreno_publish_stats(&closed);
@@ -1456,6 +1558,7 @@ void hangRows(unsigned t) {
         snprintf(line, sizeof line, "FAULTS cr0 %x gfsr %x syn %x/%x/%x | cb0 fsr %x syn %x far %x%08x", smmuRead(0x0), smmuRead(0x48),
                  smmuRead(0x50), smmuRead(0x54), smmuRead(0x58), smmuRead(bank0 + 0x58), smmuRead(bank0 + 0x68),
                  smmuRead(bank0 + 0x64), smmuRead(bank0 + 0x60));
+        if (smmuRead(bank0 + 0x58) & 0x1fe) crashReport("smmu-fault");   // FSR TF/AFF/PF/EF/TLB/ASF/UUT: a context fault
         if (strncmp(line, native_gpu_rows[kRowFaults], sizeof line)) {
             strlcpy(native_gpu_rows[kRowFaults], line, sizeof native_gpu_rows[0]);
             changed();
@@ -1599,10 +1702,8 @@ struct Pdx203MetalDiag {
     char opener[3][17], reader[3][17], name_reader[17], starter[3][17], report[64], report2[64];
     uint32_t grants;
 };
-struct Pdx203ClientRecord {char name[20]; uint32_t opens, refused, closes, slot, peak_mib, last_refusal;};
 struct Pdx203ClientText {char name[20]; char text[2][64]; uint32_t lines;};
 extern struct Pdx203MetalDiag native_adreno_metal_diag __attribute__((weak_import));
-extern struct Pdx203ClientRecord native_adreno_client_log[8] __attribute__((weak_import));
 extern struct Pdx203ClientText native_adreno_client_text[4] __attribute__((weak_import));
 extern char native_adreno_metal_rows[48][96] __attribute__((weak_import));
 extern volatile uint32_t native_adreno_mount_fail[4] __attribute__((weak_import));
