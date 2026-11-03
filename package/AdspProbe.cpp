@@ -232,11 +232,20 @@ bool readCmdDb(uint8_t *copy) {
 }
 QcomRpmhResource gLcx, gLmx;
 int gTcs = -1;
+// TCS 1 is shared with the WiFi bring-up's rail votes (pdx203_rpmh_send below; the GPU's bus votes take whichever of TCS 0/1 is idle):
+// one request at a time. Recursive: vote() services the DSP's events while it waits.
+IORecursiveLock *gRpmhLock;
 
 // Votes both rails to the given ARC index pair through active TCS 1 and waits up to 100 ms for its done interrupt. The active TCSs are 0
-// to 2 (tcs-config lists the active type first); the WiFi bring-up sends through TCS 0, so the two never share one. A request whose done
-// interrupt is not seen still counts (bit 15 of [15]): the WiFi rails show such requests take effect.
+// and 1 (tcs-config ACTIVE 2 lists the active type first). A request whose done interrupt is not seen still counts (bit 15 of [15]).
+int voteLocked(uint32_t lcx, uint32_t lmx);
 int vote(uint32_t lcx, uint32_t lmx) {
+    IORecursiveLockLock(gRpmhLock);
+    const int rc = voteLocked(lcx, lmx);
+    IORecursiveLockUnlock(gRpmhLock);
+    return rc;
+}
+int voteLocked(uint32_t lcx, uint32_t lmx) {
     if (gTcs < 0) {
         gTcs = 1;
         gRscIrqBits = 1u << gTcs;
@@ -602,6 +611,8 @@ void adspThread(void *, wait_result_t) {
     }
     gSmem = {gSmemW.va, (uint32_t)kSmemSize};
     gLayout = qcom_rsc_layout(rd(gRsc, 0));
+    gRpmhLock = IORecursiveLockAlloc();
+    if (!gRpmhLock) {fail(StMapped, -12); return;}
     stage(StMapped);
     survey();
     stage(StSurveyed);
@@ -662,4 +673,44 @@ extern "C" void sheng_adsp_probe(void) {
     thread_t thread = nullptr;
     if (!gClientLock || kernel_thread_start(adspThread, nullptr, &thread) != KERN_SUCCESS) {fail(StMapped, -7); return;}
     thread_deallocate(thread);
+}
+
+// ---- RPMh for other board drivers (the WiFi chip's rails): the command database and one active request through TCS 1, under the lock
+// the DSP's own votes take. Ready once the ADSP thread has mapped the RSC (pdx203-adsp >= 1). ----
+extern "C" int pdx203_rpmh_find(const char *name, uint32_t *address, uint32_t level, uint32_t *index) {
+    if (!gRpmhLock) return -19;
+    uint8_t *db = static_cast<uint8_t *>(IOMallocData(kCmdDbSize));
+    if (!db) return -12;
+    QcomRpmhResource r = {};
+    int rc = readCmdDb(db) ? qcom_cmd_db_find(db, kCmdDbSize, name, &r) : -5;
+    IOFreeData(db, kCmdDbSize);
+    if (rc) return rc;
+    *address = r.address;
+    if (index) rc = qcom_rpmh_level_index(&r, level, index);
+    return rc;
+}
+// Up to four commands in order; waits up to 100 ms for the TCS done interrupt (or its status bit). 0, or 1 when completion was not seen
+// (the request still went out), negative when it could not be sent.
+extern "C" int pdx203_rpmh_send(const uint32_t *addresses, const uint32_t *values, unsigned count) {
+    if (!gRpmhLock || !gRsc.va) return -19;
+    IORecursiveLockLock(gRpmhLock);
+    if (gTcs < 0) {
+        gTcs = 1;
+        gRscIrqBits = 1u << gTcs;
+        wr(gRsc, kRscTcs + 0, rd(gRsc, kRscTcs + 0) | gRscIrqBits);
+    }
+    QcomRpmhWrite writes[16];
+    const unsigned n = qcom_rpmh_active_request(&gLayout, (unsigned)gTcs, addresses, values, count, writes, 16);
+    if (!n) {IORecursiveLockUnlock(gRpmhLock); return -22;}
+    __atomic_store_n(&gRscDone, 0, __ATOMIC_RELEASE);
+    for (unsigned i = 0; i < n; ++i) wr(gRsc, kRscTcs + writes[i].offset, writes[i].value);
+    bool done = false;
+    for (unsigned ms = 0; ms < 100 && !done; ++ms) {
+        done = (__atomic_load_n(&gRscDone, __ATOMIC_ACQUIRE) & gRscIrqBits) || (rd(gRsc, kRscTcs + gLayout.irq_status) & gRscIrqBits);
+        if (!done) IOSleep(1);
+    }
+    const unsigned m = qcom_rpmh_finish(&gLayout, (unsigned)gTcs, writes, 16);
+    for (unsigned i = 0; i < m; ++i) wr(gRsc, kRscTcs + writes[i].offset, writes[i].value);
+    IORecursiveLockUnlock(gRpmhLock);
+    return done ? 0 : 1;
 }

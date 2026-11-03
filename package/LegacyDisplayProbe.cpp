@@ -525,6 +525,8 @@ extern "C" void pdx203_rtc_probe(void);
 // (package/Pdx203Audio.cpp; pdx203-audio=<bits>): their own threads, nothing without the arguments
 extern "C" void sheng_adsp_probe(void);
 extern "C" void pdx203_audio_probe(void);
+// the QCA6390 WiFi chip on PCIe0 (package/Pdx203Wifi.cpp; pdx203-wifi=<stage>): its rails go through the ADSP thread's RPMh helper
+extern "C" void pdx203_wifi_probe(void);
 void native_legacy_display_late_probe(void) {
     pdx203_cpufreq_start();
     pdx203_gpu_start();
@@ -535,6 +537,7 @@ void native_legacy_display_late_probe(void) {
     pdx203_rtc_probe();
     sheng_adsp_probe();
     pdx203_audio_probe();
+    pdx203_wifi_probe();
     unsigned touch=0;
     if(PE_parse_boot_argn("pdx203-touch",&touch,sizeof(touch)) && touch==1)(void)pdx203_touch_start();
     IOService *display=pendingLegacyDisplay;if(!display)return;pendingLegacyDisplay=nullptr;
