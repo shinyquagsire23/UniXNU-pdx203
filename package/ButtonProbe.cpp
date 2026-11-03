@@ -351,12 +351,14 @@ void markBootloader(void) {
         __asm__ volatile("dsb sy" ::: "memory");
         imemAfter = imem[0x65c / 4];
     }
-    // The PON spare register is left alone unless pdx203-fastboot-pon=<raw byte> names a value: usb-165 wrote 0x04 (Linux's
+    // The PON spare register gets pdx203-fastboot-pon=<raw byte>: usb-165 wrote 0x04 (Linux's
     // mode-bootloader 2 << 1) over 0x82 and Sony's boot chain started recovery with warmboot=0x77665502, the recovery magic, although
     // the IMEM cell read back 0x77665500.
     uint8_t spare = 0, spareAfter = 0;
     int rc = -9;
-    unsigned ponRaw = 0x100;
+    // usb-166/167: IMEM alone is not read (0x82 left in the spare register booted iPadOS again), and 0x04 starts recovery
+    // (warmboot=0x77665502), from which the rig's adb reboot bootloader reaches fastboot. So 0x04 by default; 0x100 leaves it alone.
+    unsigned ponRaw = 0x04;
     PE_parse_boot_argn("pdx203-fastboot-pon", &ponRaw, sizeof ponRaw);
     if (gPonWrite >= 0) {
         rc = read8(gPonWrite, 0x8F, &spare);
