@@ -406,6 +406,20 @@ extern "C" int pdx203_spmi_read(uint32_t ppid, uint8_t addr, uint8_t *value) {
     return observe(apid, addr, value);
 }
 
+// pdx203: the APID through which this EE may write ppid (ownership EE 0, as Linux picks it), -1 when there is none (a write
+// through an APID another EE owns wedged the CPU, usb-67), -2 until the button thread has mapped the arbiter.
+extern "C" int pdx203_spmi_writable(uint32_t ppid) {
+    if (native_buttons_stats[0] < 2 || !gChn.va || !gCore.va) return -2;
+    return findWritableApid(ppid);
+}
+// One byte written to ppid through its writable APID only; -3 when this EE owns no APID of ppid.
+extern "C" int pdx203_spmi_write(uint32_t ppid, uint8_t addr, uint8_t value) {
+    const int apid = pdx203_spmi_writable(ppid);
+    if (apid == -2) return -1;
+    if (apid < 0) return -3;
+    return write8(apid, addr, value);
+}
+
 extern "C" void native_buttons_set_sink(void (*sink)(void *, uint32_t), void *context) {
     gSinkContext = context;
     __atomic_store_n(&gSink, sink, __ATOMIC_RELEASE);

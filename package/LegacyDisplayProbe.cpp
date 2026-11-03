@@ -518,6 +518,9 @@ extern "C" void pdx203_buttons_probe(void);
 // the battery as an IOPMPowerSource (package/Pdx203Battery.cpp; pdx203-battery=1): PM8150B fuel gauge and charger over the
 // arbiter the button thread maps
 extern "C" void pdx203_battery_probe(void);
+// the time of day (package/Pdx203Rtc.cpp; pdx203-rtc=0 turns it off): the PM8150 RTC plus an offset kept in the RTC alarm registers,
+// published as the IORTC resource AppleARMPE reads the calendar from; needs the arbiter the button thread maps
+extern "C" void pdx203_rtc_probe(void);
 // the audio DSP (package/AdspProbe.cpp, sheng's for SM8250; pdx203-adsp=<mode>) and the speaker path on top of it
 // (package/Pdx203Audio.cpp; pdx203-audio=<bits>): their own threads, nothing without the arguments
 extern "C" void sheng_adsp_probe(void);
@@ -529,6 +532,7 @@ void native_legacy_display_late_probe(void) {
     (void)native_hid_input_probe();
     pdx203_buttons_probe();
     pdx203_battery_probe();
+    pdx203_rtc_probe();
     sheng_adsp_probe();
     pdx203_audio_probe();
     unsigned touch=0;
