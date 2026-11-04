@@ -649,6 +649,7 @@ extern "C" int pdx203_touch_inject(char phase, int x, int y)
 // The control channel's board input (drivers/QcomXnuUsbDebug qcom_usb_debug_board_input): TOUCH:<d|m|u>,<x>,<y> and
 // KEY:<power|volup|voldown|home>,<d|u>. Runs on the USB worker thread; no USB logging from here.
 extern "C" int pdx203_buttons_inject(uint32_t bit, bool down);
+extern "C" int pdx203_knob_set(const char *name, size_t length, int value);
 static bool argInt(const char *&p, int &value)
 {
 	if (*p < '0' || *p > '9') return false;
@@ -680,6 +681,15 @@ extern "C" int qcom_usb_debug_board_input(const char *verb, const char *args, ch
 		static const struct {const char *name; uint32_t bit;} keys[] = {{"home", 1u << 0}, {"power", 1u << 1}, {"volup", 1u << 2},
 			{"voldown", 1u << 3}};
 		const char *comma = strchr(args, ',');
+		// KEY:knob.<name>,<value>: a runtime knob (LegacyDisplayProbe.cpp pdx203_knob_set), not a key
+		if (comma && !strncmp(args, "knob.", 5)) {
+			const char *p = comma + 1;
+			int value = 0;
+			if (!argInt(p, value) || *p) {reason(out, cap, "badargs"); return 1;}
+			const int rc = pdx203_knob_set(args + 5, (size_t)(comma - args - 5), value);
+			if (rc) reason(out, cap, rc == -2 ? "range" : "noknob");
+			return rc ? 1 : 0;
+		}
 		if (!comma || (strcmp(comma + 1, "d") && strcmp(comma + 1, "u"))) {reason(out, cap, "badargs"); return 1;}
 		for (auto &k : keys) {
 			if ((size_t)(comma - args) == strlen(k.name) && !strncmp(args, k.name, strlen(k.name))) {

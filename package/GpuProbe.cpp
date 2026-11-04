@@ -1748,6 +1748,8 @@ extern volatile uint32_t native_legacy_swap_validation_calls __attribute__((weak
 extern volatile int native_legacy_transfer_status __attribute__((weak_import));
 extern volatile uint32_t native_legacy_flip_stats[6] __attribute__((weak_import));
 extern "C" unsigned native_legacy_swap_summary(char *out, unsigned cap) __attribute__((weak_import));
+extern "C" unsigned native_legacy_pace_summary(char *out, unsigned cap) __attribute__((weak_import));
+extern "C" unsigned native_legacy_panel_raw(char *out, unsigned cap) __attribute__((weak_import));
 extern "C" unsigned native_legacy_clients_dump(char *out, unsigned cap) __attribute__((weak_import));
 extern volatile uint64_t native_gop_gpu_offers __attribute__((weak_import)), native_gop_gpu_completions __attribute__((weak_import)),
     native_gop_gpu_failures __attribute__((weak_import)), native_gop_gpu_abandoned __attribute__((weak_import));
@@ -1925,6 +1927,11 @@ void displayRow() {
     // the counters move every frame: print at most every 5 s (the caller's cadence decides), and only when something changed
     if (strncmp(row, gDisplayPrinted, sizeof row)) {strlcpy(gDisplayPrinted, row, sizeof gDisplayPrinted); printf("%s\n", row);}
     if (&native_legacy_swap_summary) {char swaps[256]; native_legacy_swap_summary(swaps, sizeof swaps); printf("DISPLAY %s\n", swaps);}
+    // pdx203: the cumulative pacing counters (LegacyDisplayProbe.cpp native_legacy_pace_summary), every time; the panel's raw read pointer
+    // samples once a minute (every 12th call)
+    if (&native_legacy_pace_summary) {static char pace[640]; native_legacy_pace_summary(pace, sizeof pace); printf("DISPLAY %s\n", pace);}
+    static unsigned panelTurn;
+    if (&native_legacy_panel_raw && panelTurn++ % 12 == 0) {static char raw[1024]; if (native_legacy_panel_raw(raw, sizeof raw)) printf("PANEL %s\n", raw);}
     // pdx203: the framebuffer's user clients (LegacyDisplayProbe.cpp native_legacy_clients_dump): every selector each called with its
     // count, failures and last status, and the notification ports it registered. The render server never registered for vsync
     // (DISPLAY swaps "vs ... s0") and the UI runs at 24 frames a second: which selectors does it call, and which fail? Every 12th call

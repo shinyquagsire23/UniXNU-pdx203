@@ -210,17 +210,33 @@ static volatile unsigned vsyncHz;
 struct SwapEvent {uint64_t submitted,offered,done,retired;uint32_t number;};
 static SwapEvent swapEvents[64];static uint32_t swapEventCount;
 extern "C" {volatile uint32_t native_legacy_early_retires,native_legacy_early_failures;}
+// pdx203 pacing, counted over every swap since boot (2026-11-04: the DISPLAY swaps row is a 40-swap snapshot printed about once a
+// minute, too few to tell two images apart). The difference of two DISPLAY pace rows gives any window exactly. gap: the interval
+// between two submissions in refreshes (16.7 ms), rounded: 0, 1, 2, 3, 4, 5 or more. lat: the refresh tick to the submission (the
+// compositor's render), done: the submission to the end of the GPU copy, each in 2 ms bins, the last one 16 ms or more.
+static volatile uint64_t paceGap[6],paceLat[9],paceDone[9],paceN,paceLastSubmit;
+static volatile uint64_t paceTickUs;   // the latest refresh tick (native_legacy_vsync_phase)
+static inline unsigned paceBin2ms(uint64_t us) {return us>=16000?8:(unsigned)(us/2000);}
 extern "C" void native_legacy_swap_stage(unsigned stage) {
     const uint64_t now=probeNowUs();
     uint32_t total=swapEventCount;
     if(stage==0) {
-        SwapEvent &e=swapEvents[total%64];e={now,0,0,0,total+1};swapEventCount=total+1;return;
+        SwapEvent &e=swapEvents[total%64];e={now,0,0,0,total+1};swapEventCount=total+1;
+        paceN=paceN+1;
+        if(paceLastSubmit && now>paceLastSubmit){const uint64_t r=(now-paceLastSubmit+16667/2)/16667;paceGap[r>5?5:r]=paceGap[r>5?5:r]+1;}
+        paceLastSubmit=now;
+        if(paceTickUs && now>=paceTickUs){const unsigned b=paceBin2ms(now-paceTickUs);paceLat[b]=paceLat[b]+1;}
+        return;
     }
     uint32_t first=total>64?total-64:0;
     for(uint32_t i=first;i<total;++i) {
         SwapEvent &e=swapEvents[i%64];
         if(stage==1 && !e.offered && !e.done){e.offered=now;return;}
-        if(stage==2 && !e.done){e.done=now;if(!e.offered)e.offered=now;return;}
+        if(stage==2 && !e.done){
+            e.done=now;if(!e.offered)e.offered=now;
+            if(now>=e.submitted){const unsigned b=paceBin2ms(now-e.submitted);paceDone[b]=paceDone[b]+1;}
+            return;
+        }
         if(stage==3 && !e.retired){e.retired=now;return;}
     }
 }
@@ -871,7 +887,115 @@ bool flipReady() {
     }
     return true;
 }
+// pdx203 pacing (2026-11-04): where the panel is in its frame. Pingpong 0's read pointer (Linux dpu_hw_pingpong: PP_SYNC_CONFIG_VSYNC
+// 0x004 bits 18:0 vsync clocks a line at 19.2 MHz, PP_VSYNC_INIT_VAL 0x010 the line a frame starts at, PP_INT_COUNT_VAL 0x014 frame
+// count 31:16 and read-pointer line 15:0) counts lines from the frame start, which the panel's TE resets (pdx203-hwte=1). The UEFI
+// shim's 123 clocks a line are 6.41 us, 2602 lines a 60 Hz frame. Microseconds since the frame start and the frame count; false
+// without the flip's mapping or with a line count that is not past the start (counter values not understood yet: see PANEL rows).
+// RESULT (sa73, usb-223): INT_COUNT_VAL and LINE_COUNT read 0 on every tick (VSYNC_INIT_VAL 0xa00, tear check enabled), so every tick
+// counts as bad and vlock has no input. Suspect: the DPU's 19.2 MHz vsync clock was never enabled (the TE still triggers autorefresh).
+volatile uint64_t gPaceCommit[8];
+uint64_t gLineNs100;   // a line's duration in 1/100 ns
+uint32_t gLineInit;
+uint64_t panelPeriodUs() {return 16667;}
+bool panelPosition(int64_t *us, uint32_t *frame) {
+    if (gFlipState != 1 || !gFlipMdss) return false;
+    volatile uint32_t *pp = gFlipMdss + 0x71000 / 4;
+    if (!gLineNs100) {
+        const uint32_t clocks = pp[0x004 / 4] & 0x7ffff;
+        if (!clocks) return false;
+        gLineNs100 = (uint64_t)clocks * 100000000000ull / 19200000ull;
+        gLineInit = pp[0x010 / 4] & 0xffff;
+    }
+    const uint32_t count = pp[0x014 / 4], line = count & 0xffff;
+    *frame = count >> 16;
+    if (line < gLineInit) return false;
+    *us = (int64_t)((uint64_t)(line - gLineInit) * gLineNs100 / 100000);
+    return *us < (int64_t)(4 * panelPeriodUs());
+}
 }  // namespace
+// The refresh tick's phase (NativeMobileDisplay 0003 calls this from NativeLegacyDisplay::vsyncTick, on the display's work loop, before
+// it arms the next tick): records where in the panel's frame the tick came, and with the knob vlock=1 returns the correction (mach
+// time units) that moves the next tick toward vphase/10 ms after the panel's frame start, vgain/16 of the error a tick, at most an
+// eighth of a refresh. The software tick and the panel's TE otherwise drift: the compositor renders on the tick and the flip latches on
+// the panel's frame start, so a frame's slack before the latch wanders with that phase (sa71/sa72: 95% and 73% of swaps on time).
+// eretire (NativeMobileDisplay 0004): 1 retires a GPU swap once its copy is on the GPU's queue, not at the copy's end.
+extern "C" {volatile int32_t pdx203_knob_vlock = 0, pdx203_knob_vphase = 10, pdx203_knob_vgain = 4, pdx203_knob_eretire = 0;}
+static volatile uint64_t gPaceTick[8], gPaceTicks, gPaceTickBad, gPaceErrSum, gPaceErrN, gPanelFrame0, gPanelUs0, gPanelFrames, gPanelUs;
+static volatile int64_t gPaceCorrLast;
+static volatile uint32_t gPanelRaw[16][4], gPanelRawN;
+extern "C" int64_t native_legacy_vsync_phase(uint64_t now, uint64_t interval) {
+    (void)now;
+    const uint64_t us = probeNowUs();
+    paceTickUs = us;
+    gPaceTicks = gPaceTicks + 1;
+    if (gFlipState == 1 && gFlipMdss && (gPanelRawN < 16 || gPaceTicks % 3600 == 0)) {
+        volatile uint32_t *pp = gFlipMdss + 0x71000 / 4;
+        const uint32_t i = gPanelRawN < 16 ? gPanelRawN : 15;
+        gPanelRaw[i][0] = (uint32_t)us; gPanelRaw[i][1] = pp[0x014 / 4]; gPanelRaw[i][2] = pp[0x02c / 4]; gPanelRaw[i][3] = pp[0x010 / 4];
+        if (gPanelRawN < 16) gPanelRawN = gPanelRawN + 1;
+    }
+    int64_t at = 0; uint32_t frame = 0;
+    if (!panelPosition(&at, &frame)) {gPaceTickBad = gPaceTickBad + 1; return 0;}
+    const int64_t period = (int64_t)panelPeriodUs();
+    const unsigned b = (unsigned)(at % period * 8 / period);
+    gPaceTick[b] = gPaceTick[b] + 1;
+    // the panel's own rate: frames counted (16 bits, wrapping) over time, from the first good tick
+    if (!gPanelUs0) {gPanelUs0 = us; gPanelFrame0 = frame;}
+    else {gPanelFrames = gPanelFrames + ((frame - (uint32_t)gPanelFrame0) & 0xffff); gPanelFrame0 = frame; gPanelUs = us - gPanelUs0;}
+    int64_t err = at % period - (int64_t)pdx203_knob_vphase * 100;
+    while (err > period / 2) err -= period;
+    while (err < -period / 2) err += period;
+    gPaceErrSum = gPaceErrSum + (uint64_t)(err < 0 ? -err : err); gPaceErrN = gPaceErrN + 1;
+    if (pdx203_knob_vlock != 1) {gPaceCorrLast = 0; return 0;}
+    int64_t corrUs = -err * pdx203_knob_vgain / 16;
+    if (corrUs > period / 8) corrUs = period / 8;
+    if (corrUs < -period / 8) corrUs = -period / 8;
+    gPaceCorrLast = corrUs;
+    uint64_t abs = 0;
+    nanoseconds_to_absolutetime((uint64_t)(corrUs < 0 ? -corrUs : corrUs) * 1000ull, &abs);
+    if (abs >= interval / 2) return 0;
+    return corrUs < 0 ? -(int64_t)abs : (int64_t)abs;
+}
+// Runtime knobs, set over the USB control channel (KEY:knob.<name>,<value>; Pdx203TouchProbe.cpp). 0 set, -1 no such knob, -2 out of range.
+extern "C" int pdx203_knob_set(const char *name, size_t length, int value) {
+    static const struct {const char *name; volatile int32_t *knob; int lo, hi;} knobs[] = {
+        {"vlock", &pdx203_knob_vlock, 0, 1}, {"vphase", &pdx203_knob_vphase, 0, 166}, {"vgain", &pdx203_knob_vgain, 0, 16},
+        {"eretire", &pdx203_knob_eretire, 0, 1}};
+    for (auto &k : knobs)
+        if (length == strlen(k.name) && !strncmp(name, k.name, length)) {
+            if (value < k.lo || value > k.hi) return -2;
+            *k.knob = value;
+            return 0;
+        }
+    return -1;
+}
+// DISPLAY pace row (GpuProbe.cpp, next to DISPLAY swaps): the cumulative counters above, the tick's and the flip commit's place in the
+// panel's frame (eighths), the panel's measured rate, and the lock (knobs, mean |error| us, last correction us).
+extern "C" unsigned native_legacy_pace_summary(char *out, unsigned cap) {
+    auto u = [](uint64_t v) {return (unsigned long long)v;};
+    const unsigned long long hz100 = gPanelUs ? (unsigned long long)(gPanelFrames * 100000000ull / gPanelUs) : 0;
+    return snprintf(out, cap,
+        "pace n%llu gap %llu/%llu/%llu/%llu/%llu/%llu lat %llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu done %llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu"
+        " | tick %llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu bad %llu commit %llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu | panel %llu.%02llu Hz"
+        " | lock %d ph %d g %d err %llu us corr %lld | eretire %d",
+        u(paceN), u(paceGap[0]), u(paceGap[1]), u(paceGap[2]), u(paceGap[3]), u(paceGap[4]), u(paceGap[5]),
+        u(paceLat[0]), u(paceLat[1]), u(paceLat[2]), u(paceLat[3]), u(paceLat[4]), u(paceLat[5]), u(paceLat[6]), u(paceLat[7]), u(paceLat[8]),
+        u(paceDone[0]), u(paceDone[1]), u(paceDone[2]), u(paceDone[3]), u(paceDone[4]), u(paceDone[5]), u(paceDone[6]), u(paceDone[7]), u(paceDone[8]),
+        u(gPaceTick[0]), u(gPaceTick[1]), u(gPaceTick[2]), u(gPaceTick[3]), u(gPaceTick[4]), u(gPaceTick[5]), u(gPaceTick[6]), u(gPaceTick[7]),
+        u(gPaceTickBad), u(gPaceCommit[0]), u(gPaceCommit[1]), u(gPaceCommit[2]), u(gPaceCommit[3]), u(gPaceCommit[4]), u(gPaceCommit[5]),
+        u(gPaceCommit[6]), u(gPaceCommit[7]), hz100 / 100, hz100 % 100, (int)pdx203_knob_vlock, (int)pdx203_knob_vphase, (int)pdx203_knob_vgain,
+        gPaceErrN ? (unsigned long long)(gPaceErrSum / gPaceErrN) : 0ull, (long long)gPaceCorrLast, (int)pdx203_knob_eretire);
+}
+// PANEL rows: raw pingpong 0 reads at the first 16 ticks (then one an hour of ticks in the last slot): time us, INT_COUNT_VAL,
+// LINE_COUNT, VSYNC_INIT_VAL -- to check the read pointer's meaning before the lock is trusted.
+extern "C" unsigned native_legacy_panel_raw(char *out, unsigned cap) {
+    unsigned at = 0;
+    out[0] = 0;
+    for (uint32_t i = 0; i < gPanelRawN && at + 48 < cap; ++i)
+        at += snprintf(out + at, cap - at, "%u:%08x:%08x:%x ", gPanelRaw[i][0], gPanelRaw[i][1], gPanelRaw[i][2], gPanelRaw[i][3]);
+    return at;
+}
 extern "C" uint32_t pdx203_gpu_wait_idle(uint32_t timeout_us) __attribute__((weak_import));
 extern "C" volatile void *native_legacy_flip_target(uint64_t *bytes) {
     // the frame about to be copied must be finished: wait for the render server's GPU work (package/GpuProbe.cpp), at most 50 ms
@@ -907,6 +1031,10 @@ extern "C" void native_legacy_flip_commit(void) {
         if (ns / 1000 > native_legacy_flip_stats[4]) native_legacy_flip_stats[4] = (uint32_t)(ns / 1000);
         gFlipShown = gFlipPending;
         gFlipPending = -1;
+    }
+    {   // where in the panel's frame the flip is committed (it latches at the next frame start)
+        int64_t at = 0; uint32_t frame = 0;
+        if (panelPosition(&at, &frame)) {const unsigned b = (unsigned)(at * 8 / panelPeriodUs()); gPaceCommit[b > 7 ? 7 : b] = gPaceCommit[b > 7 ? 7 : b] + 1;}
     }
     const uint32_t address = (uint32_t)gFlipPhys[gFlipBack];
     m[(kVig0 + 0x14) / 4] = address;

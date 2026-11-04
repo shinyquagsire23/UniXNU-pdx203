@@ -6,6 +6,7 @@
   pdx203-rig.py --socket ... tap 0.5 0.3                   x, y as fractions of the panel's width and height (portrait)
   pdx203-rig.py --socket ... swipe 0.5 0.8 0.5 0.2 [300]   from, to, duration in ms
   pdx203-rig.py --socket ... key power                     press and release (power, volup, voldown, home)
+  pdx203-rig.py --socket ... knob vlock 1                  set a kernel runtime knob (LegacyDisplayProbe.cpp pdx203_knob_set)
   pdx203-rig.py --socket ... bootloader                    restart into recovery (REBOOT: PON reason 0x04, warm reset)
   pdx203-rig.py --socket ... reboot                        restart iPadOS (REBOOT to recovery, then adb reboot)
   pdx203-rig.py --socket ... flash <boot.img>              bootloader, wait for fastboot, flash boot_a, reboot
@@ -126,6 +127,7 @@ def main():
     p = sub.add_parser('tap'); p.add_argument('x'); p.add_argument('y')
     p = sub.add_parser('swipe'); [p.add_argument(n) for n in ('x1', 'y1', 'x2', 'y2')]; p.add_argument('ms', nargs='?', type=int, default=300)
     p = sub.add_parser('key'); p.add_argument('name', choices=('power', 'volup', 'voldown', 'home'))
+    p = sub.add_parser('knob'); p.add_argument('name'); p.add_argument('value', type=int)
     sub.add_parser('bootloader')
     sub.add_parser('reboot')
     p = sub.add_parser('flash'); p.add_argument('image')
@@ -140,6 +142,9 @@ def main():
         swipe(a.socket, a.x1, a.y1, a.x2, a.y2, a.ms)
     elif a.cmd == 'key':
         key(a.socket, a.name)
+    elif a.cmd == 'knob':
+        # KEY:knob.<name>,<value> (Pdx203TouchProbe.cpp); an unknown knob or a value out of range is refused
+        print(json.dumps(request(a.socket, 'KEY', f'knob.{a.name},{a.value}').fields))
     elif a.cmd == 'bootloader':
         print(json.dumps(request(a.socket, 'REBOOT').fields))
     elif a.cmd == 'reboot':
