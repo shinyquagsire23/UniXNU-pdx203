@@ -1,43 +1,51 @@
-# first-console kernel of pdx203 (stages 4 and 5 of docs/bring-up.md): source corecrypto, the generic
-# platform expert, the gic/timer cpu driver, 4 KiB code signing, the trust cache runtime and the device tree
-# panic region. no storage, display, gpu or owner-root stack yet, so the kernel reaches the platform expert and
-# then waits for a root device. it builds from the pinned sources alone, through the stock macos workflow.
-# CONFIG_XNU_<NAME> becomes XNU_<NAME> for the kernel build.
+# pdx203 (Sony Xperia 1 II, SM8250) device configuration, applied after the arch, SoC and OS fragments
+# (profiles/arch/arm64/configs/common.config, sm8250 configs/sm8250.config, ipados configs/ipados.config).
+# CONFIG_XNU_<NAME> becomes XNU_<NAME> for the kernel build; y and n are 1 and 0, {tree} is the build tree.
+#
+# Minimal format 2 image (2026-11-04): storage, the owner cache and Data mounts, the GOP display with touch and buttons,
+# and the USB log. No GPU, no gpu addon, no jailbreak; those return one at a time once this boots stably.
 
-CONFIG_XNU_BUILD_ARCHIVES=y
-CONFIG_XNU_SOURCE_CORECRYPTO14=y
-CONFIG_XNU_ARM_DT_PLATFORM=y
-CONFIG_XNU_ARMCPU=y
-CONFIG_XNU_NATIVE_ARCH_TIMER=y
-CONFIG_XNU_NATIVE_PAN=y
 CONFIG_XNU_DT_PANIC_REGION=y
-CONFIG_XNU_TRUST_CACHE_RUNTIME=y
-CONFIG_XNU_NATIVE_CS_HASH_CACHE=y
-CONFIG_XNU_CRYPTO_BOOTSTRAP="prelinked"
+CONFIG_XNU_ZONE_PGZ_ALIGNMENT_PROBE=y
+# amfi panics "AMFI: No PMGR?" without the published original ApplePMGRNub (sheng-pmgr=2 in board.toml)
+CONFIG_XNU_SHENG_PMGR=y
 
-# the base patch set calls native_legacy_display_probe() from bsd_init even with the legacy display off, so a
-# kernel without the sheng display archive needs the weak stub (package/Pdx203Stubs.c, built by the dispatcher)
-CONFIG_XNU_EXTRA_LD_ARCHIVES="{tree}/build/pdx203-stubs/libPdx203Stubs.a"
+# storage: the UFS bring-up transport (drivers/ShengUfs) mounts the OS window of userdata as root
+CONFIG_XNU_NATIVE_UFS=y
 
-# CONFIG_XNU_SOURCE_PTHREAD is not set
-# CONFIG_XNU_SOURCE_MOCKFS is not set
-# CONFIG_XNU_NATIVE_UFS is not set
-# CONFIG_XNU_NATIVE_AES is not set
-# CONFIG_XNU_NATIVE_RAM_BLOCK is not set
+# the uke route, not the signed owner-root one: BRINGUP_OWNER_CACHE lets the cache mount build without
+# OWNER_ROOT_TRUST, drivers/ShengUfs supplies the two authorization helpers kern_exec.c calls (only under
+# native-ufs-allow-unverified=1) and patches/xnu/zzzzzzz-offline-owner-root-auth-bypass.patch skips root
+# authentication under the same argument. OWNER_CACHE_MOUNT mounts the SystemOS volume read-only, UNION_SYSTEMOS
+# puts it over / as a native union, CACHE_STARTUP sets dyld's no-ignition flag.
+CONFIG_XNU_BRINGUP_OWNER_CACHE=y
+CONFIG_XNU_OWNER_CACHE_MOUNT=y
+CONFIG_XNU_OWNER_CACHE_STARTUP=y
+CONFIG_XNU_OWNER_UNION_SYSTEMOS=y
 # CONFIG_XNU_NATIVE_VIRTIO_BLOCK is not set
-# CONFIG_XNU_NATIVE_VIRTIO_CONSOLE is not set
-# CONFIG_XNU_SHENG_PMGR is not set
-# CONFIG_XNU_NATIVE_LEGACY_DISPLAY is not set
-# CONFIG_XNU_NATIVE_ADRENO is not set
-# CONFIG_XNU_ZONE_PGZ_ALIGNMENT_PROBE is not set
 # CONFIG_XNU_VERIFIED_ROOT_PROBE is not set
 # CONFIG_XNU_OWNER_ROOT_AUDIT is not set
 # CONFIG_XNU_OWNER_ROOT_TRUST is not set
-# CONFIG_XNU_OWNER_CACHE_MOUNT is not set
-# CONFIG_XNU_OWNER_CACHE_STARTUP is not set
 # CONFIG_XNU_OWNER_BOOT_MANIFEST is not set
-# CONFIG_XNU_OWNER_DATA_MOUNT is not set
-# CONFIG_XNU_OWNER_UNION_SYSTEMOS is not set
+
+# Data: the payload's seed mounted writable at /private/var through the RamBlock IOMedia (APFS refuses the bare
+# /dev/md0). The seed is local/owner-data-64g.dbr; its changed pages persist in the store window at the end of
+# userdata (sheng-data-persist=2). The UUID is that seed's volume.
+CONFIG_XNU_OWNER_DATA_MOUNT=y
+CONFIG_XNU_OWNER_DATA_VOLUME_UUID="098C9EBC-6911-4BEA-94C8-1775B4B33D87"
+CONFIG_XNU_NATIVE_RAM_BLOCK=y
+
+# display: NativeLegacyDisplay on the DarwinBoot framebuffer, started by the board probe once IOSurface is up, with
+# the touch, HID, buttons and keystore probes in the same late archive (scripts/build-pdx203-legacy-display.py)
+CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y
+# CONFIG_XNU_NATIVE_MOBILE_DISPLAY is not set
+# CONFIG_XNU_NATIVE_ADRENO is not set
 # CONFIG_XNU_BOOT_PROGRESS is not set
-CONFIG_XNU_NATIVE_MOBILE_DISPLAY=n
+
+# the CDC-ACM kernel log over the DWC3 (drivers/QcomXnuUsbDebug, patches/xnu/zzzzzzzz-qcom-usb-debug-*.patch). it
+# takes over a controller the firmware left powered and in device mode (Pdx203UsbDxe in uefi-pdx203) on qcom-usb-debug=1
+CONFIG_XNU_QCOM_USB_DEBUG=y
+
+CONFIG_XNU_BUILD_ARCHIVES=y
+CONFIG_XNU_EXTRA_LD_ARCHIVES="{tree}/build/pdx203-stubs/libPdx203Stubs.a {tree}/build/qcom-usb-debug/libQcomXnuUsbDebug.a"
 CONFIG_XNU_ARMVIRT_PLATFORM=n

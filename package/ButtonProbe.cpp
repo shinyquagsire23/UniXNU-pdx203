@@ -1,0 +1,511 @@
+// SPDX-License-Identifier: BSD-2-Clause-Patent
+// pdx203 (Xperia 1 II) power and volume buttons: UniXNU-alioth package/ButtonProbe.cpp (same SM8250 SPMI arbiter v5 and
+// PDC hop) with this board's keys from ButtonsCore.h: power = PM8150 PON kpdpwr, volume up = PON resin, volume down =
+// PM8150 GPIO 1 (active low, input with pull-up as Sony's pinctrl sets it; the pad is checked and set up if it is not), and the
+// camera key's full press (PM8150B GPIO 1, same pad setup) as the Home button.
+// Boot argument pdx203-bt=<n>: 1 map the arbiter and find the APIDs, 2 also read the levels once, 3 the real path (arm the
+// interrupts and feed NativeHidInput's report 2: bit 0 home, 1 power, 2 volume up, 3 volume down). Each stage and every change of
+// the pressed set prints a BUTTONS row on the console (this board has no BootLog page to export native_buttons_stats).
+#include <IOKit/IOLib.h>
+#include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IODeviceMemory.h>
+#include <IOKit/IOService.h>
+#include <kern/thread.h>
+#include <kern/clock.h>
+#include <pexpert/pexpert.h>
+#include "ButtonsCore.h"
+
+extern "C" int armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint32_t *, uint64_t *) __attribute__((weak_import));
+
+// BootLog.c already composes this row, in sheng's wording:
+//   [0] stage (1 mapped, 2 configured, 3 armed, negative: the step that failed)
+//   [1] interrupts                    [2] reports sent to the HID device
+//   [3] pressed mask (report 2 bits)  [4] PON APID     [5] GPIO APID
+//   [6] interrupts of other APIDs cleared     [7] PDC version
+//   [8] last error                    [9] spurious interrupts
+// Report 2 bits, matching NativeHidInput's buttonsAction (mask & 0xe): 1 power, 2 volume up,
+// 3 volume down.
+extern "C" {volatile int32_t native_buttons_stats[10];}
+
+namespace {
+// The window bases, the PPIDs, the report bits and the channel arithmetic live in ButtonsCore.h,
+// where a host test checks them. These aliases keep the driver's own names.
+constexpr uint64_t kCore = BT_CORE, kChnls = BT_CHNLS, kObsrvr = BT_OBSRVR, kIntr = BT_INTR,
+                   kCnfg = BT_CNFG, kPdc = BT_PDC;
+constexpr uint32_t kPonPpid = BT_PON_PPID, kGpioPpid = BT_GPIO_PPID, kCamPpid = BT_CAM_PPID;
+constexpr uint8_t kPowerBit = 1u << 0, kResinBit = 1u << 1;
+constexpr uint8_t kGpioBit = 1u << 0;
+// The report bits are only used through bt_pressed_mask in ButtonsCore.h now; the aliases below
+// document which slot of native_buttons_stats[3] each value occupies.
+// Peripheral registers, addressed through a channel.
+constexpr uint8_t kRtSts = 0x10, kSetType = 0x11, kPolHigh = 0x12, kPolLow = 0x13, kLatchedClr = 0x14, kEnSet = 0x15;
+// The status word is decoded by bt_status_result in ButtonsCore.h, not by bit tests here.
+// PDC: pin 1, SPI 481, IRQ_i_CFG at 0x110, enable bank at 0x10 (qcom-pdc.c:31-34).
+constexpr uint32_t kPdcPin = BT_PDC_PIN, kSpi = BT_SPI, kPdcCfg = 0x110, kPdcEnableBank = 0x10, kPdcVersion = 0x1000;
+
+struct Window {IOMemoryMap *map; volatile uint32_t *va;};
+Window gCore, gCnfg, gObs, gChn, gIntr, gPdc;
+int gPon = -1, gGpio = -1, gCam = -1;
+uint32_t gApids;
+uint32_t gVersion;
+// The channel page size and the in-channel offsets, chosen from the arbiter's version.
+struct bt_layout gLayout;
+uint32_t gApidStride, gAccEnable, gIrqStatus, gIrqClear, gApidMap, gObsStride;
+volatile uint32_t gEvents;
+extern "C" void native_hid_orientation_step(intptr_t step) __attribute__((weak_import));
+void (*volatile gSink)(void *, uint32_t);
+void *volatile gSinkContext;
+unsigned gMode;
+bool gPolled;
+constexpr unsigned kPollMs = 30;
+
+bool mapWindow(Window &w, uint64_t base, uint64_t size) {
+    IODeviceMemory *memory = IODeviceMemory::withRange(base, size);
+    w.map = memory ? memory->map(kIOMapAnywhere | kIOMapInhibitCache) : nullptr;
+    if (memory) memory->release();
+    w.va = w.map ? reinterpret_cast<volatile uint32_t *>(w.map->getVirtualAddress()) : nullptr;
+    return w.va != nullptr;
+}
+void fail(int step, int error) {native_buttons_stats[8] = error; native_buttons_stats[0] = -step; printf("BUTTONS failed at step %d error %d\n", step, error);}
+
+// The channel page for an APID, in whichever window carries the read/write channels.
+volatile uint32_t *apidReg(int apid, uint32_t reg) {return gChn.va + (gApidStride * (uint32_t)apid + reg) / 4;}
+
+// One byte of a peripheral through a channel. opc 1 = EXT_READL, 0 = EXT_WRITEL; the command
+// word is (opc << 27) | (byte address << 4) | byte count (pmic_arb_fmt_cmd_v2, spmi-pmic-arb.c).
+int transfer(int apid, uint8_t addr, uint8_t *value, bool write) {
+    volatile uint32_t *ch = gChn.va + (gApidStride * (uint32_t)apid) / 4;
+    if (write) ch[0x10 / 4] = *value;                       // WDATA0
+    ch[0x00 / 4] = bt_command(write, addr);
+    __asm__ volatile("dsb sy" ::: "memory");
+    for (uint32_t n = 0; n < 100000; ++n) {
+        const uint32_t s = ch[0x08 / 4];                    // STATUS
+        const int result = bt_status_result(s);
+        if (result == BT_NOT_DONE) continue;
+        if (result != BT_OK) return result;                 // failed, denied or dropped
+        if (!write) *value = (uint8_t)ch[0x18 / 4];         // RDATA0
+        return 0;
+    }
+    return 1;
+}
+// pdx203: reads go through the observer channel, the read-only window every APID has (spmi-pmic-arb.c v5 reads through
+// rd_base = obsrvr too); only writes need the APID's own channel, which the arbiter refuses to an EE that does not own it.
+int observe(int apid, uint8_t addr, uint8_t *value) {
+    volatile uint32_t *ch = gObs.va + (gObsStride * (uint32_t)apid) / 4;
+    ch[0x00 / 4] = bt_command(false, addr);
+    __asm__ volatile("dsb sy" ::: "memory");
+    for (uint32_t n = 0; n < 100000; ++n) {
+        const int result = bt_status_result(ch[0x08 / 4]);
+        if (result == BT_NOT_DONE) continue;
+        if (result != BT_OK) return result;
+        *value = (uint8_t)ch[0x18 / 4];
+        return 0;
+    }
+    return 1;
+}
+int read8(int apid, uint8_t addr, uint8_t *value) {return observe(apid, addr, value);}
+int write8(int apid, uint8_t addr, uint8_t value) {return transfer(apid, addr, &value, true);}
+
+// The APID that serves ppid, preferring one whose interrupts and writes this EE owns; *owned says whether it does. -1 when
+// the arbiter maps no APID to ppid. pdx203: Sony's firmware left the PON without an APID alioth's test accepted (usb-62
+// "failed at step 4"), so every match is printed with its IRQ-owner bit and owning EE, and an unowned APID is still used
+// for reading (observer channel) with the levels polled.
+int findApid(uint32_t ppid, bool *owned) {
+    int found = -1;
+    *owned = false;
+    for (uint32_t i = 0; i < gApids; ++i) {
+        const uint32_t map = gCore.va[(gApidMap + 4 * i) / 4];
+        if (!map || ((map >> 8) & 0xfff) != ppid) continue;
+        const bool irqOwner = (map >> 24) & 1;
+        // The owning EE is in SPMI_OWNERSHIP_TABLE_REG(apid) = cnfg + 0x700 + 4 * apid (spmi-pmic-arb.c); alioth's copy read
+        // cnfg + 4 * apid, another register, so every "owner" it printed was wrong (pdx203 usb-63/67).
+        const uint32_t ee = gCnfg.va[(0x700 + 4 * i) / 4] & 7u;
+        printf("BUTTONS ppid %03x apid %u map %08x irq-owner %d ee %u\n", ppid, i, map, irqOwner ? 1 : 0, ee);
+        const bool mine = irqOwner && ee == 0;
+        if (found < 0 || (mine && !*owned)) {found = (int)i; *owned = mine;}
+    }
+    return found;
+}
+
+// Both edges of the given interrupt bits, latched state cleared, then enabled in the peripheral.
+int armPeripheral(int apid, uint8_t bits) {
+    uint8_t type = 0, high = 0, low = 0;
+    int rc = read8(apid, kSetType, &type);
+    if (!rc) rc = read8(apid, kPolHigh, &high);
+    if (!rc) rc = read8(apid, kPolLow, &low);
+    if (!rc) rc = write8(apid, kSetType, type | bits);
+    if (!rc) rc = write8(apid, kPolHigh, high | bits);
+    if (!rc) rc = write8(apid, kPolLow, low | bits);
+    if (!rc) rc = write8(apid, kLatchedClr, bits);
+    if (!rc) rc = write8(apid, kEnSet, bits);
+    if (!rc) *apidReg(apid, gAccEnable) = 1;
+    return rc;
+}
+
+// Primary interrupt context: acknowledge in the arbiter and the peripheral, then wake the thread.
+// An APID that is not ours but raised the line only gets its arbiter status cleared, as the
+// vendor driver's cleanup_irq does; reading another APID's registers can end in a synchronous
+// external abort (sheng measured int-227 doing exactly that).
+void buttonsIrq(void *) {
+    bool ours = false;
+    for (uint32_t word = 0; word * 32 < gApids; ++word) {
+        uint32_t pending = gIntr.va[word];
+        while (pending) {
+            const int apid = (int)(word * 32 + __builtin_ctz(pending));
+            pending &= pending - 1;
+            if (apid != gPon && apid != gGpio && apid != gCam) {
+                *apidReg(apid, gIrqClear) = 0xff;
+                native_buttons_stats[6] = native_buttons_stats[6] + 1;
+                continue;
+            }
+            const uint32_t status = *apidReg(apid, gIrqStatus);
+            *apidReg(apid, gIrqClear) = status;
+            if (status) write8(apid, kLatchedClr, (uint8_t)status);
+            ours = true;
+        }
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+    // A line that keeps firing with none of our peripherals behind it would hold this core in the
+    // handler: after 1000 such interrupts in a row the PDC pin is masked, which drops the line.
+    static uint32_t idle;
+    if (!ours) {
+        native_buttons_stats[9] = native_buttons_stats[9] + 1;
+        if (++idle >= 1000) {
+            gPdc.va[(kPdcCfg + 4 * kPdcPin) / 4] = 4u;
+            __asm__ volatile("dsb sy" ::: "memory");
+            native_buttons_stats[0] = -9;
+        }
+        return;
+    }
+    idle = 0;
+    native_buttons_stats[1] = native_buttons_stats[1] + 1;
+    __atomic_fetch_add(&gEvents, 1, __ATOMIC_RELEASE);
+    thread_wakeup((event_t)&gEvents);
+}
+
+// The pressed set, read from the three levels. All three are active low.
+uint32_t pressed() {
+    uint8_t pon = 0, gpio = 0;
+    const int ponRead = read8(gPon, kRtSts, &pon);
+    const int gpioRead = gGpio >= 0 ? read8(gGpio, kRtSts, &gpio) : -1;
+    // A failed read must not read as "released" for the PON (which would drop a held key), and
+    // must not read as "pressed" for the GPIO (which is active low). bt_pressed_mask takes the
+    // GPIO only when it was read, so pass the read result as have_gpio.
+    if (ponRead) pon = 0;
+    uint8_t cam = 0;
+    const int camRead = gCam >= 0 ? read8(gCam, kRtSts, &cam) : -1;
+    return bt_pressed_mask(pon, gpio, gpioRead == 0) | bt_camera_mask(cam, camRead == 0);
+}
+
+bool setup() {
+    if (!mapWindow(gCore, kCore, 0x3000) || !mapWindow(gCnfg, kCnfg, 0x4000) || !mapWindow(gIntr, kIntr, 0x1000) ||
+        !mapWindow(gPdc, kPdc, 0x2000)) {fail(1, -12); return false;}
+    gVersion = gCore.va[0];
+    gApids = gCore.va[0x04 / 4] & 0x7ffu;
+    native_buttons_stats[7] = (int32_t)gPdc.va[kPdcVersion / 4];
+    // The layout follows the version, as the vendor driver's ops table does. Only the v5 layout
+    // is implemented: it keeps every channel register inside the 0x10000 * apid page, which is
+    // what this board's 32 MiB chnls window implies. A version this code does not know is
+    // refused rather than half-supported (the v2 layout puts the interrupt registers in the
+    // "intr" window, which this driver does not read).
+    gLayout = bt_layout_for(gVersion);
+    if (!gLayout.apid_stride) {fail(2, (int)gVersion); return false;}
+    gApidStride = gLayout.apid_stride; gAccEnable = gLayout.acc_enable; gIrqStatus = gLayout.irq_status;
+    gIrqClear = gLayout.irq_clear; gApidMap = gLayout.apid_map; gObsStride = gLayout.obs_stride;
+    if (!gApids || gApids > 1024) {fail(2, (int)gVersion); return false;}
+    if (!mapWindow(gObs, kObsrvr, ((uint64_t)gObsStride * gApids + 0xfff) & ~0xfffull) ||
+        !mapWindow(gChn, kChnls, (uint64_t)gApidStride * gApids)) {fail(3, -12); return false;}
+    native_buttons_stats[0] = 1;
+    printf("BUTTONS arb v%08x apids %u\n", gVersion, gApids);
+    bool ponOwned = false, gpioOwned = false, camOwned = false;
+    gPon = findApid(kPonPpid, &ponOwned); gGpio = findApid(kGpioPpid, &gpioOwned); gCam = findApid(kCamPpid, &camOwned);
+    native_buttons_stats[4] = gPon; native_buttons_stats[5] = gGpio;
+    if (gPon < 0) {fail(4, -2); return false;}
+    native_buttons_stats[0] = 2;
+    // Interrupts only when this EE owns every key's APID it found; otherwise the thread polls the levels.
+    // Polled regardless for now: the interrupt path has not run on this board (the ownership read that ruled it out was wrong).
+    gPolled = true || !ponOwned || (gGpio >= 0 && !gpioOwned) || (gCam >= 0 && !camOwned);
+    printf("BUTTONS pon %d%s vol- gpio %d%s cam gpio %d%s -> %s\n", gPon, ponOwned ? "" : " (not ours)", gGpio,
+        gpioOwned ? "" : " (not ours)", gCam, camOwned ? "" : " (not ours)", gPolled ? "polling" : "interrupts");
+    // The key pads as Sony's pinctrl leaves them: digital input (MODE_CTL 0x40 mode bits 0), 30 uA pull-up (DIG_PULL_CTL
+    // 0x42 = 0), enabled (EN_CTL 0x46 bit 7). Read first; set only what differs.
+    const int pads[2] = {gGpio, gCam};
+    for (unsigned k = 0; k < 2; ++k) {
+        const int apid = pads[k];
+        if (apid < 0) continue;
+        uint8_t mode = 0xff, pull = 0xff, en = 0xff, level = 0xff;
+        read8(apid, 0x40, &mode); read8(apid, 0x42, &pull); read8(apid, 0x46, &en); read8(apid, kRtSts, &level);
+        printf("BUTTONS pad apid %d mode %02x pull %02x en %02x rt %02x\n", apid, mode, pull, en, level);
+        const bool ownPad = (apid == gGpio) ? gpioOwned : camOwned;
+        if (gMode >= 3 && ownPad && ((mode & 0x3) != 0 || (pull & 0x7) != 0 || !(en & 0x80))) {
+            if (mode & 0x3) write8(apid, 0x40, (uint8_t)(mode & ~0x3));
+            if (pull & 0x7) write8(apid, 0x42, (uint8_t)(pull & ~0x7));
+            if (!(en & 0x80)) write8(apid, 0x46, 0x80);
+            printf("BUTTONS pad apid %d set to input, pull-up, enabled\n", apid);
+        }
+    }
+    if (gMode == 2) {uint8_t pon = 0; read8(gPon, kRtSts, &pon); printf("BUTTONS pon rt %02x mask %x\n", pon, pressed());}
+    if (gMode == 2) return true;      // read-only: no arming, no interrupt
+    if (gPolled) {native_buttons_stats[0] = 3; printf("BUTTONS polling every %u ms\n", kPollMs); return true;}
+    int rc = armPeripheral(gPon, kPowerBit | kResinBit);
+    if (!rc && gGpio >= 0) rc = armPeripheral(gGpio, kGpioBit);
+    if (!rc && gCam >= 0) rc = armPeripheral(gCam, kGpioBit);
+    if (rc) {fail(5, rc); return false;}
+    // PDC pin 1: level high, enabled. The version decides which register carries the enable.
+    const uint32_t pdcVersion = gPdc.va[kPdcVersion / 4];
+    if (pdcVersion >= 0x30200) {
+        gPdc.va[(kPdcCfg + 4 * kPdcPin) / 4] = (1u << 3) | 4u;
+    } else {
+        gPdc.va[(kPdcCfg + 4 * kPdcPin) / 4] = 4u;
+        gPdc.va[(kPdcEnableBank + 4 * (kPdcPin / 32)) / 4] |= 1u << (kPdcPin % 32);
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+    if (!armcpu_spi_attach) {fail(6, -78); return false;}
+    // The probe runs before the interrupt controller driver has started, so wait for it, up to a
+    // minute, as sheng does (int-228: kIOReturnNotReady at 4 s).
+    for (unsigned tries = 0;; ++tries) {
+        rc = armcpu_spi_attach(32 + kSpi, false, buttonsIrq, nullptr, nullptr, nullptr);
+        if (rc != kIOReturnNotReady || tries == 240) break;
+        IOSleep(250);
+    }
+    if (rc) {fail(6, rc); return false;}
+    native_buttons_stats[0] = 3;
+    printf("BUTTONS armed: SPI %u, PDC pin %u (version %x)\n", kSpi, kPdcPin, pdcVersion);
+    return true;
+}
+
+}  // namespace
+extern "C" void pdx203_halt_install(void);
+namespace {
+void buttonsThread(void *, wait_result_t) {
+    thread_set_thread_name(current_thread(), "pdx203-bt");
+    if (!setup()) return;
+    pdx203_halt_install();
+    uint32_t seen = gEvents, last = 0;
+    for (;;) {
+        const uint32_t mask = pressed();
+        if (mask != last) {
+            last = mask;
+            native_buttons_stats[3] = (int32_t)mask;
+            printf("BUTTONS pressed %x%s%s%s%s\n", mask, (mask & BT_REPORT_HOME) ? " home" : "", (mask & BT_REPORT_POWER) ? " power" : "",
+                (mask & BT_REPORT_VOLUME_UP) ? " vol+" : "", (mask & BT_REPORT_VOLUME_DOWN) ? " vol-" : "");
+            // Volume up + down held together: the next screen orientation (NativeHidInput's orientation device), and neither key
+            // reaches the system as a volume press while the chord lasts (the first key's own press already did).
+            static bool chord;
+            const uint32_t volumes = BT_REPORT_VOLUME_UP | BT_REPORT_VOLUME_DOWN;
+            uint32_t sent = mask;
+            if ((mask & volumes) == volumes) {
+                if (!chord) {chord = true; if (&native_hid_orientation_step) native_hid_orientation_step(1);}
+            } else if (!(mask & volumes)) chord = false;
+            if (chord) sent &= ~volumes;
+            void (*sink)(void *, uint32_t) = __atomic_load_n(&gSink, __ATOMIC_ACQUIRE);
+            if (sink) {sink(gSinkContext, sent); native_buttons_stats[2] = native_buttons_stats[2] + 1;}
+        }
+        if (gPolled) {IOSleep(kPollMs); continue;}
+        assert_wait((event_t)&gEvents, THREAD_UNINT);
+        if (gEvents != seen) clear_wait(current_thread(), THREAD_AWAKENED);
+        else thread_block(THREAD_CONTINUE_NULL);
+        seen = gEvents;
+    }
+}
+}  // namespace
+
+// pdx203: shutdown and restart. The PSCI firmware reports SYSTEM_RESET as not supported (alioth measured "psci v10001 reset=0"),
+// and Apple's platform driver resets through a watchdog this board does not have, so the kernel's halt_all_cpus calls this
+// (zzy-zhalt-board.patch) before it. As Linux's qpnp-power-on (qpnp_pon_reset_config) and msm-poweroff do it: tell the PM8150's
+// PON what a dropped PS_HOLD means (PS_HOLD_RST_CTL 0x5A bits 3:0: 4 shutdown, 7 hard reset; the S2 reset enable, CTL2 0x5B
+// bit 7, cleared around the change), then drop PS_HOLD (restart@c264000 "qcom,pshold" in pdx203.dtb). The PON's writes go
+// through an APID whose channel this EE owns (cnfg owner 0; usb-63: APIDs 1 and 116, the IRQ-owning one is EE 2's).
+extern "C" {extern void (*volatile native_board_halt_restart)(int reboot);}
+namespace {
+Window gPsHold;
+int gPonWrite = -1;
+// Spins (no scheduling: this runs on the halt path) so the USB console can send the line before the next step.
+void haltSpin(uint32_t us) {
+    uint64_t deadline = 0;
+    nanoseconds_to_absolutetime((uint64_t)us * 1000, &deadline);
+    deadline += mach_absolute_time();
+    while (mach_absolute_time() < deadline) {}
+}
+void haltStep(const char *what, int rc) {printf("BOARD halt: %s rc %d\n", what, rc); haltSpin(50000);}
+// PSCI with no answer expected: SYSTEM_OFF 0x84000008, SYSTEM_RESET 0x84000009 (alioth found RESET unsupported here; tried
+// last, after PS_HOLD, in case this firmware differs).
+uint64_t psci(uint64_t function) {
+    register uint64_t x0 __asm__("x0") = function;
+    register uint64_t x1 __asm__("x1") = 0, x2 __asm__("x2") = 0, x3 __asm__("x3") = 0;
+    __asm__ volatile("smc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3) : "memory");
+    return x0;
+}
+// reboot 2: into fastboot (the USB control channel's REBOOT, boot_reset_bootloader below). As Linux's "reboot bootloader" on SM8250:
+// the IMEM restart reason (0x146bf65c = 0x77665500, qcom,msm-imem@146bf000 restart_reason@65c, ios-sweet docs/PDX203.md) and the
+// PM8150 PON's soft reboot spare (0x8F bits 7:1 = 2, qcom-pon mode-bootloader), then a warm reset (PS_HOLD_RST_CTL type 1), which
+// keeps both; a hard reset (7) would clear the IMEM cell. The IMEM page is mapped unmappable with VM_WIMG_IO (7): alioth found the
+// bootloader ignored the cell written through a plain ml_io_map mapping.
+extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
+void markBootloader(void) {
+    volatile uint32_t *imem = reinterpret_cast<volatile uint32_t *>(ml_io_map_unmappable(0x146bf000, 0x1000, 7));
+    uint32_t imemBefore = 0, imemAfter = 0;
+    if (imem) {
+        imemBefore = imem[0x65c / 4];
+        imem[0x65c / 4] = 0x77665500u;
+        __asm__ volatile("dsb sy" ::: "memory");
+        imemAfter = imem[0x65c / 4];
+    }
+    // The PON spare register gets pdx203-fastboot-pon=<raw byte>: usb-165 wrote 0x04 (Linux's
+    // mode-bootloader 2 << 1) over 0x82 and Sony's boot chain started recovery with warmboot=0x77665502, the recovery magic, although
+    // the IMEM cell read back 0x77665500.
+    uint8_t spare = 0, spareAfter = 0;
+    int rc = -9;
+    // usb-166/167: IMEM alone is not read (0x82 left in the spare register booted iPadOS again), and 0x04 starts recovery
+    // (warmboot=0x77665502), from which the rig's adb reboot bootloader reaches fastboot. So 0x04 by default; 0x100 leaves it alone.
+    unsigned ponRaw = 0x04;
+    PE_parse_boot_argn("pdx203-fastboot-pon", &ponRaw, sizeof ponRaw);
+    if (gPonWrite >= 0) {
+        rc = read8(gPonWrite, 0x8F, &spare);
+        if (ponRaw <= 0xff) rc |= write8(gPonWrite, 0x8F, (uint8_t)ponRaw);
+        rc |= read8(gPonWrite, 0x8F, &spareAfter);
+    }
+    printf("BOARD bootloader: imem %08x>%08x pon spare %02x>%02x rc %d\n", imemBefore, imemAfter, spare, spareAfter, rc);
+    haltSpin(50000);
+}
+void haltRestart(int reboot) {
+    const uint8_t type = reboot == 2 ? 0x1 : reboot ? 0x7 : 0x4;
+    uint8_t ctl = 0, ctl2 = 0;
+    printf("BOARD %s: PON apid %d, type %x\n", reboot == 2 ? "restart to fastboot" : reboot ? "restart" : "shutdown", gPonWrite, type);
+    haltSpin(50000);
+    if (reboot == 2) markBootloader();
+    // usb-67: the first write through APID 1's channel wedged the CPU; that APID was picked by an ownership read at the wrong
+    // offset. findWritableApid now takes the APID spmi-pmic-arb itself would write through.
+    unsigned ponWrites = 1;   // the PON APID is now the one Linux writes through (ownership EE 0); pdx203-halt-pon=0 skips the writes
+    PE_parse_boot_argn("pdx203-halt-pon", &ponWrites, sizeof ponWrites);
+    if (gPonWrite >= 0 && ponWrites != 1) {
+        int rc = read8(gPonWrite, 0x5A, &ctl); rc |= read8(gPonWrite, 0x5B, &ctl2);
+        printf("BOARD halt: PON not written (ctl %02x ctl2 %02x rc %d)\n", ctl, ctl2, rc);
+        haltSpin(50000);
+    }
+    if (gPonWrite >= 0 && ponWrites == 1) {
+        int rc = read8(gPonWrite, 0x5B, &ctl2); haltStep("read ctl2", rc);
+        rc = read8(gPonWrite, 0x5A, &ctl); haltStep("read ctl", rc);
+        rc = write8(gPonWrite, 0x5B, (uint8_t)(ctl2 & ~0x80)); haltStep("ctl2 reset-enable off", rc);
+        haltSpin(500);
+        rc = write8(gPonWrite, 0x5A, (uint8_t)((ctl & ~0x0f) | type)); haltStep("ctl type", rc);
+        rc = write8(gPonWrite, 0x5B, (uint8_t)(ctl2 | 0x80)); haltStep("ctl2 reset-enable on", rc);
+        uint8_t check = 0;
+        rc = read8(gPonWrite, 0x5A, &check); printf("BOARD halt: ctl now %02x (was %02x, ctl2 was %02x) rc %d\n", check, ctl, ctl2, rc);
+        haltSpin(50000);
+    }
+    printf("BOARD halt: dropping PS_HOLD\n");
+    haltSpin(50000);
+    if (gPsHold.va) {
+        gPsHold.va[0] = 0;
+        __asm__ volatile("dsb sy" ::: "memory");
+    }
+    haltSpin(2000000);
+    printf("BOARD halt: still running 2 s after PS_HOLD; PSCI %s\n", reboot ? "SYSTEM_RESET" : "SYSTEM_OFF");
+    haltSpin(50000);
+    const uint64_t r = psci(reboot ? 0x84000009 : 0x84000008);
+    printf("BOARD halt: PSCI returned %llx\n", (unsigned long long)r);
+    for (;;) __asm__ volatile("wfe");
+}
+// The PON APID whose channel this EE may write: owner EE 0 in the ownership table.
+int findWritableApid(uint32_t ppid) {
+    int found = -1;
+    for (uint32_t i = 0; i < gApids; ++i) {
+        const uint32_t map = gCore.va[(gApidMap + 4 * i) / 4];
+        // As pmic_arb_read_apid_map_v5: the APID a write goes through is the last one mapped to the PPID whose ownership entry
+        // (cnfg + 0x700 + 4 * apid, bits 2:0) names this EE (0). Map bit 24 marks the APID whose owner gets the interrupts.
+        if (map && ((map >> 8) & 0xfff) == ppid && (gCnfg.va[(0x700 + 4 * i) / 4] & 7u) == 0) found = (int)i;
+    }
+    return found;
+}
+}  // namespace
+extern "C" void pdx203_halt_install(void) {
+    if (native_board_halt_restart || !gCore.va) return;
+    gPonWrite = findWritableApid(kPonPpid);
+    if (!gPsHold.va && !mapWindow(gPsHold, 0x0c264000, 0x1000)) {printf("BUTTONS halt: PS_HOLD not mapped\n"); return;}
+    uint8_t ctl = 0, ctl2 = 0;
+    if (gPonWrite >= 0) {read8(gPonWrite, 0x5A, &ctl); read8(gPonWrite, 0x5B, &ctl2);}
+    printf("BUTTONS halt/restart via PON apid %d (ps_hold_rst_ctl %02x ctl2 %02x) and PS_HOLD\n", gPonWrite, ctl, ctl2);
+    // Why the PMIC last started and stopped (usb-180 ended in a silent reset): PON gen2 registers 0xC0..0xCA, as Linux's
+    // qpnp-power-on reads them: PON_REASON1, -, WARM_RESET_REASON1/2, ON_REASON, POFF_REASON1/2, OFF_REASON, FAULT_REASON1/2,
+    // S3_RESET_REASON.
+    if (gPonWrite >= 0) {
+        uint8_t r[11] = {};
+        for (unsigned i = 0; i < 11; ++i) read8(gPonWrite, 0xC0 + i, &r[i]);
+        printf("BUTTONS pon reasons c0 %02x %02x warm %02x %02x on %02x poff %02x %02x off %02x fault %02x %02x s3 %02x\n", r[0], r[1],
+               r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10]);
+    }
+    native_board_halt_restart = haltRestart;
+}
+
+// pdx203: one byte of any PMIC peripheral through the arbiter the button thread mapped, for the battery (Pdx203Battery.cpp).
+// ppid = sid << 8 | (peripheral address >> 8). Reads go through the observer channel, so any mapped APID will do. -1 until the
+// button thread has mapped the arbiter, -2 when no APID serves ppid; otherwise the transfer's result (0 on success).
+extern "C" int pdx203_spmi_read(uint32_t ppid, uint8_t addr, uint8_t *value) {
+    if (native_buttons_stats[0] < 2 || !gObs.va || !gCore.va) return -1;
+    static struct {uint32_t ppid; int apid;} cache[8];
+    static unsigned cached;
+    int apid = -2;
+    for (unsigned i = 0; i < cached; ++i) if (cache[i].ppid == ppid) apid = cache[i].apid;
+    if (apid == -2) {
+        for (uint32_t i = 0; i < gApids && apid < 0; ++i) {
+            const uint32_t map = gCore.va[(gApidMap + 4 * i) / 4];
+            if (map && ((map >> 8) & 0xfff) == ppid) apid = (int)i;
+        }
+        if (apid < 0) return -2;
+        if (cached < 8) {cache[cached].ppid = ppid; cache[cached].apid = apid; cached++;}
+    }
+    return observe(apid, addr, value);
+}
+
+// pdx203: the APID through which this EE may write ppid (ownership EE 0, as Linux picks it), -1 when there is none (a write
+// through an APID another EE owns wedged the CPU, usb-67), -2 until the button thread has mapped the arbiter.
+extern "C" int pdx203_spmi_writable(uint32_t ppid) {
+    if (native_buttons_stats[0] < 2 || !gChn.va || !gCore.va) return -2;
+    return findWritableApid(ppid);
+}
+// One byte written to ppid through its writable APID only; -3 when this EE owns no APID of ppid.
+extern "C" int pdx203_spmi_write(uint32_t ppid, uint8_t addr, uint8_t value) {
+    const int apid = pdx203_spmi_writable(ppid);
+    if (apid == -2) return -1;
+    if (apid < 0) return -3;
+    return write8(apid, addr, value);
+}
+
+// The USB control channel's REBOOT (drivers/QcomXnuUsbDebug qcom_usb_debug_control_reset_now): straight into fastboot, without the
+// filesystem unmount (which panics on this board). Returns only when it cannot (no PON channel or PS_HOLD yet).
+extern "C" int boot_reset_bootloader(char *text, unsigned size) {
+    void (*halt)(int) = native_board_halt_restart;
+    if (!halt) {
+        static const char why[] = "pdx203 board halt not installed";
+        if (text && size) {unsigned i = 0; for (; i + 1 < size && why[i]; ++i) text[i] = why[i]; text[i] = 0;}
+        return 1;
+    }
+    halt(2);
+    return 2;
+}
+// The control channel's KEY: buttons the host holds down (BT_REPORT_* bits), sent with the real ones. pdx203_buttons_inject
+// sends the combined mask at once.
+static volatile uint32_t gInjectedButtons;
+extern "C" int pdx203_buttons_inject(uint32_t bit, bool down) {
+    void (*sink)(void *, uint32_t) = __atomic_load_n(&gSink, __ATOMIC_ACQUIRE);
+    if (!sink) return -1;
+    const uint32_t mask = down ? __atomic_or_fetch(&gInjectedButtons, bit, __ATOMIC_ACQ_REL)
+                               : __atomic_and_fetch(&gInjectedButtons, ~bit, __ATOMIC_ACQ_REL);
+    sink(gSinkContext, (uint32_t)native_buttons_stats[3] | mask);
+    return 0;
+}
+extern "C" void native_buttons_set_sink(void (*sink)(void *, uint32_t), void *context) {
+    gSinkContext = context;
+    __atomic_store_n(&gSink, sink, __ATOMIC_RELEASE);
+}
+
+extern "C" void pdx203_buttons_probe(void) {
+    unsigned mode = 0;
+    if (!PE_parse_boot_argn("pdx203-bt", &mode, sizeof mode) || !mode || mode > 3 || native_buttons_stats[0]) return;
+    gMode = mode;
+    native_buttons_stats[0] = 1;
+    thread_t thread = nullptr;
+    if (kernel_thread_start(buttonsThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
+    else fail(7, -12);
+}

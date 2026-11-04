@@ -3,6 +3,8 @@
 
 uke's binder (Allenwdk/UniXNU-uke, BSD-2-Clause-Patent), unchanged but for the candidate default: the
 pdx203 pre-build copies the first-console kernel to build/native-prelink/native-defaults-candidate.macho.
+Format 2: the objects and archives are the catalog recipes' (build/sheng-ufs/libShengUfs.a for ShengUfs,
+build/ram-block/libRamBlock.a for RamBlock); this step adds original-bindings.o to them.
 
 The full storage ABI audit (scripts/audit-storage-interface.py) also needs a
 live guest snapshot. This bring-up binder derives the same class, vtable and
@@ -20,7 +22,7 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / 'kits/NativePrelink'))
+sys.path.insert(0, str(ROOT / 'kits/XnuPrelink'))
 import native_prelink as np
 
 parser = argparse.ArgumentParser(description=__doc__)
@@ -31,7 +33,8 @@ parser.add_argument('--objects-dir', type=Path, default=None)
 args = parser.parse_args()
 component = args.component
 args.objects_dir = (args.objects_dir or
-                    ROOT / ('build/native-ufs' if component == 'NativeUfs' else 'build/native-ram-block'))
+                    ROOT / ('build/sheng-ufs' if component == 'NativeUfs' else 'build/ram-block'))
+ARCHIVE_NAME = 'libShengUfs.a' if component == 'NativeUfs' else 'libRamBlock.a'
 
 KERNELCACHE_SHA256 = 'f18b4df865405f2a287b84977d7aca745e056d656d9fc9df1662970ce2969de7'
 SOURCE_REVISION = 'e45fbe30a7879e0b16e26dddb78538f1b00e0bff'
@@ -180,11 +183,23 @@ require(undefined, f'No original block-storage imports found in {component}.o')
 missing = [name for name in undefined if name not in possible]
 require(not missing, 'Unqualified original storage import: ' + ', '.join(missing))
 bindings = {name: possible[name] for name in undefined}
+# both archives are force-loaded into the same kernel, and each one's original-bindings.o defines its imports as global
+# absolutes, so a second definition of the same name is a duplicate symbol at the final link. when NativeUfs already
+# binds a name (to the same original address, checked here), the NativeRamBlock archive leaves it to that definition
+shared = {}
+ufs_record = ROOT / 'build/sheng-ufs/bindings.json'
+if component != 'NativeUfs' and ufs_record.is_file():
+    ufs_bindings = json.loads(ufs_record.read_text()).get('bindings', {})
+    for name in list(bindings):
+        if name in ufs_bindings:
+            require(int(ufs_bindings[name], 16) == bindings[name],
+                    f'{name} binds to {ufs_bindings[name]} in NativeUfs but {bindings[name]:#x} here')
+            shared[name] = bindings.pop(name)
 assembly = out / 'original-bindings.S'
 assembly.write_text(''.join(f'.globl {name}\n.set {name}, {value:#x}\n' for name, value in sorted(bindings.items())))
 subprocess.run(['xcrun', 'clang', '-target', 'arm64-apple-ios17.0', '-Werror', '-Wno-incompatible-sysroot',
                 '-c', assembly, '-o', out / 'original-bindings.o'], check=True)
-archive = out / ('lib' + component + '.a')
+archive = out / ARCHIVE_NAME
 archive.unlink(missing_ok=True)
 subprocess.run(['xcrun', 'ar', 'rcs', archive, object_path, out / 'original-bindings.o'], check=True)
 (out / 'bindings.json').write_text(json.dumps(dict(
@@ -194,6 +209,7 @@ subprocess.run(['xcrun', 'ar', 'rcs', archive, object_path, out / 'original-bind
     original_base_destructor=hex(destructor), virtual_methods_checked=len(methods),
     kernel_bindings=matched, unresolved_original_imports=0,
     bindings={name: hex(value) for name, value in bindings.items()},
+    bound_by_native_ufs={name: hex(value) for name, value in shared.items()},
     live_qualified=False, actual_io_qualified=False), indent=2) + '\n')
-print(f'PASS: {len(bindings)} {component} bindings from the pinned original candidate '
+print(f'PASS: {len(bindings)} {component} bindings ({len(shared)} left to NativeUfs) from the pinned original candidate '
       f'({matched} kernel method bindings, {len(methods)} slots)')

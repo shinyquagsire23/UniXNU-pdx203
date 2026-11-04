@@ -1,0 +1,26 @@
+diff --git a/osfmk/kern/kern_stackshot.c b/osfmk/kern/kern_stackshot.c
+index 3159574..b64a2c7 100644
+--- a/osfmk/kern/kern_stackshot.c
++++ b/osfmk/kern/kern_stackshot.c
+@@ -3422,13 +3422,19 @@ kdp_stackshot_record_task(struct stackshot_context *ctx, task_t task)
+ 
+ 			/* If we want owner info, we should capture it regardless of its classification */
+ 			if (save_owner_info) {
+-				if (stackshot_thread_has_valid_waitinfo(thread)) {
++				/*
++				 * pdx203 (patches/xnu/zzzzzzzzzd-stackshot-bounds.patch): the arrays were sized by the counting loop above, and a
++				 * thread may start waiting in between when the other CPUs are not all held: one did, and this wrote through the
++				 * NULL array of a zero count (panic in stackshot_thread_turnstileinfo, 2026-11-01). Entries past the count are
++				 * left out instead.
++				 */
++				if (stackshot_thread_has_valid_waitinfo(thread) && current_waitinfo_index < num_waitinfo_threads) {
+ 					stackshot_thread_wait_owner_info(
+ 						thread,
+ 						&thread_waitinfo[current_waitinfo_index++]);
+ 				}
+ 
+-				if (stackshot_thread_has_valid_turnstileinfo(thread)) {
++				if (stackshot_thread_has_valid_turnstileinfo(thread) && current_turnstileinfo_index < num_turnstileinfo_threads) {
+ 					stackshot_thread_turnstileinfo(
+ 						thread,
+ 						&thread_turnstileinfo[current_turnstileinfo_index++]);

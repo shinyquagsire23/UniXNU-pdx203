@@ -142,3 +142,27 @@ python3 scripts/check-host.py          # board file, defconfigs, py_compile, the
 python3 ../UniXNU/unixnu status -D . --out out/driver   # NativeUfs and the package from "device", the rest "base"
 python3 ../UniXNU/unixnu tree -D . --out out/driver     # the build tree with kits/pdx203 and the merged scripts
 ```
+
+## unsigned apps: TrollStore and Sileo
+
+the kernel admits unsigned and fakesigned code whenever the payload's command line carries `amfi=0x83`: the 0x80 (get-out-of-my-way) bit now also drives the kernel's own switch (`unixnu_jailbreak`, `patches/xnu/zzzzzzzzzh-unixnu-jailbreak.patch`), which
+
+- skips every MACF policy verdict (`MAC_CHECK`): Seatbelt's sandbox and AMFI's launch constraints no longer deny a lookup, an exec, an IOKit open or a container write (label bookkeeping and notifications still run, so policies stay consistent)
+- turns off code signing system/process enforcement and library validation, allows invalid pages, lets `CS_OPS_ALLOW_INVALID` through, and raises allow-any-signature, get-out-of-my-way and unrestricted debugging in `security.codesigning.config` whatever the other arguments say
+- lets `proc_pidinfo`/`proc_pidfdinfo` reach processes of other users, so `ps` and dpkg's triggers work
+
+the switch is read-only visible: `sysctl security.codesigning.jailbreak`. entitlements are unaffected: they still come from the code signature blob, which is how a fakesigned app keeps the private entitlements it shipped with (TrollStore's helper needs exactly that).
+
+to install the two apps, stage the bundles and have the payload's addon carry them; the kernel unions `/private/var/ngpu/apps` over `/Applications` at boot (`patches/xnu/zzzzzzzzzi-apps-addon-mount.patch`, the `GPUADDON mount10 (/Applications)` row), so the sealed system apps stay visible below and LaunchServices finds the new ones next to them:
+
+```sh
+mkdir -p apps && cp -R TrollStore.app Sileo.app apps/
+python3 ../UniXNU/scripts/make-gpu-addon.py --apps apps <the rest of the addon flags> OUT
+./unixnu build payload ... --gpu-addon OUT
+```
+
+gates that remain, none of them in the kernel:
+
+- launchd's icon cache: after a boot whose `apps/` directory changed, remove the LaunchServices database once so `lsd` rescans `/Applications` (the addon's `oslog/lsrebuild` marker does this, `OsLogConsole.mm`)
+- TrollStore: the default "custom" installation method (MobileContainerManager + icon cache) is the one that works here. the "installd" method is not: `installd` validates the CMS in user space through CoreTrust, and 21H461 has the CoreTrust bug (CVE-2023-41991) fixed, so a fakesigned `.ipa` fails there. TrollStore falls back to custom on its own
+- Sileo: it needs its Procursus bootstrap (apt, dpkg, coreutils and the rootless prefix under `/private/var/jb`). the app's root path is the same persona spawn TrollStore's helper uses (`posix_spawnattr_set_persona_np(99, OVERRIDE)` + uid/gid 0), so nothing else in the kernel is in the way. packages that write absolute paths outside the rootless prefix hit the read-only root `/`, which is the mount layout, not code signing

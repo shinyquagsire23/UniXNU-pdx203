@@ -1,0 +1,3 @@
+# Applied after the SoC series and before the OS series. The OS series' zzz-boot-progress.patch edits the
+# sheng_pmgr_run() call this patch adds to bsd_init.c; the SM8550 SoC series carries it, the SM8250 one does not.
+arch:../../../patches/xnu/sheng-platform-power.patch

@@ -1,0 +1,20 @@
+diff --git a/bsd/vfs/vfs_subr.c b/bsd/vfs/vfs_subr.c
+index 57aece6..d7fad60 100644
+--- a/bsd/vfs/vfs_subr.c
++++ b/bsd/vfs/vfs_subr.c
+@@ -4257,6 +4257,15 @@ unmount_callback(mount_t mp, void *arg)
+ 	    && ((mp->mnt_flag & MNT_ROOTFS) || (mp->mnt_kern_flag & MNTK_SYSTEM))) { //MNTK_BACKS_ROOT
+ 		printf("unmount(%d) %s skipped\n", uip->u_only_non_system, mntname);
+ 		mount_iterdrop(mp);     // VFS_ITERATE_CB_DROPREF
++	} else if ((mp->mnt_flag & MNT_ROOTFS) && (mp->mnt_flag & MNT_RDONLY)) {
++		/*
++		 * pdx203 (patches/xnu/zzzzzzzzze-skip-ro-root-unmount.patch): the read-only root has nothing to write back, and
++		 * unmounting it panics here: the offline SystemOS union mount drops one more reference on the root vnode than it
++		 * took, and vnode_rele_ext reports a negative usecount (vfs_subr.c, at every shutdown, 2026-11-01). Every writable
++		 * volume (Data among them) is unmounted in the pass before this one.
++		 */
++		printf("unmount(%d) %s skipped (read-only root)\n", uip->u_only_non_system, mntname);
++		mount_iterdrop(mp);     // VFS_ITERATE_CB_DROPREF
+ 	} else {
+ 		printf("unmount(%d) %s\n", uip->u_only_non_system, mntname);
+ 

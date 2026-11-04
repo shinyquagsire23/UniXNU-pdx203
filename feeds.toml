@@ -1,0 +1,7 @@
+# Sources this device selects beyond the main repository's (format 2). Published builds use these committed pins.
+
+[[source]]
+name = "sm8250"
+kind = "soc"
+git = "https://github.com/FFT-infra/UniXNU-sm8250-common"
+commit = "a6e7e36caab58f5b9a5625dbdb8da2bf290fa5cc"

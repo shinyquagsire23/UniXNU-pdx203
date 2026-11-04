@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""run the archive builders the selected pdx203 configuration links, in sheng's order.
+"""Run the pdx203 board archive builders the selected configuration links (format 2).
 
-board.toml names this one script in [kernel] archives. the unixnu driver passes the defconfig's XNU_* flags
-in the environment, so the same board file serves the first-console and the stage 6 configurations without
-a builder list per defconfig. a builder that fails stops the kernel step, as a listed one would.
+board.toml lists the catalog components (ArmDTPlatform, ArmCpu, SoftwareAES, ShengUfs, RamBlock, ...) whose recipes
+the unixnu driver runs first, then this one script in [kernel] archives. It reads the defconfig's XNU_* flags from its
+environment and runs the board's own builders for what that configuration links, in sheng's order. A builder that
+fails stops the kernel step, as a listed one would.
+
+Two builders bind owned drivers to original kernelcache classes and read a prelinked candidate of the pinned
+kernelcache from build/native-prelink/ (docs/bring-up.md, the pre_build input). The candidate's original addresses
+come from the unchanged 21H461 kernelcache, so a candidate of an earlier pdx203 build is a valid input.
 """
 import os
 from pathlib import Path
@@ -11,6 +16,7 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
+CANDIDATE = 'build/native-prelink/native-defaults-candidate.macho'
 
 
 def on(name):
@@ -21,28 +27,32 @@ def main():
     steps = [
         ['build-corecrypto-14.py'],
         ['build-corecrypto-14.py', '--namespace'],
-        ['build-arm-driver.py', 'ArmDTPlatform'],
-        ['build-arm-driver.py', 'ArmCpu'],
     ]
-    if not on('NATIVE_LEGACY_DISPLAY'):
-        # the base bsd_init references native_legacy_display_probe() whatever the display flag says
-        steps.append(['build-pdx203-stubs.py'])
+    # the weak fallbacks: the base bsd_init references native_legacy_display_probe() whatever the display flag says, and the
+    # display probe imports the boot progress layer weakly. the defconfig links the archive through CONFIG_XNU_EXTRA_LD_ARCHIVES
+    steps.append(['build-pdx203-stubs.py'])
     if on('NATIVE_AES'):
-        steps += [['build-arm-driver.py', 'NativeAES'], ['build-native-aes-bindings.py']]
+        steps.append(['build-software-aes-bindings.py'])
     if on('NATIVE_UFS'):
-        # the bring-up transport without the verified-root policy bundle, bound to the original
+        # the bring-up transport (ShengUfs recipe, unverified under XNU_BRINGUP_OWNER_CACHE) bound to the original
         # IOBlockStorageDevice of the prelinked candidate (docs/bring-up.md, stage 6)
-        steps += [['prepare-storage-headers.py'], ['build-arm-driver.py', 'NativeUfs', '--unverified'],
-                  ['build-ufs-original-bindings.py', '--candidate', 'build/native-prelink/native-defaults-candidate.macho']]
-    if on('NATIVE_VIRTIO_BLOCK'):
-        steps += [['build-arm-driver.py', 'NativeVirtioBlock'], ['build-native-virtio-bindings.py', '--component', 'NativeVirtioBlock']]
+        steps.append(['build-ufs-original-bindings.py', '--candidate', CANDIDATE])
     if on('NATIVE_RAM_BLOCK'):
-        steps += [['build-arm-driver.py', 'NativeRamBlock'],
-                  ['build-native-virtio-bindings.py', '--component', 'NativeRamBlock', '--directory', 'build/native-ram-block']]
+        # the Data seed's IOMedia (RamBlock recipe), bound like the UFS transport
+        steps.append(['build-ufs-original-bindings.py', '--component', 'NativeRamBlock', '--candidate', CANDIDATE])
     if on('SOURCE_MOCKFS'):
         steps.append(['build-mockfs-fixture.py'])
     if on('SHENG_PMGR'):
         steps.append(['build-pdx203-platform-power.py'])
+    if on('NATIVE_LEGACY_DISPLAY'):
+        # the GOP display (NativeLegacyDisplay bound to the original IOMobileFramebufferLegacy, the board probe and
+        # NativeGOPPresenter) with the touch, HID, buttons and keystore probes, linked by the base build as
+        # build/native-legacy-display/libNativeLegacyDisplay.late.a
+        steps.append(['build-pdx203-legacy-display.py'])
+    if on('QCOM_USB_DEBUG'):
+        # the CDC-ACM kernel log over the DWC3 (drivers/QcomXnuUsbDebug, sm8250 profile), linked through
+        # CONFIG_XNU_EXTRA_LD_ARCHIVES as build/qcom-usb-debug/libQcomXnuUsbDebug.a
+        steps.append(['build-pdx203-usb-debug.py'])
     if on('SOURCE_PTHREAD'):
         steps.append(['build-libpthread-kernel.py'])
     for index, step in enumerate(steps, 1):

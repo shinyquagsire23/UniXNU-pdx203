@@ -1,0 +1,53 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Sony Xperia 1 II (pdx203), Qualcomm SM8250 (kona).
+//
+// The values are the ones the format 1 ADT script (scripts/make-pdx203-adt.py, removed with the format 2
+// migration) wrote, which ios-sweet verified on this phone and the stock kona dtb supplies: the upper DDR
+// bank XNU owns, the MPIDR numbering, the UFS host windows and its two apps SMMU streams.
+
+/dts-v1/;
+/include/ "sm8250.dtsi"
+
+/ {
+    model = "Sony Xperia 1 II";
+    compatible = "sony,pdx203", "qcom,sm8250";
+
+    memory@100000000 {
+        device_type = "memory";
+        // The upper DDR bank, 0x1_00000000 + 0xfcc00000, verified as XNU's RAM by ios-sweet. DarwinBoot places
+        // the owned window ([payload.adt] owned_memory_size) in it; uefi-pdx203's Pdx203BootMemoryDxe adds it.
+        reg = <0x1 0x00000000 0x0 0xfcc00000>;
+    };
+
+    soc {
+        // The apps SMMU. Its streams are listed by the devices behind it (iommus = <&apps_smmu sid mask>); the UFS
+        // transport gives each listed stream a bypass context bank before the first doorbell.
+        apps_smmu: iommu@15000000 {
+            compatible = "qcom,sm8250-smmu-500", "arm,mmu-500";
+            unixnu,adt-name = "apps-smmu";
+            reg = <0 0x15000000 0 0x100000>;
+            #iommu-cells = <2>;
+        };
+    };
+};
+
+// All eight cores through PSCI (sheng-smp=1). Kryo 585 Silver (A55) are the efficiency cluster, Gold and
+// Gold Prime (A77) the performance one. The cluster types are only valid together with the SoC's
+// native-smp-type-clusters.patch, which the SoC series applies.
+&cpu0 { status = "okay"; unixnu,cluster-type = "E"; };
+&cpu1 { status = "okay"; unixnu,cluster-type = "E"; };
+&cpu2 { status = "okay"; unixnu,cluster-type = "E"; };
+&cpu3 { status = "okay"; unixnu,cluster-type = "E"; };
+&cpu4 { status = "okay"; unixnu,cluster-type = "P"; };
+&cpu5 { status = "okay"; unixnu,cluster-type = "P"; };
+&cpu6 { status = "okay"; unixnu,cluster-type = "P"; };
+&cpu7 { status = "okay"; unixnu,cluster-type = "P"; };
+
+// Storage. The host, ICE and PHY windows, and the host's two apps SMMU streams (mainline sm8250.dtsi): without
+// the streams the first command's DMA reset the phone ~10 s later with no panic (2026-11-01).
+&ufs {
+    reg = <0 0x1d84000 0 0x3000>, <0 0x1d90000 0 0x8000>, <0 0x1d87000 0 0x1000>;
+    iommus = <&apps_smmu 0xe0 0x0>, <&apps_smmu 0x4e0 0x0>;
+    status = "okay";
+};
+&ufsphy { status = "okay"; };

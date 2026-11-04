@@ -1,0 +1,26 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index e75e3db..9baf9eb 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8044,6 +8044,21 @@ load_init_program(proc_t p)
+ #if CONFIG_MEMORYSTATUS
+ 	(void) memorystatus_init_at_boot_snapshot();
+ #endif /* CONFIG_MEMORYSTATUS */
++#if defined(XNU_OWNER_DATA_MOUNT) && XNU_OWNER_DATA_MOUNT && !(defined(XNU_BOOT_PROGRESS) && XNU_BOOT_PROGRESS)
++	/*
++	 * sheng's launchd policy (BootWatchdogPolicy.c, linked by the board) without the boot-progress layer that otherwise
++	 * calls it: on the freshly mounted Data volume, write /private/var/db/com.apple.xpc.launchd/disabled.plist from
++	 * sheng-disable-watchdogd, sheng-lite and sheng-disable-jobs, root-owned, before launchd reads it. Nothing is
++	 * written when none of them is set.
++	 */
++	{
++		extern int sheng_boot_watchdog_policy(void *, uint64_t);
++		int policy_error = sheng_boot_watchdog_policy(p, (uint64_t)scratch_addr);
++		if (policy_error) {
++			panic("launch policy failed: %d", policy_error);
++		}
++	}
++#endif
+ 
+ #if (DEBUG || DEVELOPMENT) && defined(XNU_NATIVE_AIR_INIT) && XNU_NATIVE_AIR_INIT
+ 	int offline_air = 0;

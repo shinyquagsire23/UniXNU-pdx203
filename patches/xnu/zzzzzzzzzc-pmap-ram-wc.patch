@@ -1,0 +1,53 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 7b8ccd4..7837cfc 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -5819,11 +5819,48 @@ pmap_enter_pte(pmap_t pmap, pt_entry_t *pte_p, pt_entry_t *old_pte, pt_entry_t n
+ 	return success;
+ }
+ 
++/*
++ * pdx203 (patches/xnu/zzzzzzzzzc-pmap-ram-wc.patch): with pmap-ram-wc=1, RAM that is asked for as Device memory (the IO,
++ * real-time and posted cache modes; on this config real-time is Device too, no HAS_UCNORMAL_MEM) is mapped Normal
++ * non-cacheable instead. iPadOS hands display surfaces to backboardd with such a mode, and with no GPU its software
++ * renderer clears them with bzero, whose DC ZVA takes an alignment fault on any Device memory: backboardd died of SIGBUS
++ * in CA::OGL::SWContext::set_surface (2026-11-01, logs/usb-13). RAM here is the kernel's DRAM and the GOP framebuffer,
++ * which lies outside it; real MMIO keeps its Device attributes.
++ */
++#include <pexpert/pexpert.h>
++static TUNABLE(bool, pmap_ram_wc, "pmap-ram-wc", false);
++static inline bool
++pmap_ram_wc_addr(pmap_paddr_t pa)
++{
++	if (!pmap_ram_wc) {
++		return false;
++	}
++	if (is_dram_addr(pa)) {
++		return true;
++	}
++	uint64_t fb = (uint64_t)PE_state.video.v_baseAddr, bytes = (uint64_t)PE_state.video.v_rowBytes * PE_state.video.v_height;
++	return fb && pa >= fb && pa - fb < bytes;
++}
++
+ MARK_AS_PMAP_TEXT static pt_entry_t
+ wimg_to_pte(unsigned int wimg, __unused pmap_paddr_t pa)
+ {
+ 	pt_entry_t pte;
+ 
++	switch (wimg & (VM_WIMG_MASK)) {
++	case VM_WIMG_IO:
++	case VM_WIMG_RT:
++	case VM_WIMG_POSTED:
++	case VM_WIMG_POSTED_REORDERED:
++	case VM_WIMG_POSTED_COMBINED_REORDERED:
++		if (pmap_ram_wc_addr(pa)) {
++			return ARM_PTE_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_PTE_NX | ARM_PTE_PNX;
++		}
++		break;
++	default:
++		break;
++	}
++
+ 	switch (wimg & (VM_WIMG_MASK)) {
+ 	case VM_WIMG_IO:
+ 		// Map DRAM addresses with VM_WIMG_IO as Device-GRE instead of

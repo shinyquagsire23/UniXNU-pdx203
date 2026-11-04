@@ -1,0 +1,6 @@
+[submodule "drivers/QcomXnuUsbDebug"]
+	path = drivers/QcomXnuUsbDebug
+	url = https://github.com/FFT-infra/QcomXnuUsbDebug
+[submodule "drivers/GopFramebuffer"]
+	path = drivers/GopFramebuffer
+	url = https://github.com/UniXNU/GopFramebuffer.git
