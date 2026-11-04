@@ -460,10 +460,15 @@ void profile(int pid, const char *process) {
 // client (iokit-open-user-client, filter types 12..16 tried as the numbering is private).  SBCHECK <pid> <check>=<0 allowed|1 denied|-1>
 extern "C" int sandbox_check(pid_t, const char *, int, ...);
 extern "C" int proc_pidpath(int, void *, uint32_t);
+// sa39: also the plugin's real path behind the bindfs mount (/private/var/ngpu/addons), and the images the process has loaded outside
+// the shared cache (whether dyld ever mapped the plugin), at its first sight, 30 s and 2 min later.
 void sandboxCheck(int pid) {
-    static std::vector<int> done;
-    for (int d : done) if (d == pid) return;
-    done.push_back(pid);
+    static std::vector<std::pair<int, int>> seen;
+    int *passes = nullptr;
+    for (auto &d : seen) if (d.first == pid) passes = &d.second;
+    if (!passes) {seen.push_back({pid, 0}); passes = &seen.back().second;}
+    const int pass = (*passes)++;
+    if (pass != 0 && pass != 6 && pass != 24) return;
     char path[1024] = {};
     if (proc_pidpath(pid, path, sizeof path) <= 0 || !strstr(path, "com.apple.WebKit.GPU")) return;
     constexpr int kNoReport = 0x40000000, kFilterPath = 1;
@@ -471,7 +476,8 @@ void sandboxCheck(int pid) {
                                  "/System/Library/Extensions/NativeAdrenoMetal.bundle/Info.plist",
                                  "/System/Library/Extensions/NativeAdrenoMetal.bundle/libvulkan_freedreno.dylib",
                                  "/System/Library/Extensions/NativeAdrenoMetal.publish", "/System/Library/Extensions/NativeAdrenoMetal.clients",
-                                 "/System/Library/Extensions/AGXMetalA10.bundle/AGXMetalA10", nullptr};
+                                 "/System/Library/Extensions/AGXMetalA10.bundle/AGXMetalA10",
+                                 "/private/var/ngpu/addons/NativeAdrenoMetal.bundle/NativeAdrenoMetal", nullptr};
     char line[480];
     int at = snprintf(line, sizeof line, "SBCHECK %d", pid);
     for (unsigned i = 0; files[i]; ++i) {
@@ -479,10 +485,43 @@ void sandboxCheck(int pid) {
         at += snprintf(line + at, sizeof line - at, " %s=%d", base, sandbox_check(pid, "file-read-data", kFilterPath | kNoReport, files[i]));
     }
     at += snprintf(line + at, sizeof line - at, " map=%d", sandbox_check(pid, "file-map-executable", kFilterPath | kNoReport, files[0]));
+    at += snprintf(line + at, sizeof line - at, " maprealpath=%d",
+                   sandbox_check(pid, "file-map-executable", kFilterPath | kNoReport, "/private/var/ngpu/addons/NativeAdrenoMetal.bundle/NativeAdrenoMetal"));
     for (int type = 12; type <= 16; ++type)
         at += snprintf(line + at, sizeof line - at, " io%d=%d", type, sandbox_check(pid, "iokit-open-user-client", type | kNoReport, "AGXDeviceUserClient"));
     snprintf(line + at, sizeof line - at, "\n");
     emit(line);
+    // The images outside the shared cache.
+    mach_port_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    if (kr != KERN_SUCCESS && task_read_for_pid) kr = task_read_for_pid(mach_task_self(), pid, &task);
+    at = snprintf(line, sizeof line, "SBIMAGES %d pass %d:", pid, pass);
+    if (kr != KERN_SUCCESS) {snprintf(line + at, sizeof line - at, " no task port 0x%x\n", kr); emit(line); return;}
+    task_dyld_info_data_t dyld = {};
+    mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
+    unsigned total = 0;
+    if (task_info(task, TASK_DYLD_INFO, (task_info_t)&dyld, &count) == KERN_SUCCESS && dyld.all_image_info_addr) {
+        struct dyld_all_image_infos all = {};
+        vm_size_t got = 0;
+        if (vm_read_overwrite(task, dyld.all_image_info_addr, sizeof all, (vm_address_t)&all, &got) == KERN_SUCCESS) {
+            total = all.infoArrayCount;
+            std::vector<struct dyld_image_info> infos(all.infoArrayCount < 2048 ? all.infoArrayCount : 2048);
+            if (!infos.empty() && vm_read_overwrite(task, (vm_address_t)all.infoArray, infos.size() * sizeof infos[0],
+                                                         (vm_address_t)infos.data(), &got) == KERN_SUCCESS) {
+                for (const auto &info : infos) {
+                    const uint64_t base = (uint64_t)info.imageLoadAddress;
+                    if (all.sharedCacheBaseAddress && base >= all.sharedCacheBaseAddress && base < all.sharedCacheBaseAddress + 0x200000000ull) continue;
+                    char path[256] = {};
+                    vm_read_overwrite(task, (vm_address_t)info.imageFilePath, sizeof path - 1, (vm_address_t)path, &got);
+                    const char *name = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
+                    if (at < (int)sizeof line - 40) at += snprintf(line + at, sizeof line - at, " %.32s", name);
+                }
+            }
+        }
+    }
+    snprintf(line + at, sizeof line - at, " (%u images)\n", total);
+    emit(line);
+    mach_port_deallocate(mach_task_self(), task);
 }
 void cpuTopPass(std::vector<Sample> &previous, std::vector<std::pair<uint64_t, uint64_t>> &threadsBefore, uint64_t intervalNs,
                 bool always, int &failures) {

@@ -1155,7 +1155,7 @@ bool gpuInterrupt() {
 // below the 2 GiB aperture, and the UBWC facts hw_init programs (highest bank bit 16; swizzle levels 2 and 3, as Linux's default
 // for every A6XX but the A610; eight-channel macrotiles: RBBM_NC_MODE_CNTL reads 1 at reset here (2026-10-24), and Linux's
 // ubwc_config for the SM8250 has macrotile_mode set; UBWC 4.0 of the SM8250).
-NativeAdrenoAbiDeviceInfo kDeviceInfo = {0x06050002u, 0x120000u, 0, 0x1fffffffff000ull, 0x20000000ull, 0x60000000ull,
+NativeAdrenoAbiDeviceInfo kDeviceInfo = {0x06050002u, 0x120000u, 0, 0x1fffffffff000ull, 0x04000000ull, 0x7C000000ull,
                                          16, 6, 1, 4, NativeAdrenoDeviceClientIova, 0};
 NativeAdrenoSubmit *gSubmit;
 NativeAdrenoTimer *gTimer;
@@ -1435,9 +1435,14 @@ extern "C" struct Pdx203AskerRecord native_adreno_metal_askers[12] __attribute__
 char gAskersPrinted[300];
 extern "C" char native_adreno_plugin_steps[8][48] __attribute__((weak_import));
 char gStepsPrinted[440];
+// NativeAdreno 0005: registry reads on the GPU service by processes other than the render server, "<process> <key>", newest first.
+extern "C" char native_adreno_property_log[16][48] __attribute__((weak_import));
+extern "C" uint32_t native_adreno_property_log_repeat[16] __attribute__((weak_import));
+extern "C" volatile uint32_t native_adreno_property_log_count __attribute__((weak_import));
+uint32_t gPropLogPrinted;
 // NativeAdrenoPublish.cpp kClientWindows: slot 0 the render server's 1 GiB, three more of 170 MiB.
 static const struct {uint64_t start, bytes;} kCrashWindows[4] = {
-    {0x20000000ull, 0x40000000ull}, {0x60000000ull, 0x0AAA9000ull}, {0x6AAA9000ull, 0x0AAA9000ull}, {0x75552000ull, 0x0AAA9000ull}};
+    {0x04000000ull, 0x5C000000ull}, {0x60000000ull, 0x0AAA9000ull}, {0x6AAA9000ull, 0x0AAA9000ull}, {0x75552000ull, 0x0AAA9000ull}};
 const char *crashOwner(uint64_t iova) {
     for (unsigned slot = 0; slot < 4; ++slot) {
         if (iova < kCrashWindows[slot].start || iova - kCrashWindows[slot].start >= kCrashWindows[slot].bytes) continue;
@@ -1821,6 +1826,13 @@ void metalRows() {
         for (unsigned i = 0; i < 8 && n > 0 && size_t(n) < sizeof line - 50; ++i)
             if (native_adreno_plugin_steps[i][0]) n += snprintf(line + n, sizeof line - n, " | %.47s", native_adreno_plugin_steps[i]);
         printIfChanged(gStepsPrinted, sizeof gStepsPrinted, line);
+    }
+    // One PROPLOG row per entry when the log moved, oldest first.
+    if (&native_adreno_property_log && &native_adreno_property_log_count && native_adreno_property_log_count != gPropLogPrinted) {
+        gPropLogPrinted = native_adreno_property_log_count;
+        for (int i = 15; i >= 0; --i)
+            if (native_adreno_property_log[i][0])
+                printf("PROPLOG %2d %.47s x%u\n", i, native_adreno_property_log[i], native_adreno_property_log_repeat[i]);
     }
     clientText();
     if (&native_adreno_method_stats) {
