@@ -1341,7 +1341,9 @@ bool metal() {
     // The WebKit GPU process too (sa44/45: its Metal device failed with VK_ERROR_INITIALIZATION_FAILED, its sandbox refusing the open
     // before this driver saw it, so WebKit drew with CoreAnimation's software renderer on 4.6 cores and Safari ran at 24 fps). The xnu
     // grant compares 16 characters, so "com.apple.WebKit" processes all pass this check; which of them get a device is the plugin's list.
-    accelerator->setProperty("NativeSandboxGrantProcess", "backboardd,iconservicesagent,Preferences,PosterBoard,com.apple.WebKit.GPU");
+    // sa56: every process ("*", the xnu grant's wildcard; "!name" would refuse one): which processes get a device is the plugin's deny list
+    // (make-gpu-addon --deny), so the sandbox's verdict on this service no longer decides it.
+    accelerator->setProperty("NativeSandboxGrantProcess", "*");
     accelerator->setProperty("MetalPluginClassName", "NativeAdrenoMetalDevice");
     // Turnip's options for this board, which replace the plugin's default "sysmem,nocb" (NativeAdrenoMetalPlugin.mm
     // applyBoardTurnipDebug). That default keeps every pass in system memory against a hang of the A740's concurrent binning (BV
@@ -1448,10 +1450,12 @@ uint32_t gPropLogPrinted;
 extern "C" volatile uint32_t native_adreno_view_diag[6] __attribute__((weak_import));
 char gViewsPrinted[120];
 // NativeAdrenoPublish.cpp kClientWindows: slot 0 the render server's 1 GiB, three more of 170 MiB.
-static const struct {uint64_t start, bytes;} kCrashWindows[4] = {
-    {0x04000000ull, 0x4C000000ull}, {0x50000000ull, 0x38000000ull}, {0x88000000ull, 0x38000000ull}, {0xC0000000ull, 0x38000000ull}};
+static const struct {uint64_t start, bytes;} kCrashWindows[11] = {
+    {0x04000000ull, 0x4C000000ull}, {0x50000000ull, 0x28000000ull}, {0x78000000ull, 0x28000000ull}, {0xA0000000ull, 0x28000000ull},
+    {0xC8000000ull, 0x08000000ull}, {0xD0000000ull, 0x08000000ull}, {0xD8000000ull, 0x08000000ull}, {0xE0000000ull, 0x08000000ull},
+    {0xE8000000ull, 0x08000000ull}, {0xF0000000ull, 0x08000000ull}, {0xF8000000ull, 0x08000000ull}};
 const char *crashOwner(uint64_t iova) {
-    for (unsigned slot = 0; slot < 4; ++slot) {
+    for (unsigned slot = 0; slot < 11; ++slot) {
         if (iova < kCrashWindows[slot].start || iova - kCrashWindows[slot].start >= kCrashWindows[slot].bytes) continue;
         if (&native_adreno_client_log) for (auto &r : native_adreno_client_log) if (r.name[0] && r.slot == slot) return r.name;
         return "slot-unnamed";
@@ -1527,7 +1531,7 @@ void crashReport(const char *why) {
     crashFreed("far", far);
     crashFreed("ib1", ib1);
     crashFreed("ib2", ib2);
-    for (unsigned slot = 0; slot < 4; ++slot) {
+    for (unsigned slot = 0; slot < 11; ++slot) {
         const char *name = "-";
         if (&native_adreno_client_log) for (auto &r : native_adreno_client_log) if (r.name[0] && r.slot == slot) name = r.name;
         printf("GPUCRASH slot %u %llx+%llx %s\n", slot, (unsigned long long)kCrashWindows[slot].start,
