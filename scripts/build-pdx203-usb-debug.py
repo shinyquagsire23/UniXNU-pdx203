@@ -29,10 +29,11 @@ def tool(name):
 def main():
     if not (MODULE / 'scripts/build.py').is_file():
         raise SystemExit('build-pdx203-usb-debug: %s missing; run git submodule update --init in the device repository' % MODULE)
-    # changes to the module ride as patches (patches/modules/QcomXnuUsbDebug/*.patch in the UniXNU fork, which the build tree links, in name order), as
+    # changes to the module ride as patches (patches/modules/QcomXnuUsbDebug/*.patch of this device repository, the module's
+    # parent's parent, in name order; 0002 the large screenshot chunks), as
     # NativeMobileDisplay's do (build-pdx203-legacy-display.py): applied as a stack, the applied part being the longest prefix whose last
     # patch reverses. 0001 adds the board input verbs (TOUCH, KEY) of the remote-control rig. One that applies neither way stops the build.
-    patches = sorted((ROOT / 'patches/modules/QcomXnuUsbDebug').glob('*.patch'))
+    patches = sorted((MODULE.resolve().parents[1] / 'patches/modules/QcomXnuUsbDebug').glob('*.patch'))
     applied = 0
     for k in range(len(patches), 0, -1):
         if subprocess.run(['git', '-C', str(MODULE), 'apply', '--reverse', '--check', str(patches[k - 1].resolve())],

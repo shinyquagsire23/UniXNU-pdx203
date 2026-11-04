@@ -620,7 +620,11 @@ extern "C" void sheng_adsp_probe(void);
 extern "C" void pdx203_audio_probe(void);
 // the QCA6390 WiFi chip on PCIe0 (package/Pdx203Wifi.cpp; pdx203-wifi=<stage>): its rails go through the ADSP thread's RPMh helper
 extern "C" void pdx203_wifi_probe(void);
+extern "C" void pdx203_shot_register(void);
 void native_legacy_display_late_probe(void) {
+    // the rig's screenshot provider: flipReady() registers it on the page flip path, which only a display driver with the board
+    // flip hooks calls; register it here as well (both paths register once, the capture reads the framebuffer when asked)
+    pdx203_shot_register();
     pdx203_cpufreq_start();
     pdx203_gpu_start();
     native_keystore_probe();
@@ -838,10 +842,15 @@ int shotCapture(void *, uint8_t *rgb, size_t capacity, uint32_t *width, uint32_t
     *width = w; *height = h;
     return 1;
 }
-bool flipReady() {
-    if (gFlipState >= 0) return gFlipState == 1;
+}  // namespace
+extern "C" void pdx203_shot_register(void) {
     static bool shotRegistered;
     if (!shotRegistered && &qcom_usb_debug_register_screenshot) {shotRegistered = true; qcom_usb_debug_register_screenshot(shotCapture, nullptr);}
+}
+namespace {
+bool flipReady() {
+    if (gFlipState >= 0) return gFlipState == 1;
+    pdx203_shot_register();
     unsigned on = 0;
     PE_parse_boot_argn("pdx203-flip", &on, sizeof on);
     auto off = [](int why) {gFlipState = why; native_legacy_flip_stats[0] = (uint32_t)why; return false;};

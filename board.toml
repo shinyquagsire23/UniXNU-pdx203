@@ -171,6 +171,10 @@ kernel_args = [
   "pmap-ram-wc=1",
   # persistent Data in the store window at the end of userdata: 2 reads and writes. the 64 GiB seed is served from it
   "sheng-data-persist=2",
+  # cpu clocks: vote every epss frequency domain its highest non-turbo level (package/CpuFreqProbe.cpp, alioth's, the same sm8250
+  # windows). "PDX203 CPUFREQ" rows on the usb log. 3 votes only; 4 also kept threads on the A77s, which the format 1 kernel ran as
+  # one cluster. this one has the E/P clusters of dts/pdx203.dts, so the scheduler is left to place threads itself.
+  "sheng-cpufreq=3",
 ]
 # Fixups of signed text beyond the OS profile's four (its [payload] text_fixups is replaced, so they are repeated here).
 text_fixups = [

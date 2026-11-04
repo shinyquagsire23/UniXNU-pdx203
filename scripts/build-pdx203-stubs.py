@@ -22,7 +22,8 @@ UNITS = [
     ('Pdx203Stubs.c', 'osfmk/DEVELOPMENT/startup.o.json', ['-Wall', '-Wextra', '-Werror']),
     # carried unchanged from sheng, so it is held to the kernel's own warning set rather than -Wextra
     ('BootWatchdogPolicy.c', 'bsd/DEVELOPMENT/kern_exec.o.json', ['-Werror=implicit-function-declaration']),
-    # Pdx203FaultLog.c (the exit log's crash detail) returns with patches/xnu/zzzzzzzzz-exit-log.patch
+    # the crash detail of the exit log (patches/xnu/zzzzzzzzz-exit-log.patch: saved user state, shared-region slide): osfmk-private types
+    ('Pdx203FaultLog.c', 'osfmk/DEVELOPMENT/startup.o.json', ['-Wall', '-Werror']),
 ]
 
 

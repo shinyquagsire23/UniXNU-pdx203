@@ -1,0 +1,264 @@
+diff --git a/kernel/QcomUsbControl.h b/kernel/QcomUsbControl.h
+index 2571925..68d9eaa 100644
+--- a/kernel/QcomUsbControl.h
++++ b/kernel/QcomUsbControl.h
+@@ -25,14 +25,21 @@ enum sxnu_control_verb {
+     SXNU_CONTROL_VERB_STATUS,
+     SXNU_CONTROL_VERB_REBOOT,
+     SXNU_CONTROL_VERB_SCREENSHOT,
+-    SXNU_CONTROL_VERB_SHOTNEXT
++    SXNU_CONTROL_VERB_SHOTNEXT,
++    /* Board input (pdx203): TOUCH:<d|m|u>,<x>,<y> with x and y in 1/10000 of the panel's width and height, KEY:<name>,<d|u>.
++     * The arguments follow the verb after a colon and are handed to the board unparsed (qcom_usb_debug_board_input). */
++    SXNU_CONTROL_VERB_TOUCH,
++    SXNU_CONTROL_VERB_KEY
+ };
++#define SXNU_CONTROL_VERB_LAST SXNU_CONTROL_VERB_KEY
++#define SXNU_CONTROL_ARGS_BYTES 48u
+ 
+ struct sxnu_control_frame {
+     uint64_t session;
+     uint32_t seq;
+     uint32_t crc;
+     enum sxnu_control_verb verb;
++    char args[SXNU_CONTROL_ARGS_BYTES];   /* NUL-terminated; empty for verbs without arguments */
+ };
+ 
+ struct sxnu_control_parser {
+@@ -115,6 +122,9 @@ sxnu_control_parse_verb(const uint8_t *text, size_t bytes)
+     if (bytes == 8u && text[0] == 'S' && text[1] == 'H' && text[2] == 'O' &&
+         text[3] == 'T' && text[4] == 'N' && text[5] == 'E' && text[6] == 'X' &&
+         text[7] == 'T') return SXNU_CONTROL_VERB_SHOTNEXT;
++    if (bytes == 5u && text[0] == 'T' && text[1] == 'O' && text[2] == 'U' && text[3] == 'C' &&
++        text[4] == 'H') return SXNU_CONTROL_VERB_TOUCH;
++    if (bytes == 3u && text[0] == 'K' && text[1] == 'E' && text[2] == 'Y') return SXNU_CONTROL_VERB_KEY;
+     return SXNU_CONTROL_VERB_INVALID;
+ }
+ 
+@@ -128,6 +138,8 @@ sxnu_control_verb_name(enum sxnu_control_verb verb)
+     case SXNU_CONTROL_VERB_REBOOT: return "REBOOT";
+     case SXNU_CONTROL_VERB_SCREENSHOT: return "SCREENSHOT";
+     case SXNU_CONTROL_VERB_SHOTNEXT: return "SHOTNEXT";
++    case SXNU_CONTROL_VERB_TOUCH: return "TOUCH";
++    case SXNU_CONTROL_VERB_KEY: return "KEY";
+     default: return "";
+     }
+ }
+@@ -179,15 +191,17 @@ sxnu_control_parser_feed(struct sxnu_control_parser *parser, uint8_t byte,
+ }
+ 
+ /* Strict grammar:
+- * SXNU1 <16hex session> <8hex seq> <HELLO|PING|STATUS|REBOOT|SCREENSHOT|SHOTNEXT> <8hex crc>
++ * SXNU1 <16hex session> <8hex seq> <HELLO|PING|STATUS|REBOOT|SCREENSHOT|SHOTNEXT|TOUCH:args|KEY:args> <8hex crc>
++ * Only TOUCH and KEY take arguments (printable ASCII after a colon, no spaces, below SXNU_CONTROL_ARGS_BYTES).
+  * CRC-32/IEEE covers every byte before the space immediately before the CRC. */
+ static inline int
+ sxnu_control_parse(const char *line, size_t bytes, struct sxnu_control_frame *frame)
+ {
+     const uint8_t *p = (const uint8_t *)line;
+-    size_t cursor = 5u, verb_start, verb_bytes, crc_start;
++    size_t cursor = 5u, verb_start, verb_bytes, crc_start, name_bytes, args_bytes = 0;
+     uint64_t session, seq, crc;
+     enum sxnu_control_verb verb;
++    char args[SXNU_CONTROL_ARGS_BYTES];
+ 
+     if (!line || !frame || bytes < 6u || bytes > SXNU_CONTROL_LINE_BYTES) return 0;
+     if (p[0] != 'S' || p[1] != 'X' || p[2] != 'N' || p[3] != 'U' || p[4] != '1' ||
+@@ -205,8 +219,21 @@ sxnu_control_parse(const char *line, size_t bytes, struct sxnu_control_frame *fr
+     while (cursor < bytes && p[cursor] != (uint8_t)' ') cursor++;
+     if (cursor == verb_start || cursor >= bytes) return 0;
+     verb_bytes = cursor - verb_start;
+-    verb = sxnu_control_parse_verb(p + verb_start, verb_bytes);
++    name_bytes = 0;
++    while (name_bytes < verb_bytes && p[verb_start + name_bytes] != (uint8_t)':') name_bytes++;
++    verb = sxnu_control_parse_verb(p + verb_start, name_bytes);
+     if (verb == SXNU_CONTROL_VERB_INVALID) return 0;
++    if (name_bytes < verb_bytes) {
++        if (verb != SXNU_CONTROL_VERB_TOUCH && verb != SXNU_CONTROL_VERB_KEY) return 0;
++        args_bytes = verb_bytes - name_bytes - 1u;
++        if (!args_bytes || args_bytes >= SXNU_CONTROL_ARGS_BYTES) return 0;
++        for (size_t i = 0; i < args_bytes; i++) {
++            uint8_t c = p[verb_start + name_bytes + 1u + i];
++            if (c < 0x21u || c > 0x7eu) return 0;
++            args[i] = (char)c;
++        }
++    } else if (verb == SXNU_CONTROL_VERB_TOUCH || verb == SXNU_CONTROL_VERB_KEY) return 0;
++    args[args_bytes] = 0;
+     cursor++;
+     crc_start = cursor;
+     if (crc_start > bytes || bytes - crc_start != SXNU_CONTROL_CRC_HEX) return 0;
+@@ -217,6 +244,7 @@ sxnu_control_parse(const char *line, size_t bytes, struct sxnu_control_frame *fr
+     frame->seq = (uint32_t)seq;
+     frame->crc = (uint32_t)crc;
+     frame->verb = verb;
++    for (size_t i = 0; i <= args_bytes; i++) frame->args[i] = args[i];
+     return 1;
+ }
+ 
+@@ -239,7 +267,7 @@ sxnu_control_accept(const struct sxnu_control_state *state,
+ {
+     if (!state || !frame) return SXNU_CONTROL_VERB_INVALID;
+     if (frame->verb < SXNU_CONTROL_VERB_HELLO ||
+-        frame->verb > SXNU_CONTROL_VERB_SHOTNEXT) return SXNU_CONTROL_VERB_INVALID;
++        frame->verb > SXNU_CONTROL_VERB_LAST) return SXNU_CONTROL_VERB_INVALID;
+     if (frame->verb == SXNU_CONTROL_VERB_HELLO)
+         return frame->session == 0 && frame->seq == 0 ?
+                SXNU_CONTROL_VERB_HELLO : SXNU_CONTROL_VERB_INVALID;
+@@ -255,7 +283,7 @@ sxnu_control_commit(struct sxnu_control_state *state,
+                     enum sxnu_control_verb accepted)
+ {
+     if (!state || !frame || accepted < SXNU_CONTROL_VERB_HELLO ||
+-        accepted > SXNU_CONTROL_VERB_SHOTNEXT || frame->verb != accepted) return 0;
++        accepted > SXNU_CONTROL_VERB_LAST || frame->verb != accepted) return 0;
+     if (accepted == SXNU_CONTROL_VERB_HELLO)
+         return frame->session == 0 && frame->seq == 0;
+     if (!state->session || frame->seq == 0 || frame->session != state->session ||
+diff --git a/kernel/QcomXnuUsbDebug.c b/kernel/QcomXnuUsbDebug.c
+index 1c15d4b..71053f2 100644
+--- a/kernel/QcomXnuUsbDebug.c
++++ b/kernel/QcomXnuUsbDebug.c
+@@ -1113,6 +1113,9 @@ static size_t control_reply_reboot(char *reply, size_t capacity,
+         !sxnu_control_writer_text(&writer, reason)) return 0;
+     return sxnu_control_reply_finish(&writer);
+ }
++/* The board's input injection (pdx203 package/Pdx203Rig.cpp): verb "TOUCH" or "KEY" with its argument text. Returns 0 when done,
++ * otherwise a short reason in out. Worker thread context: it may take a lock, it must not log through USB. */
++extern int qcom_usb_debug_board_input(const char *verb, const char *args, char *out, size_t capacity) __attribute__((weak_import));
+ static void control_handle_frame(const struct sxnu_control_frame *frame,
+                                  const struct qcom_usb_debug_status *status,
+                                  uint32_t generation)
+@@ -1203,6 +1206,18 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
+             reboot_accepted = 1;
+         }
+         break;
++    case SXNU_CONTROL_VERB_TOUCH:
++    case SXNU_CONTROL_VERB_KEY: {
++        char why[40] = "";
++        int rc;
++        if (!&qcom_usb_debug_board_input)
++            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "noinput");
++        else if ((rc = qcom_usb_debug_board_input(sxnu_control_verb_name(accepted), frame->args, why, sizeof(why))) != 0)
++            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", why[0] ? why : "refused");
++        else
++            reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "OK", "done");
++        break;
++    }
+     default:
+         return;
+     }
+diff --git a/scripts/build.py b/scripts/build.py
+index 17e3e05..d2f531c 100644
+--- a/scripts/build.py
++++ b/scripts/build.py
+@@ -124,7 +124,7 @@ def main():
+                    # Optional: the board's own reset path, which maps the IMEM window with
+                    # the attributes the bootloader accepts. Weak, so a board without it
+                    # still links and falls back to this module's plain PSCI reset.
+-                   '_boot_reset_bootloader'}
++                   '_boot_reset_bootloader', '_qcom_usb_debug_board_input'}
+         if external - allowed:
+             raise RuntimeError('unexpected XNU imports: ' + str(sorted(external - allowed)))
+         required = {'_qcom_usb_debug_' + s for s in
+diff --git a/scripts/xnu_usb_control.py b/scripts/xnu_usb_control.py
+index 7613958..693bdc8 100644
+--- a/scripts/xnu_usb_control.py
++++ b/scripts/xnu_usb_control.py
+@@ -12,7 +12,10 @@ import zlib
+ FRAME_BYTES = 128
+ REPLY_BYTES = 512
+ WORK_BYTES = 256
+-VERBS = ('HELLO', 'PING', 'STATUS', 'REBOOT', 'SCREENSHOT', 'SHOTNEXT')
++VERBS = ('HELLO', 'PING', 'STATUS', 'REBOOT', 'SCREENSHOT', 'SHOTNEXT', 'TOUCH', 'KEY')
++# Board input (pdx203): TOUCH:<d|m|u>,<x>,<y> (x, y in 1/10000 of the panel), KEY:<name>,<d|u>. Only these take arguments.
++ARG_VERBS = ('TOUCH', 'KEY')
++ARGS = re.compile(rb'[!-~]{1,47}')
+ FIELD_KEYS = frozenset((
+     'session', 'last_seq', 'control', 'rx', 'rxo', 'tx', 'poll', 'usb',
+     'er', 'bp', 'bo', 'ev', 'gen', 'rej', 'state', 'result',
+@@ -81,9 +84,11 @@ def _crc_parts(line, prefix):
+     return line[:split], expected
+ 
+ 
+-def encode_request(verb, session=0, seq=0):
++def encode_request(verb, session=0, seq=0, args=None):
+     if verb not in VERBS:
+         raise ControlError('unknown control verb')
++    if (verb in ARG_VERBS) != bool(args) or (args and not ARGS.fullmatch(args.encode('ascii'))):
++        raise ControlError('arguments are required by TOUCH and KEY only, printable and short')
+     session = _integer(session, (1 << 64) - 1, 'session')
+     seq = _integer(seq, (1 << 32) - 1, 'sequence')
+     if verb == 'HELLO':
+@@ -91,7 +96,8 @@ def encode_request(verb, session=0, seq=0):
+             raise ControlError('HELLO requires session zero and sequence zero')
+     elif not session or not seq:
+         raise ControlError('non-HELLO commands require nonzero session and sequence')
+-    prefix = f'SXNU1 {session:016x} {seq:08x} {verb}'.encode('ascii')
++    token = f'{verb}:{args}' if args else verb
++    prefix = f'SXNU1 {session:016x} {seq:08x} {token}'.encode('ascii')
+     frame = prefix + f' {crc32(prefix):08x}\n'.encode('ascii')
+     if len(frame) > FRAME_BYTES:
+         raise ControlError('encoded request exceeds the fixed frame limit')
+@@ -110,8 +116,11 @@ def parse_request(frame):
+         verb = parts[3].decode('ascii')
+     except UnicodeDecodeError as exc:
+         raise ControlError('request verb is not ASCII') from exc
++    verb, colon, args = verb.partition(':')
+     if verb not in VERBS:
+         raise ControlError('unknown control verb')
++    if (verb in ARG_VERBS) != bool(colon) or (colon and not ARGS.fullmatch(args.encode('ascii'))):
++        raise ControlError('arguments are required by TOUCH and KEY only, printable and short')
+     session, seq = int(parts[1], 16), int(parts[2], 16)
+     if verb == 'HELLO':
+         if session or seq:
+@@ -161,7 +170,7 @@ def validate_reply(reply):
+     if reply.verb == 'HELLO':
+         if reply.status != 'OK' or reply.session == 0:
+             raise ControlError('HELLO reply is not a successful kernel session announcement')
+-    elif reply.verb in ('REBOOT', 'SCREENSHOT', 'SHOTNEXT'):
++    elif reply.verb in ('REBOOT', 'SCREENSHOT', 'SHOTNEXT', 'TOUCH', 'KEY'):
+         if 'state' not in reply.fields:
+             raise ControlError('command reply lacks its state')
+     elif reply.status != 'OK' or not required[reply.verb] <= set(reply.fields):
+@@ -239,8 +248,8 @@ class UnixControlClient:
+                 return validate_reply(parse_reply(bytes(received)))
+         raise ControlError('control socket reply exceeds the fixed limit')
+ 
+-    def request(self, verb, session=0, seq=0):
+-        return self.request_frame(encode_request(verb, session, seq))
++    def request(self, verb, session=0, seq=0, args=None):
++        return self.request_frame(encode_request(verb, session, seq, args))
+ 
+     def close(self):
+         self.socket.close()
+@@ -265,7 +274,7 @@ def _hello_fields(reply):
+     return kernel_session, last_seq
+ 
+ 
+-def execute_cli_request(socket_path, verb, timeout=5.0):
++def execute_cli_request(socket_path, verb, timeout=5.0, args=None):
+     if verb not in VERBS:
+         raise ControlError('unknown control verb')
+     with UnixControlClient(socket_path, timeout) as client:
+@@ -279,7 +288,7 @@ def execute_cli_request(socket_path, verb, timeout=5.0):
+     # connection has been closed; issue the sole state-changing frame on a new
+     # one and never retry it.
+     with UnixControlClient(socket_path, timeout) as client:
+-        reply = client.request(verb, kernel_session, last_seq + 1)
++        reply = client.request(verb, kernel_session, last_seq + 1, args)
+     if (reply.session != kernel_session or reply.seq != last_seq + 1 or
+             reply.verb != verb):
+         raise ControlError('reply does not match the issued command')
+@@ -292,11 +301,12 @@ def main(argv=None):
+                         help='collector-created private Unix control socket')
+     parser.add_argument('--timeout', type=float, default=5.0)
+     parser.add_argument('verb', choices=tuple(v.lower() for v in VERBS))
++    parser.add_argument('args', nargs='?', help='TOUCH/KEY arguments, e.g. d,5000,5000 or power,d')
+     args = parser.parse_args(argv)
+     if not args.timeout > 0:
+         parser.error('--timeout must be positive')
+     try:
+-        reply = execute_cli_request(args.socket, args.verb.upper(), args.timeout)
++        reply = execute_cli_request(args.socket, args.verb.upper(), args.timeout, args.args)
+     except (ControlError, OSError) as exc:
+         print(json.dumps({'ok': False, 'verb': args.verb.upper(), 'error': str(exc)}), file=sys.stderr)
+         return 2

@@ -1,0 +1,18 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 9baf9eb..7a5771d 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -2002,6 +2002,13 @@ cleanup_rosetta_fp:
+ 	p->p_acflag &= ~AFORK;
+ 
+ 	set_proc_name(imgp, p);
++	/* bring-up exec log (patches/xnu/zzzzzzzzzb-exec-log.patch): with EXITLOG it gives the set of live processes */
++	/* t=: milliseconds since boot, for timing the boot from the USB log */
++	if (strncmp(p->p_name, "xpcproxy", sizeof("xpcproxy")) != 0) {
++		struct timeval up_;
++		microuptime(&up_);
++		printf("EXECLOG %s[%d] %.160s t=%ld\n", p->p_name, proc_getpid(p), imgp->ip_strings ? imgp->ip_strings : "", (long)(up_.tv_sec * 1000 + up_.tv_usec / 1000));
++	}
+ 
+ #if CONFIG_SECLUDED_MEMORY
+ 	if (secluded_for_apps &&

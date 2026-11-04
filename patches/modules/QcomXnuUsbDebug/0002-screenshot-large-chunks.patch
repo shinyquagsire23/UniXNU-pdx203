@@ -1,0 +1,172 @@
+diff --git a/include/QcomUsbScreenshot.h b/include/QcomUsbScreenshot.h
+index bd591d9..e3a5f24 100644
+--- a/include/QcomUsbScreenshot.h
++++ b/include/QcomUsbScreenshot.h
+@@ -6,7 +6,9 @@
+ #ifndef QUD_SCREENSHOT_MAX_BYTES
+ #define QUD_SCREENSHOT_MAX_BYTES (16u * 1024u * 1024u)
+ #endif
+-#define QUD_SCREENSHOT_CHUNK 192u
++/* 3 KiB a SHOTNEXT reply (6 KiB of hex): the control worker answers one request per 5 ms pass, and 192-byte chunks made a busy frame
++ * (2.8 MB of RLE) take 2 1/4 minutes. */
++#define QUD_SCREENSHOT_CHUNK 3072u
+ #define QUD_SCREENSHOT_MAX_DIMENSION 4096u
+ struct qcom_usb_screenshot_info {
+     uint32_t width, height, bytes, encoded_bytes, crc32, frame;
+diff --git a/kernel/QcomUsbControl.h b/kernel/QcomUsbControl.h
+index 68d9eaa..e995b4d 100644
+--- a/kernel/QcomUsbControl.h
++++ b/kernel/QcomUsbControl.h
+@@ -12,7 +12,7 @@
+ /* The newline is part of the 128-byte request-frame ceiling. */
+ #define SXNU_CONTROL_FRAME_BYTES 128u
+ #define SXNU_CONTROL_LINE_BYTES 127u
+-#define SXNU_CONTROL_REPLY_BYTES 512u
++#define SXNU_CONTROL_REPLY_BYTES 6400u   /* a SHOTNEXT chunk in hex and its header; replies live in static storage */
+ #define SXNU_CONTROL_WORK_BYTES 256u
+ #define SXNU_CONTROL_SESSION_HEX 16u
+ #define SXNU_CONTROL_SEQ_HEX 8u
+diff --git a/kernel/QcomXnuUsbDebug.c b/kernel/QcomXnuUsbDebug.c
+index 71053f2..2e4b200 100644
+--- a/kernel/QcomXnuUsbDebug.c
++++ b/kernel/QcomXnuUsbDebug.c
+@@ -1022,7 +1022,7 @@ static void control_rotate_session_owned(void)
+ }
+ static size_t control_reply_queue(const char *reply, size_t bytes)
+ {
+-    uint8_t wire[SXNU_CONTROL_REPLY_BYTES + 1u];
++    static uint8_t wire[SXNU_CONTROL_REPLY_BYTES + 1u];   /* filled and queued under the lock */
+     uint64_t flags;
+     int queued = 0;
+     if (!reply || !bytes || bytes > SXNU_CONTROL_REPLY_BYTES || !acquire(&flags)) return 0;
+@@ -1038,6 +1038,16 @@ static size_t control_reply_queue(const char *reply, size_t bytes)
+     if (queued) (void)__atomic_add_fetch(&control_reply_count, 1u, __ATOMIC_RELAXED);
+     return queued ? bytes : 0;
+ }
++/* Free room in the transmit ring now (0 when USB is not active): a SHOTNEXT chunk is sized to it, as a reply that does not fit is dropped. */
++static size_t control_tx_room(void)
++{
++    uint64_t flags;
++    size_t room = 0;
++    if (!acquire(&flags)) return 0;
++    if (native.status.phase == QCOM_USB_DEBUG_ACTIVE) room = DWC3_TX_BYTES - dwc3_queued(native.core);
++    release(flags);
++    return room;
++}
+ static size_t control_reply_hello(char *reply, size_t capacity,
+                                   const struct sxnu_control_frame *frame)
+ {
+@@ -1121,7 +1131,8 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
+                                  uint32_t generation)
+ {
+     enum sxnu_control_verb accepted = sxnu_control_accept(&usb_control_context.state, frame);
+-    char reply[SXNU_CONTROL_REPLY_BYTES];
++    /* Static: the control worker (qcom_usb_debug_poll) is the only caller, and a 6 KiB reply would not fit its stack comfortably. */
++    static char reply[SXNU_CONTROL_REPLY_BYTES];
+     size_t reply_bytes = 0;
+     int queued = 0;
+     int reboot_accepted = 0;
+@@ -1172,13 +1183,20 @@ static void control_handle_frame(const struct sxnu_control_frame *frame,
+     case SXNU_CONTROL_VERB_SHOTNEXT: {
+         struct qcom_usb_screenshot_info info;
+         struct sxnu_control_writer writer;
+-        uint8_t chunk[QUD_SCREENSHOT_CHUNK];
++        static uint8_t chunk[QUD_SCREENSHOT_CHUNK];
+         uint32_t offset;
+         if (!qcom_usb_shot_info(&info)) {
+             reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "noimage");
+             break;
+         }
+-        shot_bytes = qcom_usb_shot_peek(chunk, sizeof(chunk), &offset);
++        {
++            /* Header and CRC take under 128 bytes; the rest of the room carries hex, two characters a byte. */
++            size_t room = control_tx_room();
++            size_t fit = room > 256u ? (room - 256u) / 2u : 0u;
++            if (fit > sizeof(chunk)) fit = sizeof(chunk);
++            if (fit < 192u) fit = 192u;
++            shot_bytes = qcom_usb_shot_peek(chunk, fit, &offset);
++        }
+         if (!shot_bytes) {
+             reply_bytes = control_reply_reboot(reply, sizeof(reply), frame, "ERR", "done");
+             break;
+@@ -1334,7 +1352,7 @@ void qcom_usb_debug_control_reboot_failed(int result)
+ {
+     struct sxnu_control_frame frame;
+     struct sxnu_control_writer writer;
+-    char reply[SXNU_CONTROL_REPLY_BYTES];
++    char reply[256];   /* a short ERR state reply */
+     unsigned int requested;
+     requested = __atomic_exchange_n(&control_reboot_requested, 0u, __ATOMIC_ACQ_REL);
+     __atomic_store_n(&control_reboot_taken, 0u, __ATOMIC_RELEASE);
+diff --git a/scripts/screenshot.py b/scripts/screenshot.py
+index 8d02f10..a727156 100644
+--- a/scripts/screenshot.py
++++ b/scripts/screenshot.py
+@@ -75,7 +75,7 @@ def receive_snapshot(first, next_reply, deadline):
+         if (reply.status != 'OK' or fields.get('state') != 'data' or
+                 reply.session != first.session or reply.verb != 'SHOTNEXT' or
+                 received_frame != frame or offset != len(data) or
+-                not 0 < len(chunk) <= 192 or len(data) + len(chunk) > encoded):
++                not 0 < len(chunk) <= 3072 or len(data) + len(chunk) > encoded):
+             raise ControlError('stale, missing, repeated or oversized snapshot chunk')
+         data.extend(chunk)
+     rgb = decode_pixels(data, width, height, encoding, crc)
+diff --git a/scripts/xnu_usb_control.py b/scripts/xnu_usb_control.py
+index 693bdc8..feacb1a 100644
+--- a/scripts/xnu_usb_control.py
++++ b/scripts/xnu_usb_control.py
+@@ -10,7 +10,7 @@ import sys
+ import zlib
+ 
+ FRAME_BYTES = 128
+-REPLY_BYTES = 512
++REPLY_BYTES = 6400   # kernel/QcomUsbControl.h: a 3 KiB SHOTNEXT chunk in hex
+ WORK_BYTES = 256
+ VERBS = ('HELLO', 'PING', 'STATUS', 'REBOOT', 'SCREENSHOT', 'SHOTNEXT', 'TOUCH', 'KEY')
+ # Board input (pdx203): TOUCH:<d|m|u>,<x>,<y> (x, y in 1/10000 of the panel), KEY:<name>,<d|u>. Only these take arguments.
+diff --git a/tests/test_usb_control.c b/tests/test_usb_control.c
+index 3e0b8d8..dc5a758 100644
+--- a/tests/test_usb_control.c
++++ b/tests/test_usb_control.c
+@@ -241,7 +241,7 @@ test_reply_and_budget(void)
+     size_t bytes, crc_offset;
+     uint64_t parsed_crc;
+ 
+-    assert(SXNU_CONTROL_FRAME_BYTES == 128u && SXNU_CONTROL_REPLY_BYTES == 512u);
++    assert(SXNU_CONTROL_FRAME_BYTES == 128u && SXNU_CONTROL_REPLY_BYTES == 6400u);
+     assert(SXNU_CONTROL_WORK_BYTES == 256u);
+     sxnu_control_writer_init(&writer, reply, sizeof(reply));
+     assert(sxnu_control_reply_start(&writer, UINT64_C(0x1122334455667788), 3u,
+@@ -260,7 +260,7 @@ test_reply_and_budget(void)
+                                      " this status deliberately exceeds the small reply buffer"));
+     assert(writer.failed);
+     assert(sxnu_control_reply_finish(&writer) == 0);
+-    puts("PASS: 512-byte status reply is CRC-correct; fixed frame/work budgets and truncation are enforced");
++    puts("PASS: status reply is CRC-correct; fixed frame/work budgets and truncation are enforced");
+ }
+ 
+ int main(void)
+diff --git a/tests/test_usb_screenshot_control.c b/tests/test_usb_screenshot_control.c
+index f05eda2..0d61724 100644
+--- a/tests/test_usb_screenshot_control.c
++++ b/tests/test_usb_screenshot_control.c
+@@ -27,7 +27,10 @@ static size_t control_reply_ping(char *p, size_t n, const struct sxnu_control_fr
+ static size_t control_reply_status(char *p, size_t n, const struct sxnu_control_frame *f,
+     const struct qcom_usb_debug_status *s)
+ { return control_reply_ping(p, n, f, s); }
++static size_t control_tx_room(void) { return 16384u; }
+ #include "control-handler.inc"
++int qcom_usb_debug_board_input(const char *verb, const char *args, char *out, size_t capacity)
++{ (void)verb; (void)args; (void)out; (void)capacity; return 1; }
+ static int capture(void *cookie, uint8_t *rgb, size_t capacity, uint32_t *w, uint32_t *h)
+ {
+     (void)cookie; assert(capacity >= 24); ++captures;
+@@ -38,7 +41,7 @@ static int capture(void *cookie, uint8_t *rgb, size_t capacity, uint32_t *w, uin
+ }
+ static void send_request(enum sxnu_control_verb verb, uint32_t seq)
+ {
+-    const struct sxnu_control_frame frame = {7, seq, 0, verb};
++    const struct sxnu_control_frame frame = {7, seq, 0, verb, ""};
+     struct qcom_usb_debug_status status = {0};
+     control_handle_frame(&frame, &status, 1);
+ }

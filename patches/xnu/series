@@ -7,8 +7,13 @@ zzzzzzz-offline-owner-root-auth-bypass.patch
 # The CDC-ACM kernel log over the DWC3 (drivers/QcomXnuUsbDebug): the console tee and its worker thread.
 zzzzzzzz-qcom-usb-debug-console.patch
 zzzzzzzz-qcom-usb-debug-worker.patch
+# EXITLOG: every process exit with its reason, t=<ms since boot> and, for a signal death, the crash detail
+# (package/Pdx203FaultLog.c: PC, LR, fault address, ESR, shared-region slide, frame-pointer backtrace).
+zzzzzzzzz-exit-log.patch
 # sheng's launchd policy (package/BootWatchdogPolicy.c) without the boot progress layer.
 zzzzzzzzza-launch-policy.patch
+# EXECLOG: every exec with t=<ms since boot> (xpcproxy left out).
+zzzzzzzzzb-exec-log.patch
 # pmap-ram-wc=1: RAM asked for as Device memory is mapped Normal non-cacheable.
 zzzzzzzzzc-pmap-ram-wc.patch
 # A stackshot fills no more wait/turnstile entries than it counted (a panic seen with eight CPUs).

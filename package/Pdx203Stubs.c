@@ -113,3 +113,5 @@ __attribute__((weak)) void native_hid_orientation_step(intptr_t step) { (void)st
 /* the board halt/restart hook halt_all_cpus calls first (the fork's zzy-zhalt-board.patch); without it the buttons' reset
  * path finds it NULL and falls back */
 void (*volatile native_board_halt_restart)(int reboot) __attribute__((weak)) = 0;
+/* the display work loop's gate lanes (the fork's NativeMobileDisplay 0002 patch), which the exit log's freeze rows print; none here */
+__attribute__((weak)) unsigned native_legacy_gate_dump(char *out, unsigned cap) { if (out && cap) out[0] = 0; return 0; }
