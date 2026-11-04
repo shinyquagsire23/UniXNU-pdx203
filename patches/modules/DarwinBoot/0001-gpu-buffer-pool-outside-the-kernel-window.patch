@@ -1,0 +1,78 @@
+From f6016bbdbdf994dbda3afba0a587cb11d6f32bf4 Mon Sep 17 00:00:00 2001
+From: shinyquagsire23 <mtinc2@gmail.com>
+Date: Wed, 4 Nov 2026 13:55:16 -0700
+Subject: [PATCH] feat(boot): reserve a GPU buffer pool outside the kernel
+ window (/chosen/darwinboot-gpu-pool)
+
+Ported from the pdx203 fork (7c216fe) onto upstream: the tree asks with base
+0 and a size; once the kernel window is placed the loader reserves that much
+RAM outside it, top down, 64 MiB less at a time down to 64 MiB, and writes the
+base and size it got. The GPU driver keeps its buffer pool there at the same
+size every boot: a contiguous allocation inside the window came up at 32 to
+512 MiB depending on fragmentation (pdx203, 2026-11-02).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Wby9vE95hj6m7p14a2x9aY
+---
+ DarwinBootPkg/Driver/DarwinBoot.c | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/DarwinBootPkg/Driver/DarwinBoot.c b/DarwinBootPkg/Driver/DarwinBoot.c
+index 3b6cafc..2c04a26 100644
+--- a/DarwinBootPkg/Driver/DarwinBoot.c
++++ b/DarwinBootPkg/Driver/DarwinBoot.c
+@@ -265,6 +265,13 @@ ParseKernel (CONST UINT8 *Data, UINTN Size, KERNEL *Kernel)
+   return Found ? EFI_SUCCESS : EFI_LOAD_ERROR;
+ }
+ 
++//
++// /chosen/darwinboot-gpu-pool (16 bytes: physical base, bytes). The tree asks with base 0 and the size it wants; once the kernel window is
++// placed the loader reserves that much RAM outside it (top down, 64 MiB less at a time down to 64 MiB) and writes the base and the size it got, 0 for
++// none. The GPU driver keeps its buffer pool there, the same size at every boot: a contiguous allocation inside the window came up at
++// 32 to 512 MiB depending on how the boot had fragmented memory (pdx203, 2026-11-02).
++//
++STATIC UINTN mGpuPoolOffset = MAX_UINTN;
+ STATIC
+ BOOLEAN
+ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN ParentPath, UINTN *RamdiskOffset, UINTN *TrustCacheOffset, UINTN *AddonOffset, UINTN *PolicyOffset, UINT64 *WindowSize, BOOLEAN *KeepPacked)
+@@ -326,6 +333,10 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
+       if ((PolicyCandidate != MAX_UINTN) || (Length != 16)) { return FALSE; }
+       PolicyCandidate = *Offset;
+     }
++    if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "darwinboot-gpu-pool") == 0) {
++      if ((mGpuPoolOffset != MAX_UINTN) || (Length != 16)) { return FALSE; }
++      mGpuPoolOffset = *Offset;
++    }
+     if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "darwinboot-memory-size") == 0) {
+       if ((MemoryCandidate != MAX_UINTN) || (Length != 8)) { return FALSE; }
+       MemoryCandidate = *Offset;
+@@ -655,6 +666,7 @@ Boot (
+   PolicyOffset = MAX_UINTN;
+   WindowSize = 0;
+   KeepPacked = FALSE;
++  mGpuPoolOffset = MAX_UINTN;
+   if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &PolicyOffset, &WindowSize, &KeepPacked) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
+   if (KeepPacked && (!RamdiskPacked || (RamdiskOffset == MAX_UINTN))) { Status = EFI_COMPROMISED_DATA; goto Fail; }
+   if (WindowSize == 0) { WindowSize = WINDOW_SIZE; }
+@@ -721,6 +733,18 @@ Boot (
+   if (EFI_ERROR (Status)) { goto Fail; }
+   Status = AllocateWindow (&Kernel, WindowSize, &Address);
+   if (EFI_ERROR (Status)) { goto Fail; }
++  if ((mGpuPoolOffset != MAX_UINTN) && (U64 ((UINT8 *)Tree + mGpuPoolOffset) == 0)) {
++    UINT64 Want = U64 ((UINT8 *)Tree + mGpuPoolOffset + 8), Got = 0, Base = 0;
++    for (UINT64 Try = Want & ~(UINT64)(SIZE_2MB - 1); Try >= SIZE_64MB; Try -= SIZE_64MB) {
++      EFI_PHYSICAL_ADDRESS At = MAX_UINT64;   // top down: the highest free run below 2^64
++      if (!EFI_ERROR (gBS->AllocatePages (AllocateMaxAddress, EfiReservedMemoryType, EFI_SIZE_TO_PAGES (Try + SIZE_2MB), &At))) {
++        Base = ALIGN_VALUE (At, SIZE_2MB); Got = Try; break;
++      }
++    }
++    WriteUnaligned64 ((UINT64 *)((UINT8 *)Tree + mGpuPoolOffset), Base);
++    WriteUnaligned64 ((UINT64 *)((UINT8 *)Tree + mGpuPoolOffset + 8), Got);
++    Print (L"DARWINBOOT: gpu pool 0x%lx + 0x%lx (asked 0x%lx)\n", Base, Got, Want);
++  }
+   ArgsAddress = ALIGN_VALUE (Address + Kernel.End - Kernel.Base, SIZE_16KB);
+   TreeAddress = ArgsAddress + EFI_PAGE_SIZE;
+   RamdiskAddress = ALIGN_VALUE (TreeAddress + TreeSize, EFI_PAGE_SIZE);
+-- 
+2.55.0
+

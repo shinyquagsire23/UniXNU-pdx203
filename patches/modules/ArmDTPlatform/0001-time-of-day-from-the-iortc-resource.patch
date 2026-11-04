@@ -1,0 +1,75 @@
+From 1f275aa5749641cdd758edec235bf9bfdfc46cf0 Mon Sep 17 00:00:00 2001
+From: shinyquagsire23 <mtinc2@gmail.com>
+Date: Mon, 2 Nov 2026 17:58:51 -0700
+Subject: [PATCH] ArmDTPlatform: time of day from the published IORTC resource
+
+getUTCTimeOfDay/setUTCTimeOfDay forward to the object published as the IORTC
+resource through AppleARMPE's platform-function protocol (getGMTTimeOfDay /
+setGMTTimeOfDay with clock_sec_t * and uint32_t * nanoseconds). Without one
+the base class answers as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Wby9vE95hj6m7p14a2x9aY
+---
+ ArmDTPlatform.cpp | 38 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 38 insertions(+)
+
+diff --git a/ArmDTPlatform.cpp b/ArmDTPlatform.cpp
+index fdafc43..632c144 100644
+--- a/ArmDTPlatform.cpp
++++ b/ArmDTPlatform.cpp
+@@ -36,6 +36,8 @@ public:
+   bool configure (IOService *provider) override;
+   const char *deleteList (void) override;
+   const char *excludeList (void) override;
++  void getUTCTimeOfDay (clock_sec_t *secs, clock_nsec_t *nsecs) override;
++  void setUTCTimeOfDay (clock_sec_t secs, clock_nsec_t nsecs) override;
+ private:
+   bool hasNVRAMProxy (IOService *provider);
+   bool createDeviceNubs (IOService *provider);
+@@ -56,6 +58,42 @@ const char *ArmDTPlatform::excludeList (void)
+   return "()";
+ }
+ 
++// Time of day: the board's real-time clock, when one is published as the
++// "IORTC" resource, answers AppleARMPE's platform-function protocol:
++// callPlatformFunction("getGMTTimeOfDay", false, clock_sec_t *, uint32_t *
++// nanoseconds) and "setGMTTimeOfDay" with the same arguments. Without one
++// the base class answers (0, so the calendar starts at the epoch) and a set
++// is dropped, as before.
++static IOService *publishedRTC (void)
++{
++  IOService *resources = IOService::getResourceService ();
++  return resources ? OSDynamicCast (IOService, resources->getProperty ("IORTC")) : nullptr;
++}
++
++void ArmDTPlatform::getUTCTimeOfDay (clock_sec_t *secs, clock_nsec_t *nsecs)
++{
++  IOService *rtc = publishedRTC ();
++  clock_sec_t s = 0;
++  uint32_t ns = 0;
++  if (rtc != nullptr && rtc->callPlatformFunction ("getGMTTimeOfDay", false, &s, &ns, nullptr, nullptr) == kIOReturnSuccess) {
++    *secs = s;
++    *nsecs = ns;
++    return;
++  }
++  IODTPlatformExpert::getUTCTimeOfDay (secs, nsecs);
++}
++
++void ArmDTPlatform::setUTCTimeOfDay (clock_sec_t secs, clock_nsec_t nsecs)
++{
++  IOService *rtc = publishedRTC ();
++  uint32_t ns = (uint32_t) nsecs;
++  if (rtc != nullptr) {
++    (void) rtc->callPlatformFunction ("setGMTTimeOfDay", false, &secs, &ns, nullptr, nullptr);
++    return;
++  }
++  IODTPlatformExpert::setUTCTimeOfDay (secs, nsecs);
++}
++
+ bool ArmDTPlatform::hasNVRAMProxy (IOService *provider)
+ {
+   IORegistryEntry *chosen = provider->childFromPath ("chosen", gIODTPlane);
+-- 
+2.55.0
+

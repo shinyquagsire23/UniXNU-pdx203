@@ -1,0 +1,38 @@
+From ed9bc98722abfa7a13734abf574ea2f18b5c8bc4 Mon Sep 17 00:00:00 2001
+From: shinyquagsire23 <mtinc2@gmail.com>
+Date: Sun, 1 Nov 2026 04:25:40 -0700
+Subject: [PATCH] fix: wait for the Data volume media before giving up
+
+APFS publishes a container's volume media asynchronously. With one CPU the
+Data volume was always there before launchd's scratch Data mount asked for
+it. With eight (sheng-smp=1 on the Xperia 1 II) the mount came first and the
+kernel panicked "offline scratch Data mount failed". Retry for up to
+10 s, as NativeUfs does for the SystemOS volume.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Wby9vE95hj6m7p14a2x9aY
+---
+ NativeRamBlock.cpp | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/NativeRamBlock.cpp b/NativeRamBlock.cpp
+index b3301ac..c3fba87 100644
+--- a/NativeRamBlock.cpp
++++ b/NativeRamBlock.cpp
+@@ -457,5 +457,12 @@ extern "C" int native_ram_block_volume_seed(const char *uuid,dev_t *device,char
+     uint64_t *base,uint64_t *bytes,uint8_t digest[32]) {
+   if(!base || !bytes || !digest)return 0;
+   *base=0;*bytes=0;memset(digest,0,32);
+-  return selectVolumeSeed(uuid,device,path,size,base,bytes,digest);
++  // APFS publishes the container's volume media asynchronously. With one cpu it was always there before launchd's Data mount
++  // asked, with eight (sheng-smp=1 on pdx203, 2026-11-01) the mount came first and failed ("offline scratch Data mount
++  // failed"). wait for it the way NativeUfs waits for the SystemOS volume: up to 10 s.
++  for(unsigned attempt=0;attempt<100;++attempt){
++    if(selectVolumeSeed(uuid,device,path,size,base,bytes,digest))return 1;
++    IOSleep(100);
++  }
++  return 0;
+ }
+-- 
+2.55.0
+

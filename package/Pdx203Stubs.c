@@ -100,8 +100,6 @@ pdx203_gpu_start(void)
 /* Hooks of features the minimal format 2 image leaves out. Each is weak: the feature's own object, linked again when it
  * returns, wins. The late probe starts them unconditionally and each checks its own boot argument, so a no-op is the
  * "argument not given" behaviour. */
-__attribute__((weak)) void pdx203_battery_probe(void) {}
-__attribute__((weak)) void pdx203_rtc_probe(void) {}
 __attribute__((weak)) void sheng_adsp_probe(void) {}
 __attribute__((weak)) void pdx203_audio_probe(void) {}
 __attribute__((weak)) void pdx203_wifi_probe(void) {}

@@ -165,6 +165,11 @@ kernel_args = [
   "pdx203-touch=1",
   # the power and volume buttons over SPMI (package/ButtonProbe.cpp)
   "pdx203-bt=3",
+  # the battery (package/Pdx203Battery.cpp): an IOPMPowerSource with the PM8150B fuel gauge's monotonic SOC, the charger status and USB
+  # presence over SPMI through the buttons' arbiter mapping (needs pdx203-bt). BATTERY rows on the usb log. The time of day comes from
+  # the PM8150 RTC as the IORTC resource (package/Pdx203Rtc.cpp, on by default: pdx203-rtc=0 turns it off), which ArmDTPlatform reads
+  # (patches/modules/ArmDTPlatform)
+  "pdx203-battery=1",
   # the AppleKeyStore stand-in: "no passcode, nothing locked"
   "offline-key-events=1",
   "sheng-aks=1",
