@@ -189,6 +189,10 @@ kernel_args = [
   "sheng-gpu-addon=1",
   # the GPU hand-off: composited frames go to the panel through the GOP presenter instead of a CPU copy
   "sheng-fb-gpu=1",
+  # launch constraints off (patches/xnu/zzyc-owner-skip-launch-constraints.patch): the cached com.apple.iomfb_fdr_loader job requires a
+  # platform binary, and the board's log forwarder that the addon overlays as its executable is an owner-trusted one (f2g: AMFI
+  # "Launch Constraint Violation ... (Constraint not matched)", SIGKILL at exec)
+  "sheng-no-lc=1",
 ]
 # Fixups of signed text beyond the OS profile's four (its [payload] text_fixups is replaced, so they are repeated here).
 text_fixups = [

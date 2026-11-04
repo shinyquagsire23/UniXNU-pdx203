@@ -24,3 +24,6 @@ zzzzzzzzze-skip-ro-root-unmount.patch
 # names only), and the same grant for connection ports in the kernel object filter (the WebKit GPU process maps its BOs).
 zzzzzzzzzf-native-grant-wildcard.patch
 zzzzzzzzzg-native-adreno-kobj-filter-grant.patch
+# The board's unified-log forwarder (userland/OsLogConsole.mm) as the cached iomfb_fdr_loader job's /usr/bin executable, and the
+# Enable-Private-Data logging preference, both overlays of the GPU addon (sheng-gpu-addon=1).
+zzzzzzzzzh-oslog-forwarder-mounts.patch
