@@ -17,7 +17,9 @@ kit = "pdx203"                     # package/ of this repository appears as kits
 # framebuffer with touch through ShengHidInput, the keystore stand-in. ShengHidInput's recipe is not run on its own:
 # scripts/build-pdx203-legacy-display.py builds it and puts its late object in the force-loaded display archive.
 include = ["ArmDTPlatform", "ArmCpu", "SoftwareAES", "ShengUfs", "RamBlock", "GopFramebuffer", "ShengHidInput",
-           "AppleKeyStoreState", "XnuPrelink", "DarwinBoot", "QcomXnuUsbDebug"]
+           "AppleKeyStoreState", "XnuPrelink", "DarwinBoot", "QcomXnuUsbDebug",
+           # the A650's kits, compiled by scripts/build-pdx203-adreno.py (ArmSmmu4K pinned in kits/ at the driver's revision)
+           "AdrenoPM4", "AdrenoFirmware", "ArmSmmu4K"]
 
 # the donor image, the same one the OS profile names: the unchanged iPad7,1 iPadOS 17.7.11 restore image, the identity
 # sheng and alioth use (no pac on the a77, so the arm64 ipad userland, not an arm64e iphone one). --ipsw PATH uses a local
@@ -175,6 +177,12 @@ kernel_args = [
   # windows). "PDX203 CPUFREQ" rows on the usb log. 3 votes only; 4 also kept threads on the A77s, which the format 1 kernel ran as
   # one cluster. this one has the E/P clusters of dts/pdx203.dts, so the scheduler is left to place threads itself.
   "sheng-cpufreq=3",
+  # the adreno 650, the board probe (package/GpuProbe.cpp) one mode at a time. 11: the GPU up and published for user clients with
+  # the kernel's own self-test submissions; 12 adds the staged accelerator for Metal (with the gpu addon). GPUROW <n> rows on the usb log
+  "pipa-gpu=11",
+  "pipa-gpu-perf=7",   # 670 MHz, the SD865 top level (Linux sm8250 gpu opp table)
+  # the buffer pool in RAM darwinboot reserves outside the kernel window ([adt.chosen.bytes] darwinboot-gpu-pool), in MiB
+  "pipa-gpu-pool=512",
 ]
 # Fixups of signed text beyond the OS profile's four (its [payload] text_fixups is replaced, so they are repeated here).
 text_fixups = [
@@ -208,6 +216,9 @@ unique_chip_id = "required"        # the platform seed is not stored in any repo
 # form: SHA-384 of "Pdx203Bringup.BootSet.v1\0", not apple data.
 [adt.chosen.bytes]
 boot-manifest-hash = "1d0d00ef77a4c50547b2d7fbfd56aeeb40c17eda7e79c8ca5154b8c334ec3699b0dfaae2fd1cae411831855ab1451d6b"
+# darwinboot reserves this much outside the owned window (top down) for the Adreno driver's buffer pool and writes {base, bytes}
+# back: base 0, 0x30000000 bytes asked. a contiguous allocation inside the window came up at 32 to 512 MiB (2026-11-02, usb-105).
+darwinboot-gpu-pool = "00000000000000000000003000000000"
 
 # no suspend on this board, so the cpu never parks
 [adt.defaults.u32]

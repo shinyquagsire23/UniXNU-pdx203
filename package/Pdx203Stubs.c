@@ -115,3 +115,18 @@ __attribute__((weak)) void native_hid_orientation_step(intptr_t step) { (void)st
 void (*volatile native_board_halt_restart)(int reboot) __attribute__((weak)) = 0;
 /* the display work loop's gate lanes (the fork's NativeMobileDisplay 0002 patch), which the exit log's freeze rows print; none here */
 __attribute__((weak)) unsigned native_legacy_gate_dump(char *out, unsigned cap) { if (out && cap) out[0] = 0; return 0; }
+
+/* Counters the GPU probe's rows read (package/GpuProbe.cpp) from parts not in this image yet: the fork's NativeMobileDisplay
+ * 0002/0004 patches and its GPU addon mount patch. Zero until the part that owns each returns. */
+__attribute__((weak)) volatile uint32_t native_legacy_swap_timeouts, native_legacy_orphan_retires, native_legacy_gpu_dropped;
+__attribute__((weak)) volatile uint32_t native_legacy_async_copies, native_legacy_async_drops;
+__attribute__((weak)) volatile uint64_t native_legacy_async_max_us;
+__attribute__((weak)) volatile int native_gpu_addon4_stage = 0, native_gpu_addon4_status = -1, native_gpu_addon_cryptex_execs = 0,
+                                   native_gpu_addon_reset = -1;
+/* the fork's zzy-zpmap-owner.patch: which process maps a physical page (the Adreno free log's attribution); unknown here */
+__attribute__((weak)) int native_pmap_page_owner(uint32_t ppnum, char *name, size_t namelen, int *pid, uint64_t *va)
+{
+	(void)ppnum; (void)namelen; (void)pid; (void)va;
+	if (name && namelen) name[0] = 0;
+	return 0;
+}

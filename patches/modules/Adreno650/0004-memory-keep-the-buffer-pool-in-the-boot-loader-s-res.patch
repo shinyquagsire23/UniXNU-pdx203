@@ -1,0 +1,112 @@
+From 8defd1508377a323cc7d1dc1af5fd4f8433a0ca3 Mon Sep 17 00:00:00 2001
+From: shinyquagsire23 <mtinc2@gmail.com>
+Date: Mon, 2 Nov 2026 21:00:04 -0700
+Subject: [PATCH 4/4] memory: keep the buffer pool in the boot loader's
+ reserved block (/chosen/darwinboot-gpu-pool) when there is one
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Wby9vE95hj6m7p14a2x9aY
+---
+ NativeAdrenoGpuContext.cpp |  2 +-
+ NativeAdrenoMemory.cpp     | 37 +++++++++++++++++++++++++++++++++----
+ 2 files changed, 34 insertions(+), 5 deletions(-)
+
+diff --git a/NativeAdrenoGpuContext.cpp b/NativeAdrenoGpuContext.cpp
+index 54f2746..467c5f6 100644
+--- a/NativeAdrenoGpuContext.cpp
++++ b/NativeAdrenoGpuContext.cpp
+@@ -36,7 +36,7 @@ IOReturn NativeAdrenoGpuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
+     if(!status && native_adreno_pool_mib) {
+         for(uint32_t mib=native_adreno_pool_mib;mib>=16;mib>>=1) {
+             const IOReturn pooled=NativeAdrenoMemory::reservePool(report->output_bits,(size_t)mib<<20);
+-            native_adreno_pool_stats[0]=pooled==kIOReturnSuccess?mib:0;native_adreno_pool_status=(uint32_t)pooled;
++            native_adreno_pool_stats[0]=pooled==kIOReturnSuccess?(uint32_t)(NativeAdrenoMemory::poolBytes()>>20):0;native_adreno_pool_status=(uint32_t)pooled;
+             if(pooled==kIOReturnSuccess)break;
+         }
+         /* Not fatal: without it each pooled BO changes its pages' attribute itself, as a scattered one does. */
+diff --git a/NativeAdrenoMemory.cpp b/NativeAdrenoMemory.cpp
+index cca9952..d4c76ee 100644
+--- a/NativeAdrenoMemory.cpp
++++ b/NativeAdrenoMemory.cpp
+@@ -3,6 +3,9 @@
+ /* Where a call that never returns is stuck: the free/unmap/release path stores a stage number here, the board page shows it. */
+ extern "C" {volatile uint32_t native_adreno_trace_stage;}
+ #include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IODeviceMemory.h>
++#include <IOKit/IORegistryEntry.h>
++#include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
+ #include <kern/task.h>
+ 
+@@ -19,6 +22,7 @@ namespace {
+ struct PoolExtent {size_t offset,bytes;};
+ struct Pool {
+     IOBufferMemoryDescriptor *descriptor=nullptr;
++    IOMemoryMap *carveout=nullptr;   /* the boot loader's reserved block (reservePool) instead of a descriptor */
+     unsigned char *virt=nullptr;uint64_t physical=0;size_t bytes=0,used=0,peak=0;
+     PoolExtent free[512];unsigned count=0;
+     bool write_combined=false;
+@@ -53,14 +57,14 @@ void poolGive(size_t offset,size_t bytes) {
+ }
+ }
+ size_t NativeAdrenoMemory::poolBytes() {return pool.bytes;}
+-uint64_t NativeAdrenoMemory::poolPhysical() {return pool.descriptor?pool.physical:0;}
++uint64_t NativeAdrenoMemory::poolPhysical() {return pool.descriptor || pool.carveout?pool.physical:0;}
+ /* int-152: a user BO's pages changed attribute one pmap_set_cache_attributes call at a time (each walks the page's mappings, flushes the
+  * TLB and cleans the page), on allocation and again on release, under the connection lock: 3 ms a BO on average and 90-130 ms for a
+  * surface-sized one, while every other GPU call of every client waited. The pool is the BOs' own block and nothing else maps it, so
+  * its pages take the attribute once here and keep it while the pool lives. */
+ IOReturn NativeAdrenoMemory::writeCombinePool()
+ {
+-    if(!pool.descriptor || !pool.virt || !pool.bytes)return kIOReturnNotReady;
++    if(!(pool.descriptor || pool.carveout) || !pool.virt || !pool.bytes)return kIOReturnNotReady;
+     if(pool.write_combined)return kIOReturnSuccess;
+     IOReturn status=NativeAdrenoMaintainOwnedPages(pool.virt,pool.bytes,NativeAdrenoCleanInvalidate);
+     if(status)return status;
+@@ -71,8 +75,33 @@ IOReturn NativeAdrenoMemory::writeCombinePool()
+ }
+ IOReturn NativeAdrenoMemory::reservePool(unsigned bits,size_t bytes)
+ {
+-    if(pool.descriptor)return kIOReturnBusy;
++    if(pool.descriptor || pool.carveout)return kIOReturnBusy;
+     if(!bytes || (bytes&4095) || !outputWidth(bits))return kIOReturnBadArgument;
++    /* /chosen/darwinboot-gpu-pool {base, bytes}: RAM the boot loader reserved outside the kernel's window (DarwinBoot). It is not the VM's,
++     * so it is the same size at every boot whatever the boot did to memory, and it is mapped write-combined from the start (the attribute
++     * writeCombinePool would give a descriptor's pages); its size wins over the one asked for. */
++    if(IORegistryEntry *chosen=IORegistryEntry::fromPath("/chosen",gIODTPlane)) {
++        OSData *d=OSDynamicCast(OSData,chosen->getProperty("darwinboot-gpu-pool"));
++        uint64_t cell[2]={0,0};
++        if(d && d->getLength()==sizeof cell)memcpy(cell,d->getBytesNoCopy(),sizeof cell);
++        chosen->release();
++        const uint64_t base=cell[0],size=cell[1]&~UINT64_C(4095),limit=UINT64_C(1)<<bits;
++        if(base && !(base&4095) && size>=(UINT64_C(16)<<20) && base<limit && size<=limit-base) {
++            IODeviceMemory *memory=IODeviceMemory::withRange(base,size);
++            IOMemoryMap *map=memory?memory->map(kIOMapAnywhere|kIOMapWriteCombineCache):nullptr;
++            if(memory)memory->release();
++            unsigned char *virt=map?reinterpret_cast<unsigned char *>(map->getVirtualAddress()):nullptr;
++            if(virt) {
++                pool.carveout=map;pool.virt=virt;pool.physical=base;pool.bytes=(size_t)size;pool.used=pool.peak=0;
++                pool.free[0]={0,(size_t)size};pool.count=1;pool.write_combined=true;
++                native_adreno_pool_stats[0]=(uint32_t)(size>>20);
++                IOLog("NativeAdreno: buffer pool %llu MiB at 0x%llx, reserved by the boot loader\n",size>>20,base);
++                return kIOReturnSuccess;
++            }
++            if(map)map->release();
++            IOLog("NativeAdreno: the boot loader's pool at 0x%llx (%llu MiB) could not be mapped\n",base,size>>20);
++        }
++    }
+     NativeAdrenoCpuState cpu{};
+     IOReturn status=NativeAdrenoQueryCpu4K(&cpu);if(status!=kIOReturnSuccess)return status;
+     const uint64_t limit=UINT64_C(1)<<bits;
+@@ -104,7 +133,7 @@ IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous
+     NativeAdrenoCpuState cpu{};
+     IOReturn status=NativeAdrenoQueryCpu4K(&cpu);if(status!=kIOReturnSuccess)return status;
+     uint64_t limit=UINT64_C(1)<<bits;
+-    if(pooled && pool.descriptor && bytes<=pool.bytes) {
++    if(pooled && (pool.descriptor || pool.carveout) && bytes<=pool.bytes) {
+         size_t offset=0;
+         if(poolTake(bytes,&offset)) {
+             const uint64_t physical=pool.physical+offset;
+-- 
+2.55.0
+

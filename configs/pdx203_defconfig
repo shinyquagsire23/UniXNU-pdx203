@@ -39,7 +39,9 @@ CONFIG_XNU_NATIVE_RAM_BLOCK=y
 # the touch, HID, buttons and keystore probes in the same late archive (scripts/build-pdx203-legacy-display.py)
 CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y
 # CONFIG_XNU_NATIVE_MOBILE_DISPLAY is not set
-# CONFIG_XNU_NATIVE_ADRENO is not set
+# the Adreno 650 (drivers/Adreno650 with patches/modules/Adreno650, the kits, package/GpuProbe.cpp and the A650 GMU cold start,
+# scripts/build-pdx203-adreno.py), linked as build/adreno740/libAdreno740.a; the board probe runs with pipa-gpu=<mode>
+CONFIG_XNU_NATIVE_ADRENO=y
 # CONFIG_XNU_BOOT_PROGRESS is not set
 
 # the CDC-ACM kernel log over the DWC3 (drivers/QcomXnuUsbDebug, patches/xnu/zzzzzzzz-qcom-usb-debug-*.patch). it

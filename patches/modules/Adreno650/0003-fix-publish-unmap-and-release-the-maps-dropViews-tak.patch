@@ -1,0 +1,44 @@
+From 9d404f2ac25afdfff5704359266aa6b03c69ff91 Mon Sep 17 00:00:00 2001
+From: shinyquagsire23 <mtinc2@gmail.com>
+Date: Mon, 2 Nov 2026 13:16:37 -0700
+Subject: [PATCH 3/4] fix(publish): unmap and release the maps dropViews takes
+ off a client
+
+removeMappingForDescriptor returns the map retained and out of the
+client's list; dropViews never released it, so the map and its user PTEs
+outlived the BO. Pool pages went to the next BO still mapped in the old
+process, and a VM-backed BO's free panicked in pmap_assert_free (pdx203
+pathdiag boot, PosterBoard; usb-60: 20 GPULEAK rows at SpringBoard's
+device closes).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Wby9vE95hj6m7p14a2x9aY
+---
+ NativeAdrenoPublish.cpp | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/NativeAdrenoPublish.cpp b/NativeAdrenoPublish.cpp
+index dbb9281..5771e0f 100644
+--- a/NativeAdrenoPublish.cpp
++++ b/NativeAdrenoPublish.cpp
+@@ -287,8 +287,15 @@ void AGXDeviceUserClient::dropViews(uint32_t token)
+         else if(views_)for(size_t i=0;i<MaxViews;++i) {View &v=views_[i];if(v.descriptor) {view=v.descriptor;v.descriptor=nullptr;v.token=0;break;}}
+         IOLockUnlock(g.lock);
+         if(!view)return;
+-        /* The returned reference is the last one outside the descriptor's own list: dropping it frees the map, which unmaps the user range. */
+-        while(removeMappingForDescriptor(view))native_adreno_metal_diag.forced_unmaps=native_adreno_metal_diag.forced_unmaps+1;
++        /* removeMappingForDescriptor hands back the map retained (IOUserClient.cpp) and out of the client's list; the map was dropped
++         * without that release, so it and its user PTEs outlived the BO: pool pages went to the next BO still mapped in the old process,
++         * and a VM-backed BO's free hit pmap_assert_free (pdx203 usb-60: 20 GPULEAK rows at SpringBoard's device closes). Unmap the user
++         * range now and drop the last reference. */
++        while(IOMemoryMap *map=removeMappingForDescriptor(view)) {
++            map->unmap();
++            map->release();
++            native_adreno_metal_diag.forced_unmaps=native_adreno_metal_diag.forced_unmaps+1;
++        }
+         view->release();
+     }
+ }
+-- 
+2.55.0
+

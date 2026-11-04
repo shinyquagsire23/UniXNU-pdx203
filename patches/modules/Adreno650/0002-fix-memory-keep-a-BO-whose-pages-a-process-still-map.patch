@@ -1,0 +1,67 @@
+From a5041e84621fa1cf7b7eb97f19df2c2c4a54f4c5 Mon Sep 17 00:00:00 2001
+From: shinyquagsire23 <mtinc2@gmail.com>
+Date: Mon, 2 Nov 2026 13:00:03 -0700
+Subject: [PATCH 2/4] fix(memory): keep a BO whose pages a process still maps
+ instead of freeing them
+
+Closing a connection freed a BO whose page another address space still
+mapped, and pmap_assert_free panicked (pdx203 pathdiag boot, PosterBoard).
+release() now asks the pmap for a user mapping of each owned page first;
+if one is left, the memory is leaked and a GPULEAK row names the owner,
+its address and the BO size.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Wby9vE95hj6m7p14a2x9aY
+---
+ NativeAdrenoMemory.cpp | 31 +++++++++++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/NativeAdrenoMemory.cpp b/NativeAdrenoMemory.cpp
+index 1ec3d82..cca9952 100644
+--- a/NativeAdrenoMemory.cpp
++++ b/NativeAdrenoMemory.cpp
+@@ -237,10 +237,41 @@ IOReturn NativeAdrenoMemory::makeWriteCombined()
+     if(status)return status;
+     write_combined_=true;return kIOReturnSuccess;
+ }
++/* Owned pages a user process still maps when their BO is freed (pdx203 pathdiag boot: PosterBoard closed a connection, releaseAll freed a BO
++ * whose page another address space still mapped, and pmap_assert_free panicked). release() looks for such a mapping first; if one is left the
++ * BO's memory is kept (leaked) instead of freed, and the owner is logged: [0] BOs kept, [1] their KiB, [2] last owner pid, [3] last BO KiB. */
++extern "C" {
++volatile uint32_t native_adreno_mapped_leaks[4];
++int native_pmap_page_owner(ppnum_t ppnum,char *name,size_t namelen,int *pid,uint64_t *va);
++}
++static bool nativeAdrenoUserMapped(const NativeAdrenoPhysicalSpan *spans,size_t count,size_t bytes)
++{
++    for(size_t i=0;i<count;++i)
++        for(uint64_t at=0;at<spans[i].bytes;at+=4096) {
++            char name[20]={};int pid=-1;uint64_t va=0;
++            const uint64_t pa=spans[i].physical+at;
++            if(native_pmap_page_owner(ppnum_t(pa>>12),name,sizeof name,&pid,&va)==0) {
++                native_adreno_mapped_leaks[0]=native_adreno_mapped_leaks[0]+1;
++                native_adreno_mapped_leaks[1]=native_adreno_mapped_leaks[1]+uint32_t(bytes>>10);
++                native_adreno_mapped_leaks[2]=uint32_t(pid);native_adreno_mapped_leaks[3]=uint32_t(bytes>>10);
++                IOLog("GPULEAK %s[%d] va 0x%llx pa 0x%llx bo %llu KiB span %zu/%zu: kept, not freed\n",name,pid,
++                    (unsigned long long)va,(unsigned long long)pa,(unsigned long long)(bytes>>10),i,count);
++                return true;
++            }
++        }
++    return false;
++}
+ IOReturn NativeAdrenoMemory::release()
+ {
+     native_adreno_trace_stage=30;
+     if(device_references_ || quarantined_)return kIOReturnBusy;
++    if(!imported_ && spans_ && span_count_ && nativeAdrenoUserMapped(spans_,span_count_,bytes_)) {
++        /* Leak the pages with their descriptor (and pool range) rather than hand mapped pages back to the VM. */
++        descriptor_=nullptr;imported_=nullptr;pooled_=false;prepared_=false;write_combined_=false;pool_offset_=0;
++        IODeleteData(spans_,NativeAdrenoPhysicalSpan,span_capacity_);
++        mapping_=nullptr;spans_=nullptr;bytes_=span_count_=span_capacity_=0;read_only_=false;
++        return kIOReturnSuccess;
++    }
+     if(write_combined_ && pooled_ && pool.write_combined)write_combined_=false;   /* the pool's pages keep the attribute */
+     if(write_combined_) {
+         /* The pages go back to the VM cacheable, as they came. */
+-- 
+2.55.0
+

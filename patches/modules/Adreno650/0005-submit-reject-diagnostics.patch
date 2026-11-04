@@ -1,0 +1,111 @@
+diff --git a/NativeAdrenoSubmit.cpp b/NativeAdrenoSubmit.cpp
+index 827150e..cbc00fe 100644
+--- a/NativeAdrenoSubmit.cpp
++++ b/NativeAdrenoSubmit.cpp
+@@ -18,6 +18,9 @@ extern "C" {volatile uint32_t native_adreno_wc_distrusted;}
+  * [3] stale clean lines, [4] the last audit failure (any failure also ends the trust), [5] pages found back at the default attribute
+  * and write-combined again. */
+ extern "C" {volatile uint32_t native_adreno_wc_audit[6];}
++/* The core's own refusal of a submission (NativeAdrenoUserClient's check 8): [0] the check (1 count, 2 buffer size, 3 not readable or the
++ * IB outside its mapping, 4 describe failed), [1] buffer index, [2] iova low, [3] bytes, [4] the mapping's iova low, [5] its bytes. */
++extern "C" {volatile uint32_t native_adreno_submit_core_reject[6];}
+ /* Fence waits: [0] calls, [1] timeouts, [2] the fence of the last timed-out wait, [3] the fence value the GPU had written then, [4] the newest fence handed out,
+  * [5] the newest completed, [6] waits for a fence no job holds (observeFence path), [7] the last fence refused as never submitted. */
+ extern "C" {volatile uint32_t native_adreno_fence_wait[8];}
+@@ -119,7 +122,7 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
+ {
+     if(!fence)return kIOReturnBadArgument;*fence=0;
+     if(!attached_ || poisoned_)return kIOReturnNotReady;
+-    if(!buffers || !count || count>SubmitMaxBuffers)return kIOReturnBadArgument;
++    if(!buffers || !count || count>SubmitMaxBuffers) {native_adreno_submit_core_reject[0]=1;return kIOReturnBadArgument;}
+     uint64_t phase[7];phase[0]=mach_absolute_time();
+     native_adreno_submit_ibs[0]=native_adreno_submit_ibs[0]+1;native_adreno_submit_ibs[1]=native_adreno_submit_ibs[1]+(uint32_t)count;
+     if(count>native_adreno_submit_ibs[2])native_adreno_submit_ibs[2]=(uint32_t)count;
+@@ -130,13 +133,18 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
+     static_assert(sizeof(scratch_words_)/sizeof(scratch_words_[0])>=SubmitMaxBuffers*(1+SubmitIbWords),"ring words");
+     for(size_t i=0;i<count;++i) {
+         const NativeAdrenoSubmitBuffer &buffer=buffers[i];
+-        if(!buffer.handle || !buffer.bytes || (buffer.bytes&3) || buffer.bytes>SubmitMaxIbBytes)
+-            return kIOReturnBadArgument;
++        volatile uint32_t *cr=native_adreno_submit_core_reject;
++        if(!buffer.handle || !buffer.bytes || (buffer.bytes&3) || buffer.bytes>SubmitMaxIbBytes) {
++            cr[0]=2;cr[1]=(uint32_t)i;cr[2]=(uint32_t)buffer.iova;cr[3]=(uint32_t)buffer.bytes;return kIOReturnBadArgument;
++        }
+         uint64_t iova=0;size_t bytes=0;unsigned permissions=0;
+         IOReturn status=vm_->describe(buffer.handle,&iova,&bytes,&permissions);
+-        if(status)return status;
++        if(status) {cr[0]=4;cr[1]=(uint32_t)i;cr[2]=(uint32_t)buffer.iova;cr[3]=(uint32_t)buffer.bytes;return status;}
+         if(!(permissions&ArmSmmu4KRead) || buffer.iova<iova ||
+-            buffer.iova-iova>bytes || buffer.bytes>bytes-(buffer.iova-iova))return kIOReturnBadArgument;
++            buffer.iova-iova>bytes || buffer.bytes>bytes-(buffer.iova-iova)) {
++            cr[0]=3;cr[1]=(uint32_t)i;cr[2]=(uint32_t)buffer.iova;cr[3]=(uint32_t)buffer.bytes;cr[4]=(uint32_t)iova;cr[5]=(uint32_t)bytes;
++            return kIOReturnBadArgument;
++        }
+         uint32_t header=0;
+         if(AdrenoPM4Type7(SubmitIndirectBuffer,SubmitIbWords,&header)!=AdrenoPM4Success)
+             return poison();
+diff --git a/NativeAdrenoUserClient.cpp b/NativeAdrenoUserClient.cpp
+index b27b05a..b2abc2a 100644
+--- a/NativeAdrenoUserClient.cpp
++++ b/NativeAdrenoUserClient.cpp
+@@ -12,6 +12,21 @@ extern "C" volatile uint32_t native_adreno_import_stage;
+  * 1 alive, 2 released, 3 free refused. */
+ extern "C" {volatile uint64_t native_adreno_import_live[3+8*4];}
+ extern "C" int proc_selfpid(void);
++/* pdx203 usb-168: one submission refused with kIOReturnBadArgument made Turnip lose its device (Metal "commandBuffer refused:
++ * DeviceLost"), and the render server's display thread then hung logging it. Each refused submission: [0] refusals, [1] the check
++ * (1 count/reserved, 2 queue, 3 wait without clock, 4 wait failed, 5 buffer size, 6 unknown handle, 7 handle not mapped, 8 the core
++ * refused, see native_adreno_submit_core_reject), [2] buffer index, [3] buffer count, [4]/[5] handle low/high, [6] iova low,
++ * [7] bytes, [8] status, [9] pid. */
++extern "C" {volatile uint32_t native_adreno_submit_reject[10];}
++static IOReturn noteSubmitReject(uint32_t check,uint32_t index,uint32_t count,uint64_t handle,uint64_t iova,uint64_t bytes,IOReturn status)
++{
++    volatile uint32_t *r=native_adreno_submit_reject;
++    r[1]=check;r[2]=index;r[3]=count;r[4]=(uint32_t)handle;r[5]=(uint32_t)(handle>>32);r[6]=(uint32_t)iova;r[7]=(uint32_t)bytes;
++    r[8]=(uint32_t)status;r[9]=(uint32_t)proc_selfpid();
++    __asm__ volatile("dmb ish":::"memory");
++    r[0]=r[0]+1;
++    return status;
++}
+ static unsigned gImportNext;
+ static void noteImportState(uint64_t handle,uint64_t state)
+ {
+@@ -328,23 +343,25 @@ IOReturn NativeAdrenoUserClient::submit(const NativeAdrenoAbiSubmit *request,
+     if(!request || !reply)return kIOReturnBadArgument;reply->fence=0;
+     if(!open_)return kIOReturnNotReady;
+     if(!request->buffer_count || request->buffer_count>NativeAdrenoAbiMaxBuffers ||
+-        request->reserved)return kIOReturnBadArgument;
++        request->reserved)return noteSubmitReject(1,0,request->buffer_count,0,0,request->reserved,kIOReturnBadArgument);
+     if(request->queue>=NativeAdrenoAbiMaxQueues || !queues_[request->queue].active)
+-        return kIOReturnBadArgument;
++        return noteSubmitReject(2,request->queue,request->buffer_count,0,0,0,kIOReturnBadArgument);
+     if(request->wait_fence) {
+-        if(!clock)return kIOReturnBadArgument;
++        if(!clock)return noteSubmitReject(3,0,request->buffer_count,0,0,0,kIOReturnBadArgument);
+         const uint32_t wait_us=request->wait_timeout_ns==0?0:
+             (request->wait_timeout_ns>UINT64_C(0xffffffff)*1000u?0xffffffffu:
+             (uint32_t)(request->wait_timeout_ns/1000));
+         const IOReturn waited=submit_->observeFence((uint32_t)request->wait_fence,clock,wait_us);
++        if(waited && waited!=kIOReturnTimeout)return noteSubmitReject(4,0,request->buffer_count,0,request->wait_fence,0,waited);
+         if(waited)return waited;
+     }
+     NativeAdrenoSubmitBuffer *buffers=submit_buffers_;
+     for(uint32_t i=0;i<request->buffer_count;++i) {
+         const NativeAdrenoAbiSubmitBuffer &wire=request->buffers[i];
+-        if(!wire.bytes || (wire.bytes&3))return kIOReturnBadArgument;
++        if(!wire.bytes || (wire.bytes&3))return noteSubmitReject(5,i,request->buffer_count,wire.handle,wire.iova,wire.bytes,kIOReturnBadArgument);
+         Entry *entry=find(wire.handle);
+-        if(!entry || !entry->mapped_state)return kIOReturnBadArgument;
++        if(!entry)return noteSubmitReject(6,i,request->buffer_count,wire.handle,wire.iova,wire.bytes,kIOReturnBadArgument);
++        if(!entry->mapped_state)return noteSubmitReject(7,i,request->buffer_count,wire.handle,wire.iova,wire.bytes,kIOReturnBadArgument);
+         buffers[i]={entry->mapped,wire.iova,(size_t)wire.bytes};
+     }
+     uint32_t fence=0;
+@@ -352,6 +369,7 @@ IOReturn NativeAdrenoUserClient::submit(const NativeAdrenoAbiSubmit *request,
+     ring_->useContext(context_);
+     const IOReturn status=submit_->submit(buffers,request->buffer_count,
+         queue_base_+static_cast<uint32_t>(request->queue),&fence);
++    if(status && status!=kIOReturnBusy)return noteSubmitReject(8,0,request->buffer_count,0,0,0,status);
+     if(status)return status;
+     reply->fence=fence;
+     return kIOReturnSuccess;

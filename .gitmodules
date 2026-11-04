@@ -4,3 +4,9 @@
 [submodule "drivers/GopFramebuffer"]
 	path = drivers/GopFramebuffer
 	url = https://github.com/UniXNU/GopFramebuffer.git
+[submodule "drivers/Adreno650"]
+	path = drivers/Adreno650
+	url = https://github.com/FFT-infra/Adreno650
+[submodule "kits/ArmSmmu4K"]
+	path = kits/ArmSmmu4K
+	url = https://github.com/UniXNU/ArmSmmu4K.git

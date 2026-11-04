@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""The Adreno 650 archive for pdx203 (build/native-adreno/libNativeAdreno.a, force-loaded by build-xnu-4k-baseline.sh with
+CONFIG_XNU_NATIVE_ADRENO). UniXNU-alioth's scripts/build-adreno650.py (same SM8250/A650) with pdx203's paths: the driver is
+drivers/NativeAdreno (pinned at FFT-infra/Adreno650 bdee54c), the board probe, its power facts and the A650 GMU cold start are
+this board's package (kits/pdx203: GpuProbe.cpp, GpuPowerBoard.h, A650Gmu.c/h), alioth's PCIe file is not built, and the firmware
+object is generated from the proprietary images in .cache/firmware/a650 (a650_gmu.bin and a650_sqe.fw, byte-identical to alioth's;
+a650_zap.mdt with a650_zap.b00..bNN, Sony's signed zap for this phone as the vendor partition ships it, laid out at its program
+headers' file offsets into the combined ELF the probe loads). A missing image gives an empty array, so the probe stops cleanly at
+that step."""
+import json, os, re, shutil, struct, subprocess, sys
+from pathlib import Path
+ROOT = Path(__file__).resolve().parents[1]
+c_recipe = json.loads((ROOT / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/bsd/DEVELOPMENT/bsd_init.o.json').read_text().strip().rstrip(','))
+cxx_recipe = json.loads((ROOT / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json').read_text().strip().rstrip(','))
+# scripts/build-xnu-4k-baseline.sh force-loads CONFIG_XNU_NATIVE_ADRENO from build/adreno740/libAdreno740.a: the A740 name is
+# hard-coded there (as UniXNU-alioth's build-adreno650.py notes), so the A650 archive is produced under it.
+out = ROOT / 'build/adreno740'
+out.mkdir(parents=True, exist_ok=True)
+# The driver checkout is an input for the same reason as the kits: Adreno650 is not a
+# component in UniXNU's catalogue, so the tree has no drivers/Adreno650 unless this names it.
+# Format 2 links only catalog components into the tree; Adreno650 is not one, so the default is this device repository's
+# submodule (unixnu passes the repository as UNIXNU_DEVICE to the archive builders).
+driver = Path(os.environ.get('ADRENO650_DRIVER') or
+              str(Path(os.environ['UNIXNU_DEVICE']) / 'drivers/Adreno650' if os.environ.get('UNIXNU_DEVICE') else ROOT / 'drivers/Adreno650'))
+# Changes to the driver ride as patches (patches/modules/NativeAdreno/*.patch in the UniXNU fork, which the build tree links), applied
+# as a stack like NativeMobileDisplay's (build-pdx203-legacy-display.py): the applied part is the longest prefix whose last patch
+# reverses; one that applies neither way stops the build.
+import subprocess as _subprocess
+# format 2: the stack is this device repository's patches/modules/Adreno650 (the fork's four driver commits on bdee54c, then its
+# eight module patches), found from the driver submodule's own checkout (drivers/Adreno650 -> the repository root)
+_patches = sorted((driver.resolve().parents[1] / 'patches/modules/Adreno650').glob('*.patch'))
+_applied = 0
+for _k in range(len(_patches), 0, -1):
+    if _subprocess.run(['git', '-C', str(driver.resolve()), 'apply', '--reverse', '--check', str(_patches[_k - 1].resolve())],
+                       capture_output=True).returncode == 0:
+        _applied = _k
+        break
+for _patch in _patches[_applied:]:
+    _subprocess.run(['git', '-C', str(driver.resolve()), 'apply', str(_patch.resolve())], check=True)
+    print('applied', _patch.name, 'to drivers/Adreno650')
+# The three upstream kits this recipe compiles are not copied into the generated tree unless a
+# selected component asks for them, so the directory is an input rather than an assumption:
+# ADRENO650_KITS names it, and a build passes this repository's kits directory.
+def write_synced(path, text):
+    """Write, flush and fsync a generated build input before anything reads it.
+
+    On this shared mount a plain write is still in flight when the compiler opens the file,
+    which shows up as clang's MemoryBuffer assertion rather than as a compile error."""
+    with path.open('w') as stream:
+        stream.write(text)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+KITS = Path(os.environ.get('ADRENO650_KITS', str(ROOT / 'kits')))
+sources = sorted(KITS.joinpath('ArmSmmu4K').glob('ArmSmmu4K*.c')) + [KITS / 'AdrenoPM4' / 'AdrenoPM4.c']
+# The HFI kit and the A650 cold start that uses it.
+sources += [KITS / 'AdrenoFirmware' / (name + '.c') for name in ('AdrenoFirmware', 'AdrenoHfi', 'AdrenoHfiStartup', 'AdrenoHfiVotes')]
+sources += [ROOT / 'kits/pdx203' / 'A650Gmu.c']
+# The GPU half of NativeAdreno and the GMU's SMMU context. Left out: sheng's GMU platform nodes and service
+# (NativeAdrenoService.cpp, NativeAdrenoGmuService/Platform/Config) and the accelerator.
+sources += [driver / (name + '.cpp') for name in (
+    'NativeAdrenoGpuContext', 'NativeAdrenoSmmuContext', 'NativeAdrenoSmmuMemory',
+    'NativeAdrenoMemory', 'NativeAdrenoCpu', 'NativeAdrenoVm', 'NativeAdrenoRing', 'NativeAdrenoSubmit', 'NativeAdrenoTimer',
+    'NativeAdrenoUserClient', 'NativeAdrenoPublish', 'NativeAdrenoCpInit', 'NativeAdrenoIrq',
+    'NativeAdrenoGmuContext', 'NativeAdrenoGmuMemory')]
+# The board probe and its firmware: both are package files. The probe exports
+# native_gpu_probe(), which the late display probe calls; the firmware object defines the
+# three arrays it weak-imports.
+PACKAGE = Path(os.environ.get('ADRENO650_PACKAGE', str(ROOT / 'kits/pdx203')))
+# The firmware arrays the probe weak-imports, generated from the board's proprietary images (never committed).
+FIRMWARE = ROOT / '.cache/firmware/a650'
+lines = ['#include <stdint.h>', '// Generated by scripts/build-pdx203-adreno.py from .cache/firmware/a650. Do not edit.']
+def zap_image():
+    """The zap shader as the probe loads it: the ELF header and program headers at 0, every segment at its own p_offset.
+
+    Built from the vendor's split files (a650_zap.mdt = b00 + b01, then b02...): the Sony vendor tree also carries an
+    a650_zap.elf of the same size that is Qualcomm test-signed ("Generated Test Root CA"), which this phone's TrustZone refuses at
+    init_image (2026-11-01, usb-24: init ffcfffbb). A test-signed image stops the build."""
+    mdt = FIRMWARE / 'a650_zap.mdt'
+    if not mdt.is_file():
+        return b''
+    head = mdt.read_bytes()
+    phoff, = struct.unpack_from('<I', head, 28)
+    phnum, = struct.unpack_from('<H', head, 44)
+    segments = [struct.unpack_from('<8I', head, phoff + 32 * i) for i in range(phnum)]
+    image = bytearray(max(seg[1] + seg[4] for seg in segments))
+    blobs = []
+    for i, seg in enumerate(segments):
+        blob = (FIRMWARE / ('a650_zap.b%02d' % i)).read_bytes()
+        if len(blob) != seg[4]:
+            raise SystemExit('a650_zap.b%02d: %d bytes, its program header says %d' % (i, len(blob), seg[4]))
+        image[seg[1]:seg[1] + seg[4]] = blob
+        blobs.append(blob)
+    if len(blobs) < 2 or blobs[0] + blobs[1] != head:
+        raise SystemExit('a650_zap.mdt is not a650_zap.b00 followed by a650_zap.b01')
+    if b'Generated Test' in image:
+        raise SystemExit('a650_zap: Qualcomm test-signed, not the vendor image')
+    return bytes(image)
+
+
+for name, file in (('gmu', 'a650_gmu.bin'), ('sqe', 'a650_sqe.fw'), ('zap', 'a650_zap.mdt')):
+    path = FIRMWARE / file
+    data = zap_image() if name == 'zap' else path.read_bytes() if path.is_file() else b''
+    body_bytes = ','.join(str(b) for b in data) or '0'
+    lines.append('const uint8_t native_gpu_%s_firmware[] = {%s};' % (name, body_bytes))
+    lines.append('const uint32_t native_gpu_%s_firmware_size = %d;' % (name, len(data)))
+    print('firmware %s: %s (%d bytes)' % (name, file, len(data)))
+firmware_c = out / 'GpuFirmwareA650.c'
+write_synced(firmware_c, '\n'.join(lines) + '\n')
+sources += [PACKAGE / 'GpuProbe.cpp', firmware_c]
+objects = []
+for source in sources:
+    recipe = c_recipe if source.suffix == '.c' else cxx_recipe
+    obj = out / (source.stem + ('.kit.o' if source.suffix == '.c' else '.o'))
+    command, i = [], 0
+    while i < len(recipe['arguments']):
+        value = recipe['arguments'][i]
+        if value == recipe['file']:
+            command.append(str(source))
+        elif value == '-o':
+            command += ['-o', str(obj)]
+            i += 1
+        elif value in ('-MF', '-MJ'):
+            i += 1
+        elif value == '-Xclang' and recipe['arguments'][i + 1].startswith('-W'):
+            i += 1
+        elif not value.startswith('-W') and value not in ('-MD', '-MP'):
+            command.append(value)
+        i += 1
+    command += ['-I', str(ROOT / 'kits/pdx203'), '-I', str(ROOT / 'kits/AdrenoPM4'), '-I', str(ROOT / 'kits/ArmSmmu4K'), '-I', str(ROOT / 'kits/AdrenoFirmware'),
+                '-I', str(KITS / 'pipa'), '-I', str(KITS / 'AdrenoFirmware'), '-I', str(KITS / 'AdrenoPM4'), '-I', str(KITS / 'ArmSmmu4K'), '-I', str(ROOT / '.cache/xnu-work/osfmk'),
+                '-I', str(driver), '-I', str(PACKAGE), '-Wall', '-Wextra', '-Werror',
+                '-Wno-unused-parameter', '-Wno-incompatible-sysroot', '-Wno-c99-designator',
+                '-Wno-reorder-init-list', '-Wno-deprecated-enum-enum-conversion',
+                '-Wno-unnecessary-virtual-specifier']
+    # Mode 12: the staged AGXAccelerator registers the IOAcceleratorES service that the original
+    # Metal discovery needs (IOAcceleratorES -> MetalPluginName -> NSBundle -> the plugin).
+    if source.name == 'GpuProbe.cpp':
+        command.append('-DPIPA_GPU_ACCELERATOR=1')
+    result = subprocess.run(command, cwd=recipe['directory'], capture_output=True, text=True)
+    if result.returncode:
+        sys.exit(str(source) + ':\n' + result.stderr[-2500:])
+    objects.append(obj)
+archive = out / 'libAdreno740.a'
+archive.unlink(missing_ok=True)
+subprocess.run(['xcrun', 'ar', 'rcs', archive, *objects], check=True)
+print('PASS: %d NativeAdreno a650 objects archived' % len(objects))
+
+# Mode 12's staged accelerator, the job scripts/build-adreno740-accelerator.py does for the A740
+# checkout. The class derives from the original IOAcceleratorES, which this kernel does not
+# build, so its three base symbols are bound to the addresses the audited record names
+# (scripts/data/ioaccelerator-base-abi.json), and its initializer registration is stripped from
+# __mod_init_func so the board probe can run it after IOGPUFamily has loaded. build-xnu links
+# only libNativeAdreno.a, so it rides in the same archive.
+plan = json.loads((ROOT / 'scripts/data/ioaccelerator-base-abi.json').read_text())
+bindings = {
+    '__ZN15IOAcceleratorESC2EPK11OSMetaClass': int(plan['protected_compatible_constructor_aliases'][0], 16),
+    '__ZN15IOAcceleratorESD2Ev': int(plan['nondeleting_destructor'], 16),
+    '__ZN15IOAcceleratorES10gMetaClassE': int(plan['metaclass'], 16),
+}
+compiler = cxx_recipe['arguments'][0]
+llvm_bin = Path(compiler).parent
+accel_obj = out / 'NativeAdrenoAccelerator.o'
+command, i = [], 0
+while i < len(cxx_recipe['arguments']):
+    value = cxx_recipe['arguments'][i]
+    if value == cxx_recipe['file']:
+        command.append(str(driver / 'NativeAdrenoAccelerator.cpp'))
+    elif value == '-o':
+        command += ['-o', str(accel_obj)]
+        i += 1
+    elif value in ('-MF', '-MJ'):
+        i += 1
+    elif value == '-Xclang' and cxx_recipe['arguments'][i + 1].startswith('-W'):
+        i += 1
+    elif not value.startswith('-W') and value not in ('-MD', '-MP'):
+        command.append(value)
+    i += 1
+# NativeAdrenoAccelerator.cpp includes "../AdrenoMetal/OriginalAcceleratorABI.h", the Metal plugin repository's header, which this
+# tree carries as drivers/NativeMetal (FFT-infra/AdrenoMetal): an AdrenoMetal alias next to an empty include directory resolves it.
+shim = out / 'include-shim'
+(shim / 'base').mkdir(parents=True, exist_ok=True)
+alias = shim / 'AdrenoMetal'
+if alias.is_symlink() or alias.exists():
+    alias.unlink()
+# format 2: the tree carries no Metal plugin checkout until AdrenoMetal is selected; UniXNU's own drivers/AdrenoMetal (found next to
+# the base drivers the tree links, ArmCpu among them) has the same header
+metal = ROOT / 'drivers/AdrenoMetal'
+if not metal.is_dir():
+    metal = (ROOT / 'drivers/ArmCpu').resolve().parent / 'AdrenoMetal'
+alias.symlink_to(metal)
+command += ['-I', str(shim / 'base'), '-I', str(ROOT / '.cache/xnu-work/osfmk'), '-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter',
+            '-Wno-unnecessary-virtual-specifier', '-Wno-c99-designator', '-Wno-reorder-init-list',
+            '-Wno-deprecated-enum-enum-conversion', '-Wno-overloaded-virtual']
+result = subprocess.run(command, cwd=cxx_recipe['directory'], capture_output=True, text=True)
+if result.returncode:
+    sys.exit('NativeAdrenoAccelerator.cpp:\n' + result.stderr[-2500:])
+asm = out / 'original-bindings.S'
+write_synced(asm, ''.join('.globl %s\n.set %s, %#x\n' % (name, name, address) for name, address in sorted(bindings.items())))
+bind_obj = out / 'original-bindings.o'
+subprocess.run([compiler, '-c', '--target=arm64-apple-ios17.0', '-o', str(bind_obj), str(asm)], check=True)
+late = out / 'NativeAdrenoAccelerator.late.o'
+
+
+def tool(name):
+    found = shutil.which(name) or str(llvm_bin / name)
+    if not Path(found).exists():
+        sys.exit('missing ' + name + ' (the accelerator needs the LLVM binutils)')
+    return found
+
+
+subprocess.run([tool('llvm-objcopy'), '--remove-section=__DATA,__mod_init_func',
+                '--globalize-symbol=__GLOBAL__sub_I_NativeAdrenoAccelerator.cpp', str(accel_obj), str(late)], check=True)
+subprocess.run([tool('llvm-ar'), 'rcs', str(archive), str(late), str(bind_obj)], check=True)
+print('PASS: staged accelerator appended, IOAcceleratorES bound to %s'
+      % ', '.join('%#x' % address for _, address in sorted(bindings.items())))
+
+# Every NativeAdreno or kit symbol the objects use must be defined by them; the rest is the kernel's.
+nm = subprocess.run(['xcrun', 'nm', '-gP', archive], capture_output=True, text=True, check=True).stdout.splitlines()
+defined = {f.split()[0] for f in nm if len(f.split()) > 1 and f.split()[1] in 'TSDBC'}
+undefined = {f.split()[0] for f in nm if len(f.split()) > 1 and f.split()[1] == 'U'}
+missing = sorted(s for s in undefined - defined if re.search(r'NativeAdreno|native_adreno|ArmSmmu4K|AdrenoPM4|AdrenoHfi|AdrenoFirmware|A650Gmu|Sheng', s))
+if missing:
+    sys.exit('NativeAdreno symbols used but not built here: ' + ', '.join(missing))
+required = ('_NativeAdrenoGpuContextBringup', '_NativeAdrenoGpuContextBuffers', '_NativeAdrenoGpuContextVm', '_native_adreno_publish',
+            '_ArmSmmu4KAttachStreams', '_AdrenoPM4Type7', '_NativeAdrenoGmuContextBringupRoutes', '_NativeAdrenoGmuContextPayloads',
+            '_A650GmuColdStart', '_A650GmuBuildStartup', '_native_adreno_accelerator_allocate')
+absent = [s for s in required if s not in defined]
+if absent:
+    sys.exit('Required definitions absent: ' + ', '.join(absent))
+print('PASS: archive verified with %d objects' % len(objects))

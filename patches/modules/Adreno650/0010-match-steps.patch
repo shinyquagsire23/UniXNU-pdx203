@@ -1,0 +1,29 @@
+diff --git a/NativeAdrenoAccelerator.cpp b/NativeAdrenoAccelerator.cpp
+index 7f678fc..8e4465d 100644
+--- a/NativeAdrenoAccelerator.cpp
++++ b/NativeAdrenoAccelerator.cpp
+@@ -21,6 +21,7 @@ public:
+     OSObject *copyProperty(const OSSymbol *key) const APPLE_KEXT_OVERRIDE;
+     OSObject *copyProperty(const OSString *key) const APPLE_KEXT_OVERRIDE;
+     OSObject *copyProperty(const char *key) const APPLE_KEXT_OVERRIDE;
++    bool matchPropertyTable(OSDictionary *table,SInt32 *score) APPLE_KEXT_OVERRIDE;
+ };
+ OSDefineMetaClassAndStructors(AGXAccelerator,IOAcceleratorES)
+ 
+@@ -46,5 +47,16 @@ OSObject *AGXAccelerator::copyProperty(const char *key) const
+     native_adreno_note_property_read(key);
+     return IORegistryEntry::copyProperty(key);
+ }
++/* pdx203 sa44: a plugin step from a process whose sandbox refuses unlisted property reads (the WebKit GPU process): service matching is
++ * allowed, so the plugin matches IOAcceleratorES with a "NAMStep" key and the step lands in the PLUGSTEP ring as a "NAM:" read does. */
++bool AGXAccelerator::matchPropertyTable(OSDictionary *table,SInt32 *score)
++{
++    if(table)if(OSString *step=OSDynamicCast(OSString,table->getObject("NAMStep"))) {
++        char key[48];
++        snprintf(key,sizeof key,"NAM:%.40s",step->getCStringNoCopy());
++        native_adreno_note_property_read(key);
++    }
++    return IOService::matchPropertyTable(table,score);   /* IOAcceleratorES overrides nothing (its vtable is the runtime kext's) */
++}
+ extern "C" IOService *native_adreno_accelerator_allocate(void) {return new AGXAccelerator;}
+ extern "C" unsigned native_adreno_accelerator_instance_size(void) {return sizeof(AGXAccelerator);}

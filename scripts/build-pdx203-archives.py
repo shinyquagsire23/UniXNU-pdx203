@@ -49,6 +49,10 @@ def main():
         # NativeGOPPresenter) with the touch, HID, buttons and keystore probes, linked by the base build as
         # build/native-legacy-display/libNativeLegacyDisplay.late.a
         steps.append(['build-pdx203-legacy-display.py'])
+    if on('NATIVE_ADRENO'):
+        # the Adreno 650: drivers/Adreno650 (FFT-infra bdee54c and this repository's patch stack), the kits, the board probe and
+        # its firmware, linked by the base build as build/adreno740/libAdreno740.a
+        steps.append(['build-pdx203-adreno.py'])
     if on('QCOM_USB_DEBUG'):
         # the CDC-ACM kernel log over the DWC3 (drivers/QcomXnuUsbDebug, sm8250 profile), linked through
         # CONFIG_XNU_EXTRA_LD_ARCHIVES as build/qcom-usb-debug/libQcomXnuUsbDebug.a

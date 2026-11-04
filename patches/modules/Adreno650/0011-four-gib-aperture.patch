@@ -1,0 +1,50 @@
+diff --git a/NativeAdrenoGmuContext.cpp b/NativeAdrenoGmuContext.cpp
+index dc0acaf..dd76c0b 100644
+--- a/NativeAdrenoGmuContext.cpp
++++ b/NativeAdrenoGmuContext.cpp
+@@ -41,7 +41,7 @@ IOReturn NativeAdrenoGmuContext::bringUp(const ArmSmmu4KIo *io,unsigned bank,uns
+     if(!status)status=gmu_.allocate(NativeAdrenoGmuDefaultSizes(TablePages*0x1000),report->output_bits);
+     if(!status) {
+         step(Prepare);
+-        status=smmu_.prepare(&gmu_.tables(),0,0,GmuApertureBytes,NativeAdrenoSmmuContext::MaxLeaves,
++        status=smmu_.prepare(&gmu_.tables(),0,0,GmuApertureBytes,size_t(1)<<19,
+             bank,asid,1000,report->output_bits);
+     }
+     if(!status) {
+diff --git a/NativeAdrenoGpuContext.h b/NativeAdrenoGpuContext.h
+index 9bc2889..de7f7bc 100644
+--- a/NativeAdrenoGpuContext.h
++++ b/NativeAdrenoGpuContext.h
+@@ -18,7 +18,9 @@
+  * SQE buffer at 1 MiB would lie inside that window. */
+ enum : uint64_t {
+     GpuSqeIova=0x2000000, GpuRingIova=0x2100000, GpuMemptrsIova=0x2200000, GpuPwrupIova=0x2201000,
+-    GpuScratchIova=0x2202000, GpuApertureBytes=0x80000000
++    GpuScratchIova=0x2202000,
++    /* pdx203 sa54: 4 GiB (2 GiB before): the WebKit GPU process filled a 256 MiB window with surface imports (sa53). */
++    GpuApertureBytes=0x100000000ull
+ };
+ enum : size_t {GpuSqeBytes=0x13000, GpuRingBytes=0x8000, GpuPageBytes=0x1000, GpuBufferCount=5};
+ struct NativeAdrenoGpuBuffer {uint64_t physical,bytes,iova;};
+@@ -32,7 +34,7 @@ class NativeAdrenoGpuContext final {
+     bool ready_=false,used_=false;
+ public:
+     enum Step : uint32_t {Allocate=1,Prepare,Program,Attach,VmAttach,Map,Ready};
+-    enum : size_t {TablePages=1027};
++    enum : size_t {TablePages=2053};   /* 4 GiB of 4 KiB pages from level 1: 1 + 4 + 2048 tables (2 GiB: 1027) */
+     NativeAdrenoGpuContext()=default;
+     NativeAdrenoGpuContext(const NativeAdrenoGpuContext &)=delete;
+     NativeAdrenoGpuContext &operator=(const NativeAdrenoGpuContext &)=delete;
+diff --git a/NativeAdrenoSmmuContext.h b/NativeAdrenoSmmuContext.h
+index 4ed1bcc..cd82186 100644
+--- a/NativeAdrenoSmmuContext.h
++++ b/NativeAdrenoSmmuContext.h
+@@ -31,7 +31,7 @@ public:
+     NativeAdrenoSmmuContext(const NativeAdrenoSmmuContext &)=delete;
+     NativeAdrenoSmmuContext &operator=(const NativeAdrenoSmmuContext &)=delete;
+     /* A 2 GiB lower aperture, the GMU's, is 524288 leaves. */
+-    enum : size_t {MaxLeaves=size_t(1)<<19};
++    enum : size_t {MaxLeaves=size_t(1)<<20};   /* the GPU's 4 GiB (pdx203 sa54); the GMU's 2 GiB passes 1<<19 itself */
+     /* iova/bytes describe the aperture in the chosen region; the pool must be contiguous. */
+     /* output_bits: the context's output size, at most the SMMU's ID2.OAS (Linux uses OAS for stage 1). */
+     IOReturn prepare(NativeAdrenoMemory *tables,unsigned upper,uint64_t iova,size_t bytes,

@@ -1,0 +1,33 @@
+diff --git a/NativeAdrenoUserClient.cpp b/NativeAdrenoUserClient.cpp
+index b2abc2a..49ec7ce 100644
+--- a/NativeAdrenoUserClient.cpp
++++ b/NativeAdrenoUserClient.cpp
+@@ -307,6 +307,20 @@ IOReturn NativeAdrenoUserClient::mapBo(const NativeAdrenoAbiBoMap *request,
+     reply->iova=request->iova;
+     return kIOReturnSuccess;
+ }
++/* pdx203 usb-175: the CP's IB2 fetch faulted on a draw stream already unmapped while the IB1 that called it was in flight. The 256 newest
++ * BoFrees that unmapped a GPU range, for GpuProbe's GPUCRASH to name the one at a faulting address: {iova, bytes, handle, pid<<32 |
++ * newest fence handed out, completed fence <<32 | ms of uptime}. A free whose newest fence is below the faulting job's came before
++ * that job was submitted (a stale reference in the client); one at or above it, while the job ran. */
++extern "C" {volatile uint64_t native_adreno_free_log[256][5];volatile uint32_t native_adreno_free_log_count;}
++static void noteFreed(uint64_t iova,uint64_t bytes,uint64_t handle,uint32_t submitted,uint32_t completed)
++{
++    const uint32_t at=native_adreno_free_log_count&255u;
++    volatile uint64_t *r=native_adreno_free_log[at];
++    const uint64_t ms=native_adreno_vm_now_us?native_adreno_vm_now_us()/1000u:0;
++    r[0]=iova;r[1]=bytes;r[2]=handle;r[3]=(uint64_t)(uint32_t)proc_selfpid()<<32|submitted;r[4]=(uint64_t)completed<<32|(uint32_t)ms;
++    __asm__ volatile("dmb ish":::"memory");
++    native_adreno_free_log_count=native_adreno_free_log_count+1;
++}
+ static void noteFreeRefused(bool imported,uint64_t handle,IOReturn status)
+ {
+     if(!imported)return;
+@@ -329,6 +343,7 @@ IOReturn NativeAdrenoUserClient::freeBo(const NativeAdrenoAbiBoFree *request)
+         const IOReturn unmap=vm_->unmap(entry->mapped);
+         native_adreno_trace_stage=4;
+         if(unmap) {noteFreeRefused(entry->imported,entry->handle,unmap);return unmap;}
++        noteFreed(entry->iova,entry->memory.bytes(),entry->handle,ring_?ring_->lastSubmitted():0,ring_?ring_->completedFence():0);
+         entry->mapped_state=false;entry->mapped=0;entry->iova=0;
+     }
+     const IOReturn release=entry->memory.release();

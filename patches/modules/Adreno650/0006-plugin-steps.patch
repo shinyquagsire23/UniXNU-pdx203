@@ -1,0 +1,28 @@
+diff --git a/NativeAdrenoPublish.cpp b/NativeAdrenoPublish.cpp
+index 5771e0f..968ed28 100644
+--- a/NativeAdrenoPublish.cpp
++++ b/NativeAdrenoPublish.cpp
+@@ -105,6 +105,9 @@ volatile uint32_t native_adreno_mount_fail[4];
+ /* Processes that read MetalPluginName (the Metal discovery), first twelve names, with counts. */
+ struct NativeAdrenoAskerRecord {char name[20]; uint32_t reads;};
+ struct NativeAdrenoAskerRecord native_adreno_metal_askers[12];
++/* pdx203: the plugin's own steps in a process that never opens a device, read as registry keys "NAM:<step>" on the accelerator (a
++ * property read needs no connection): the latest eight, "<process> <step>", newest first. */
++char native_adreno_plugin_steps[8][48];
+ }
+ /* GPU address windows inside the board's VA range (GpuPowerProbe gDeviceInfo: 0x20000000..0x80000000 of the 2 GiB aperture). Slot 0 is the
+  * render server's (it held the whole 1.5 GiB alone before int-155 and used at most a few hundred MiB); slots 1 and 2 are for other Metal
+@@ -722,6 +725,13 @@ extern "C" IOReturn native_adreno_new_user_client(IOService *provider,task_t own
+ }
+ extern "C" void native_adreno_note_property_read(const char *key)
+ {
++    if(key && !strncmp(key,"NAM:",4)) {
++        char name[20]={};
++        proc_selfname(name,sizeof name);
++        for(unsigned i=7;i>0;--i)memcpy(native_adreno_plugin_steps[i],native_adreno_plugin_steps[i-1],sizeof native_adreno_plugin_steps[i]);
++        snprintf(native_adreno_plugin_steps[0],sizeof native_adreno_plugin_steps[0],"%.19s %.26s",name,key+4);
++        return;
++    }
+     if(key && !strcmp(key,"MetalPluginName")) {
+         proc_selfname(native_adreno_metal_diag.name_reader,17);
+         native_adreno_metal_diag.name_reads=native_adreno_metal_diag.name_reads+1;

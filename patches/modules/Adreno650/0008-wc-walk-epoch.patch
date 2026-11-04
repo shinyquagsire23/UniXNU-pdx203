@@ -1,0 +1,98 @@
+diff --git a/NativeAdrenoUserClient.cpp b/NativeAdrenoUserClient.cpp
+index 49ec7ce..6cf7282 100644
+--- a/NativeAdrenoUserClient.cpp
++++ b/NativeAdrenoUserClient.cpp
+@@ -33,6 +33,7 @@ static void noteImportState(uint64_t handle,uint64_t state)
+     for(unsigned i=0;i<8;++i)if(native_adreno_import_live[3+i*4+2]==handle) {native_adreno_import_live[3+i*4+3]=state;return;}
+ }
+ extern "C" volatile uint32_t native_adreno_io_coherent;
++extern "C" volatile uint32_t native_adreno_wc_epoch;   /* NativeAdrenoVm.cpp */
+ /* Per kernel method: [method][0] calls, [1] calls that returned non-zero, [2] last status, [3] total time (us, 32-bit). Method numbers are the ABI's (1..16). */
+ extern "C" {extern uint64_t (*native_adreno_vm_now_us)(void);volatile uint32_t native_adreno_method_stats[20][4];volatile uint32_t native_adreno_map_fail[7][2];}
+ static void noteImport(IOReturn status,uint32_t stage,uint64_t bytes,uint64_t address)
+@@ -505,6 +506,11 @@ IOReturn NativeAdrenoUserClient::dispatch(uint32_t method,const void *input,
+     if(input_size!=expected_in || output_size!=expected_out)return kIOReturnBadArgument;
+     if((expected_in && !input) || (expected_out && !output))return kIOReturnBadArgument;
+     IOReturn status=kIOReturnSuccess;
++    /* pdx203: a client's memory calls may change page attributes (NativeAdrenoVm.cpp native_adreno_wc_epoch). */
++    if(method==NativeAdrenoMethodBoAlloc || method==NativeAdrenoMethodBoMap || method==NativeAdrenoMethodBoFree ||
++        method==NativeAdrenoMethodBoCpuMap || method==NativeAdrenoMethodBoCpuUnmap || method==NativeAdrenoMethodBoImport ||
++        method==NativeAdrenoMethodCloseQueue)
++        native_adreno_wc_epoch=native_adreno_wc_epoch+1;
+     switch(method) {
+     case NativeAdrenoMethodQuery: {
+         NativeAdrenoAbiParams reply{};
+diff --git a/NativeAdrenoVm.cpp b/NativeAdrenoVm.cpp
+index 2041489..b1d3e25 100644
+--- a/NativeAdrenoVm.cpp
++++ b/NativeAdrenoVm.cpp
+@@ -18,7 +18,13 @@ extern "C" {volatile uint32_t native_adreno_io_coherent;volatile uint32_t native
+ volatile uint32_t native_adreno_written_imports_owned;
+ /* And this when its clients clean the read-only imports themselves before a submission (pipa: the Metal frontend cleans each IOSurface
+  * whose seed changed, NativeBridgeMetalFrontend.mm flushSurfaces): no cleaning of them per submission after the one at map. */
+-volatile uint32_t native_adreno_readonly_imports_owned;}
++volatile uint32_t native_adreno_readonly_imports_owned;
++/* pdx203: the read-only imports' cleaning period in ms (50 before sa38: about 60 MB and 5 ms of a submission every 50 ms, usb-179). */
++volatile uint32_t native_adreno_readonly_clean_ms=200;
++/* pdx203: bumped by anything that may change a page's attributes (a GPU map or unmap here, a client's allocation, free or CPU view:
++ * NativeAdrenoUserClient.cpp). reassertWriteCombined walks every page only when it moved, or 100 ms after its last walk; [0] walks,
++ * [1] skipped, [2] pages a timed walk reset with no event since the last (attributes that moved by themselves). */
++volatile uint32_t native_adreno_wc_epoch;volatile uint64_t native_adreno_wc_walks[3];}
+ static bool coherentMapping(unsigned writeback) {return writeback && native_adreno_io_coherent;}
+ /* GPU-written imports (render targets) are mapped non-coherent (the GPU stopped inside its end-of-pass clean writing them through
+  * write-back mappings), and the CPU never touches their pixels while the GPU owns them: they were cleaned when mapped and need no
+@@ -307,6 +313,7 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t
+ {
+     if(!handle)return kIOReturnBadArgument;*handle=0;result_={};
+     if(!attached_ || poisoned_)return kIOReturnNotReady;
++    native_adreno_wc_epoch=native_adreno_wc_epoch+1;
+     PhaseClock clock;
+     const unsigned cls=aliasClass(permissions,writeback,shareability)&15;
+     const bool exclusive=exclusivePages(memory,cls);
+@@ -358,6 +365,7 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t
+ IOReturn NativeAdrenoVm::unmap(uint64_t handle)
+ {
+     native_adreno_trace_stage=10;
++    native_adreno_wc_epoch=native_adreno_wc_epoch+1;
+     result_={};if(!attached_ || poisoned_)return kIOReturnNotReady;
+     Mapping *record=find(handle);if(!record)return kIOReturnBadArgument;
+     if(record->jobs)return kIOReturnBusy;
+@@ -441,7 +449,7 @@ IOReturn NativeAdrenoVm::publishMapped()
+     bool readonlyDue=false;
+     if(native_adreno_readonly_imports_owned) {
+ #ifdef KERNEL
+-        uint64_t period=0;nanoseconds_to_absolutetime(50ull*1000*1000,&period);
++        uint64_t period=0;nanoseconds_to_absolutetime((uint64_t)native_adreno_readonly_clean_ms*1000*1000,&period);
+         const uint64_t now=mach_absolute_time();
+         if(now-readonly_cleaned_>=period){readonlyDue=true;readonly_cleaned_=now;}
+ #else
+@@ -499,12 +507,29 @@ IOReturn NativeAdrenoVm::reassertWriteCombined(uint32_t *reset) const
+ {
+     if(!reset)return kIOReturnBadArgument;
+     if(!attached_ || poisoned_)return kIOReturnNotReady;
++    /* pdx203 usb-179: the walk looked at every page of every BO at every submission, 0.86 ms each. */
++    static uint32_t walked_epoch=~0u;static uint64_t walked_at;
++    const uint32_t epoch=native_adreno_wc_epoch;
++    bool timed=false;
++#ifdef KERNEL
++    uint64_t period=0;nanoseconds_to_absolutetime(100ull*1000*1000,&period);
++    const uint64_t now=mach_absolute_time();
++    timed=now-walked_at>=period;
++#else
++    const uint64_t now=0;timed=true;
++#endif
++    if(epoch==walked_epoch && !timed) {native_adreno_wc_walks[1]=native_adreno_wc_walks[1]+1;return kIOReturnSuccess;}
++    const bool quiet=epoch==walked_epoch;
++    walked_epoch=epoch;walked_at=now;
++    native_adreno_wc_walks[0]=native_adreno_wc_walks[0]+1;
++    const uint32_t before=*reset;
+     for(size_t i=0;i<high_;++i) {
+         const Mapping &m=mappings_[i];
+         if(!m.memory)continue;
+         const IOReturn status=m.memory->reassertWriteCombined(reset);
+         if(status)return status;
+     }
++    if(quiet && *reset!=before)native_adreno_wc_walks[2]=native_adreno_wc_walks[2]+(*reset-before);
+     return kIOReturnSuccess;
+ }
+ IOReturn NativeAdrenoVm::auditRange(uint64_t iova,size_t bytes,uint32_t *lines,uint32_t *dirty,uint32_t *stale) const
