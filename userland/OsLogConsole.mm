@@ -461,6 +461,7 @@ int kperfValue(const char *name, uint32_t value) {return sysctlbyname(name, null
 // where the thread really was. Rows (counts are samples):
 //   CPUIC <process>[pid] n<samples> r<row>: <where> <samples> ...   interrupted PCs, 10 a row
 //   CPUIL <process>[pid] n<samples> r<row>: <where> <samples> ...   their LRs (the caller, for a leaf that has not saved it)
+//   CPUIX <process>[pid] n<samples> r<row>: <pc>@<lr> <samples> ...  the most frequent PC and LR pairs
 //   CPUIT <process>[pid] n<samples> irq<wanted> el1<in the kernel> other<other process> bad<saved PC != ELR>: <thread> <samples> ...
 // Addresses as TaskImages::where. False when the sysctl is missing or refuses (then thread_get_state's profile runs).
 bool irqProfile(int pid, const char *process, mach_port_t task) {
@@ -532,6 +533,19 @@ bool irqProfile(int pid, const char *process, mach_port_t task) {
     if (records) {
         emitRows("CPUIC", process, pid, (unsigned)records, named(pcs), 60);
         emitRows("CPUIL", process, pid, (unsigned)records, named(lrs), 40);
+        // CPUIX: the interrupted PC with its LR, "<pc>@<lr>", the 40 most frequent pairs (who calls the hot leaves: malloc, locks).
+        std::vector<std::pair<std::string, unsigned>> pairs;
+        for (size_t i = 0; i < records; ++i) {
+            char pc[64], lr[64];
+            images.where(r[i].pc & 0x0000000fffffffffull, pc, sizeof pc);
+            images.where(r[i].lr & 0x0000000fffffffffull, lr, sizeof lr);
+            const std::string key = std::string(pc) + "@" + lr;
+            bool hit = false;
+            for (auto &e : pairs) if (e.first == key) {++e.second; hit = true; break;}
+            if (!hit && pairs.size() < 4096) pairs.push_back({key, 1});
+        }
+        std::sort(pairs.begin(), pairs.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+        emitRows("CPUIX", process, pid, (unsigned)records, pairs, 40);
     }
     std::sort(perThread.begin(), perThread.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
     int at = snprintf(line, sizeof line, "CPUIT %s[%d] n%zu irq%u el1 %u other %u bad %u:", process, pid, records, header[1], header[2], header[3], header[4]);
