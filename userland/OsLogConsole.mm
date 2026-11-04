@@ -25,6 +25,10 @@
 #include <string>
 #include <unistd.h>
 #include <vector>
+#include <algorithm>
+#include <mach/mach_time.h>
+#include <pthread.h>
+#include <time.h>
 
 namespace {
 
@@ -317,6 +321,122 @@ void installStagedSystemApps() {
 }
 }  // namespace
 
+// CPU use on the USB console, every 5 s while something is busy (and every 60 s regardless):
+//   CPUTOP <total>% | <process>[pid] <pct> ...            the busiest processes, as % of one core (8 cores: 800 % at most)
+//   CPUTHR <process>[pid] <pct>: <thread> <pct> ...       the busiest threads of the three busiest processes
+// The pids come from sysctl kern.proc.all (proc_listallpids answered nothing here, usb-128); the times from proc_pidinfo (PROC_PIDTASKINFO in
+// Mach ticks, PROC_PIDTHREADINFO per thread). A thread's share is its part of its process's threads' time, so the units of the two cancel.
+// pdx203: Safari's pages draw at 24 fps where Settings scrolls at 37-47 (2026-11-03); this says which process and thread is the limit.
+namespace {
+struct TaskInfo {   // <sys/proc_info.h> struct proc_taskinfo (not in the iOS SDK)
+    uint64_t virtual_size, resident_size, total_user, total_system, threads_user, threads_system;
+    int32_t policy, faults, pageins, cow_faults, messages_sent, messages_received, syscalls_mach, syscalls_unix, csw, threadnum, numrunning,
+        priority;
+};
+struct ThreadInfo {   // struct proc_threadinfo
+    uint64_t user_time, system_time;
+    int32_t cpu_usage, policy, run_state, flags, sleep_time, curpri, priority, maxpriority;
+    char name[64];
+};
+constexpr int kPidTaskInfo = 4, kPidThreadInfo = 5, kPidListThreads = 6;
+extern "C" int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int size);
+
+struct Sample { int pid; char name[20]; uint64_t ticks, delta; };
+
+void cpuTopPass(std::vector<Sample> &previous, std::vector<std::pair<uint64_t, uint64_t>> &threadsBefore, uint64_t intervalNs,
+                bool always, int &failures) {
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+    size_t size = 0;
+    if (sysctl(mib, 3, nullptr, &size, nullptr, 0) != 0 || !size) return;
+    size += size / 4;
+    std::vector<char> buffer(size);
+    if (sysctl(mib, 3, buffer.data(), &size, nullptr, 0) != 0) return;
+    const struct kinfo_proc *procs = (const struct kinfo_proc *)buffer.data();
+    const unsigned count = (unsigned)(size / sizeof *procs);
+    static mach_timebase_info_data_t timebase;
+    if (!timebase.denom) mach_timebase_info(&timebase);
+    std::vector<Sample> now;
+    for (unsigned i = 0; i < count; ++i) {
+        TaskInfo info = {};
+        const int pid = procs[i].kp_proc.p_pid;
+        if (proc_pidinfo(pid, kPidTaskInfo, 0, &info, sizeof info) != (int)sizeof info) {
+            if (pid > 1 && failures < 3 && ++failures == 3) {
+                char line[120];
+                snprintf(line, sizeof line, "CPUTOP proc_pidinfo(%d) refused: %s\n", pid, strerror(errno));
+                emit(line);
+            }
+            continue;
+        }
+        Sample sample = {pid, {}, info.total_user + info.total_system, 0};
+        strlcpy(sample.name, procs[i].kp_proc.p_comm, sizeof sample.name);
+        for (const Sample &old : previous)
+            if (old.pid == pid && sample.ticks >= old.ticks) sample.delta = sample.ticks - old.ticks;
+        now.push_back(sample);
+    }
+    const bool first = previous.empty();
+    previous = now;
+    if (first) return;
+    std::sort(now.begin(), now.end(), [](const Sample &a, const Sample &b) { return a.delta > b.delta; });
+    auto percent = [&](uint64_t ticks) { return (unsigned)(ticks * timebase.numer / timebase.denom * 100 / (intervalNs ? intervalNs : 1)); };
+    uint64_t total = 0;
+    for (const Sample &s : now) total += s.delta;
+    if (!always && percent(total) < 15) return;
+    char line[400];
+    int at = snprintf(line, sizeof line, "CPUTOP %u%%", percent(total));
+    for (unsigned i = 0; i < now.size() && i < 8 && now[i].delta; ++i)
+        at += snprintf(line + at, sizeof line - at, " | %s[%d] %u", now[i].name, now[i].pid, percent(now[i].delta));
+    snprintf(line + at, sizeof line - at, "\n");
+    emit(line);
+    std::vector<std::pair<uint64_t, uint64_t>> threadsNow;
+    for (unsigned i = 0; i < now.size() && i < 3 && percent(now[i].delta) >= 10; ++i) {
+        uint64_t handles[256];
+        const int bytes = proc_pidinfo(now[i].pid, kPidListThreads, 0, handles, sizeof handles);
+        if (bytes <= 0) continue;
+        struct Thread { uint64_t delta; char name[24]; };
+        std::vector<Thread> threads;
+        uint64_t sum = 0;
+        for (int t = 0; t < bytes / (int)sizeof(uint64_t); ++t) {
+            ThreadInfo info = {};
+            if (proc_pidinfo(now[i].pid, kPidThreadInfo, handles[t], &info, sizeof info) != (int)sizeof info) continue;
+            const uint64_t time = info.user_time + info.system_time;
+            threadsNow.push_back({handles[t], time});
+            uint64_t delta = 0;
+            for (const auto &old : threadsBefore)
+                if (old.first == handles[t] && time >= old.second) delta = time - old.second;
+            Thread thread = {delta, {}};
+            if (info.name[0]) strlcpy(thread.name, info.name, sizeof thread.name);
+            else snprintf(thread.name, sizeof thread.name, "t%llx", (unsigned long long)(handles[t] & 0xfffff));
+            for (char &c : thread.name) if (c == ' ') c = '_';
+            threads.push_back(thread);
+            sum += delta;
+        }
+        if (!sum) continue;
+        std::sort(threads.begin(), threads.end(), [](const Thread &a, const Thread &b) { return a.delta > b.delta; });
+        const unsigned whole = percent(now[i].delta);
+        at = snprintf(line, sizeof line, "CPUTHR %s[%d] %u:", now[i].name, now[i].pid, whole);
+        for (unsigned t = 0; t < threads.size() && t < 6 && threads[t].delta; ++t)
+            at += snprintf(line + at, sizeof line - at, " %s %u", threads[t].name, (unsigned)(threads[t].delta * whole / sum));
+        snprintf(line + at, sizeof line - at, "\n");
+        emit(line);
+    }
+    threadsBefore = threadsNow;
+}
+
+void *cpuTop(void *) {
+    std::vector<Sample> previous;
+    std::vector<std::pair<uint64_t, uint64_t>> threads;
+    int failures = 0;
+    uint64_t last = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    for (unsigned pass = 0;; ++pass) {
+        sleep(5);
+        const uint64_t when = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+        @autoreleasepool { cpuTopPass(previous, threads, when - last, pass % 12 == 0, failures); }
+        last = when;
+    }
+    return nullptr;
+}
+}  // namespace
+
 int main() {
     @autoreleasepool {
         Filter filter = load();
@@ -325,6 +445,8 @@ int main() {
                  filter.exact.size(), filter.prefix.size(), filter.all ? ", all processes" : "", filter.level, filter.rate);
         emit(line);
         gFilter = filter;
+        pthread_t sampler;
+        if (pthread_create(&sampler, nullptr, cpuTop, nullptr) == 0) pthread_detach(sampler);
         launchServicesDatabase();
         installStagedSystemApps();
         if (startLiveStream()) {
