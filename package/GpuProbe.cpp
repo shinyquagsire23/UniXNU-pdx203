@@ -1337,7 +1337,10 @@ bool metal() {
     if (!accelerator) return stop(kIOReturnNoMemory);
     if (!accelerator->init()) {accelerator->release(); return stop(kIOReturnError);}
     accelerator->setProperty("MetalPluginName", "NativeAdrenoMetal");
-    accelerator->setProperty("NativeSandboxGrantProcess", "backboardd,iconservicesagent,Preferences,PosterBoard");
+    // The WebKit GPU process too (sa44/45: its Metal device failed with VK_ERROR_INITIALIZATION_FAILED, its sandbox refusing the open
+    // before this driver saw it, so WebKit drew with CoreAnimation's software renderer on 4.6 cores and Safari ran at 24 fps). The xnu
+    // grant compares 16 characters, so "com.apple.WebKit" processes all pass this check; which of them get a device is the plugin's list.
+    accelerator->setProperty("NativeSandboxGrantProcess", "backboardd,iconservicesagent,Preferences,PosterBoard,com.apple.WebKit.GPU");
     accelerator->setProperty("MetalPluginClassName", "NativeAdrenoMetalDevice");
     // Turnip's options for this board, which replace the plugin's default "sysmem,nocb" (NativeAdrenoMetalPlugin.mm
     // applyBoardTurnipDebug). That default keeps every pass in system memory against a hang of the A740's concurrent binning (BV
@@ -1440,6 +1443,9 @@ extern "C" char native_adreno_property_log[16][48] __attribute__((weak_import));
 extern "C" uint32_t native_adreno_property_log_repeat[16] __attribute__((weak_import));
 extern "C" volatile uint32_t native_adreno_property_log_count __attribute__((weak_import));
 uint32_t gPropLogPrinted;
+// NativeAdrenoPublish.cpp: BO CPU views (clientMemoryForType): calls, new, cached, refused, last refusal, threads inside.
+extern "C" volatile uint32_t native_adreno_view_diag[6] __attribute__((weak_import));
+char gViewsPrinted[120];
 // NativeAdrenoPublish.cpp kClientWindows: slot 0 the render server's 1 GiB, three more of 170 MiB.
 static const struct {uint64_t start, bytes;} kCrashWindows[4] = {
     {0x04000000ull, 0x5C000000ull}, {0x60000000ull, 0x0AAA9000ull}, {0x6AAA9000ull, 0x0AAA9000ull}, {0x75552000ull, 0x0AAA9000ull}};
@@ -1826,6 +1832,12 @@ void metalRows() {
         for (unsigned i = 0; i < 8 && n > 0 && size_t(n) < sizeof line - 50; ++i)
             if (native_adreno_plugin_steps[i][0]) n += snprintf(line + n, sizeof line - n, " | %.47s", native_adreno_plugin_steps[i]);
         printIfChanged(gStepsPrinted, sizeof gStepsPrinted, line);
+    }
+    if (&native_adreno_view_diag) {
+        snprintf(line, sizeof line, "VIEWS calls %u new %u cached %u refused %u last %x inside %u", native_adreno_view_diag[0],
+                 native_adreno_view_diag[1], native_adreno_view_diag[2], native_adreno_view_diag[3], native_adreno_view_diag[4],
+                 native_adreno_view_diag[5]);
+        if (native_adreno_view_diag[3]) printIfChanged(gViewsPrinted, sizeof gViewsPrinted, line);
     }
     // One PROPLOG row per entry when the log moved, oldest first.
     if (&native_adreno_property_log && &native_adreno_property_log_count && native_adreno_property_log_count != gPropLogPrinted) {

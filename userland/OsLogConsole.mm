@@ -500,11 +500,16 @@ void sandboxCheck(int pid) {
     task_dyld_info_data_t dyld = {};
     mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
     unsigned total = 0;
+    struct Img { uint64_t base; char name[40]; };
+    std::vector<Img> imgs;
+    uint64_t cacheBase = 0, slide = 0;
     if (task_info(task, TASK_DYLD_INFO, (task_info_t)&dyld, &count) == KERN_SUCCESS && dyld.all_image_info_addr) {
         struct dyld_all_image_infos all = {};
         vm_size_t got = 0;
         if (vm_read_overwrite(task, dyld.all_image_info_addr, sizeof all, (vm_address_t)&all, &got) == KERN_SUCCESS) {
             total = all.infoArrayCount;
+            cacheBase = all.sharedCacheBaseAddress;
+            slide = all.sharedCacheSlide;
             std::vector<struct dyld_image_info> infos(all.infoArrayCount < 2048 ? all.infoArrayCount : 2048);
             if (!infos.empty() && vm_read_overwrite(task, (vm_address_t)all.infoArray, infos.size() * sizeof infos[0],
                                                          (vm_address_t)infos.data(), &got) == KERN_SUCCESS) {
@@ -515,12 +520,60 @@ void sandboxCheck(int pid) {
                     vm_read_overwrite(task, (vm_address_t)info.imageFilePath, sizeof path - 1, (vm_address_t)path, &got);
                     const char *name = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
                     if (at < (int)sizeof line - 40) at += snprintf(line + at, sizeof line - at, " %.32s", name);
+                    Img img = {base, {}};
+                    strlcpy(img.name, name, sizeof img.name);
+                    imgs.push_back(img);
                 }
             }
         }
     }
     snprintf(line + at, sizeof line - at, " (%u images)\n", total);
     emit(line);
+    // sa43: every thread's stack (frame pointers, 12 frames), symbolized as image+offset or dsc:<unslid> (ipsw dyld a2s): a thread
+    // held inside the plugin's load (its initializers) would show here, as the plugin is mapped but never reached Metal's init call.
+    auto where = [&](uint64_t pc, char *out, size_t size) {
+        pc &= 0x0000000fffffffffull;
+        if (cacheBase && pc >= cacheBase && pc < cacheBase + 0x200000000ull) {snprintf(out, size, "dsc:%llx", (unsigned long long)(pc - slide)); return;}
+        const Img *best = nullptr;
+        for (const Img &img : imgs) if (img.base <= pc && (!best || img.base > best->base)) best = &img;
+        if (best) snprintf(out, size, "%.20s+%llx", best->name, (unsigned long long)(pc - best->base));
+        else snprintf(out, size, "%llx", (unsigned long long)pc);
+    };
+    thread_act_array_t threads = nullptr;
+    mach_msg_type_number_t threadCount = 0;
+    if (pass != 0 && task_threads(task, &threads, &threadCount) == KERN_SUCCESS) {
+        for (unsigned t = 0; t < threadCount; ++t) {
+            arm_thread_state64_t state = {};
+            mach_msg_type_number_t n = ARM_THREAD_STATE64_COUNT;
+            if (thread_get_state(threads[t], ARM_THREAD_STATE64, (thread_state_t)&state, &n) == KERN_SUCCESS) {
+                thread_extended_info_data_t ext = {};
+                mach_msg_type_number_t en = THREAD_EXTENDED_INFO_COUNT;
+                const bool named = thread_info(threads[t], THREAD_EXTENDED_INFO, (thread_info_t)&ext, &en) == KERN_SUCCESS && ext.pth_name[0];
+                at = snprintf(line, sizeof line, "SBSTACK %d t%u %.24s:", pid, t, named ? ext.pth_name : "-");
+                char w[64];
+                where(arm_thread_state64_get_pc(state), w, sizeof w);
+                at += snprintf(line + at, sizeof line - at, " %s", w);
+                where(arm_thread_state64_get_lr(state), w, sizeof w);
+                at += snprintf(line + at, sizeof line - at, " %s", w);
+                uint64_t fp = arm_thread_state64_get_fp(state) & 0x0000000fffffffffull;
+                for (unsigned f = 0; f < 12 && fp && at < (int)sizeof line - 40; ++f) {
+                    uint64_t frame[2] = {};
+                    vm_size_t got = 0;
+                    if (vm_read_overwrite(task, (vm_address_t)fp, sizeof frame, (vm_address_t)frame, &got) != KERN_SUCCESS) break;
+                    if (!frame[1]) break;
+                    where(frame[1], w, sizeof w);
+                    at += snprintf(line + at, sizeof line - at, " %s", w);
+                    const uint64_t next = frame[0] & 0x0000000fffffffffull;
+                    if (next <= fp) break;
+                    fp = next;
+                }
+                snprintf(line + at, sizeof line - at, "\n");
+                emit(line);
+            }
+            mach_port_deallocate(mach_task_self(), threads[t]);
+        }
+        vm_deallocate(mach_task_self(), (vm_address_t)threads, threadCount * sizeof threads[0]);
+    }
     mach_port_deallocate(mach_task_self(), task);
 }
 void cpuTopPass(std::vector<Sample> &previous, std::vector<std::pair<uint64_t, uint64_t>> &threadsBefore, uint64_t intervalNs,
