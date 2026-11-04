@@ -35,3 +35,6 @@ zzzzzzzzzk-apps-addon-mount.patch
 # The board's audio server plug-in (ShengAudio.driver) in the addon's audio/, union-mounted over /System/Library/Audio/Plug-Ins/HAL
 # (mount5), and the native_gpu_addon5_* status globals package/Pdx203Audio.cpp reads.
 zzzzzzzzzl-audio-addon-mount.patch
+# The board's PSCI halt/restart (halt_all_cpus calls native_board_halt_restart, set by package/ButtonProbe.cpp): shutdown and reboot
+# work instead of timing out at IOPlatformExpert.cpp:884.
+zzzzzzzzzm-halt-board.patch

@@ -1,0 +1,30 @@
+pdx203: the board's own PSCI halt/restart so shutdown and reboot work
+
+SM8250 PSCI reports SYSTEM_RESET unsupported and there is no Apple watchdog, so the stock halt_all_cpus path timed out
+(IOPlatformExpert.cpp:884 "Halt/Restart Timed out"). halt_all_cpus now calls native_board_halt_restart first, which
+package/ButtonProbe.cpp sets once the PMIC is reachable (PS_HOLD reset type, then drop PS_HOLD). From the fork (zzy-zhalt-board.patch).
+
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -795,11 +795,21 @@
+ {
+ 	return machine_info.memory_size;
+ }
++
++/* pdx203: the board's own halt and restart (package/ButtonProbe.cpp sets it once the PMIC is reachable): on SM8250 the PSCI
++ * firmware reports SYSTEM_RESET as not supported, and Apple's platform driver resets through a watchdog this board does not
++ * have, so neither shutdown nor restart did anything (IOPlatformExpert.cpp:884 "Halt/Restart Timed out"). The hook programs the
++ * PMIC's PS_HOLD reset type and drops PS_HOLD; it does not return. */
++void (*volatile native_board_halt_restart)(int reboot) = NULL;
+ 
+ __attribute__((noreturn))
+ void
+ halt_all_cpus(boolean_t reboot)
+ {
++	if (native_board_halt_restart) {
++		printf("%s (board)\n", reboot ? "MACH Reboot" : "CPU halted");
++		native_board_halt_restart(reboot ? 1 : 0);
++	}
+ 	if (reboot) {
+ 		printf("MACH Reboot\n");
+ 		PEHaltRestart(kPERestartCPU);

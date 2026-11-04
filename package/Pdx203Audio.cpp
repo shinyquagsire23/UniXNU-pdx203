@@ -200,7 +200,7 @@ bool ampPoll(unsigned amp, uint32_t reg, uint32_t bit) {
 // Linux cs35l41-lib.c / cs35l41.c / cs35l41_hda.c, Sony's driver for the board values). 16-bit I2S slots at 48 kHz, BCLK 1.536 MHz.
 // Per amplifier: [0] DEVID, [1] REVID, [2] OTPID, [3] IRQ1 status 1 at the last look, then the bring-up: [4] the step that failed
 // (0: none), [5] IRQ1 status 3 (bit 1 PLL lock), [6] PWR_CTRL2, [7] OTP fields written.
-uint32_t gAmpVolume = 0x8000, gAmpGain = 0;   // 0 dB digital, 0.5 dB analog (the plug-in applies the system volume) (pdx203-audio-vol / -gain override)
+uint32_t gAmpVolume = 0x8000, gAmpGain = 0x80;   // 0 dB digital, 4.5 dB analog (the 0.5 dB default was a touch quiet; <=0x140/10.5 dB is safe without DSP protection; plug-in applies system volume) (pdx203-audio-vol / -gain override)
 
 int ampOtpUnpack(unsigned amp) {
     uint32_t id = 0, otp[24];

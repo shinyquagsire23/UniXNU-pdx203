@@ -225,6 +225,15 @@ text_fixups = [
   "dyld_shared_cache_arm64.05,6749788,f6ddf297,f60300aa",
   # QuartzCore CADeviceUseVBL: use_vbl is always set, so the render server asks the framebuffer for vsync (2026-11-03)
   "dyld_shared_cache_arm64.03,27d6634,a00000b4,03000014",
+  # QuartzCore CA::IOSAManager::create_new_iosa_manager (0x1895a4964 / 0x1895a496c): on this board IOSurfaceAcceleratorCreate fails
+  # (no fixed-function IOSurface scaler/blit), and the window server's surface-copy path (copy_surface -> copy_iosurface ->
+  # copy_iosa_manager) hard-aborted QuartzCore, taking down backboardd and respawning SpringBoard -- the recurring freeze
+  # (backboardd-2026-11-04-160429.ips: SIGABRT, "Failed to create IOSurfaceAccelerator"). copy_iosurface already tolerates an
+  # accelerator-less manager (ldr [mgr,#0x10]; cbz -> release + return 0), so the two failure branches are redirected from the abort
+  # block to 0x1895a4994 (set refcount=1, release the temporaries, return the manager with a null accelerator). The copy is then
+  # skipped instead of crashing. 2026-11-04.
+  "dyld_shared_cache_arm64.03,27f8964,80040035,80010035",
+  "dyld_shared_cache_arm64.03,27f896c,400400b4,400100b4",
 ]
 
 [payload.adt]
