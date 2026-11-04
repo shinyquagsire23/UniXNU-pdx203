@@ -345,11 +345,16 @@ extern "C" int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int
 
 struct Sample { int pid; char name[20]; uint64_t ticks, delta; };
 
-// A one-second PC profile of a busy process (over 150 % of a core, at most every 30 s): every running thread's user PC sampled
-// (thread_get_state), the hottest PCs as "dsc:<unslid address>" in the shared cache (symbolize on the host with ipsw dyld a2s) or
-// "<image>+<offset>" in another image, then the samples by thread name:
-//   CPUPC <process>[pid] n<samples>: <where> <pct> ...
+// A one-second PC profile of a busy process (see cpuTopPass: every 10 s one of the three busiest over 40 %, in turn): the user PC of
+// every thread whose CPU time moved since its last look (thread_get_state), plus its callers (lr and the frame-pointer chain), the hottest
+// as "dsc:<unslid address>" in the shared cache (symbolize on the host against the shared cache's symbols) or "<image>+<offset>" in
+// another image; then the samples by thread name, and the MIBs (or name2oid strings) of threads caught in __sysctl:
+//   CPUPC <process>[pid] n<samples> r<row>: <where> <samples> ...   leaf PCs, 10 a row
+//   CPUPI <process>[pid] n<samples> r<row>: <where> <samples> ...   return addresses, each once a sample (inclusive)
 //   CPUPT <process>[pid]: <thread> <samples> ...
+//   CPUSC <process>[pid] n<samples>: <mib or n2o:name> <samples> ...
+// Caveat (pdx203, 2026-11-03): a thread running user code is stopped for thread_get_state only at its next kernel entry, so the leaf
+// PCs lean to system calls; CPUTHR's user/kernel split is the reliable figure.
 // It needs a task read port (task_for_pid with the task-port grants in build-oslog-console.py); a refusal is reported once.
 extern "C" kern_return_t task_read_for_pid(mach_port_t, int, mach_port_t *) __attribute__((weak_import));
 void profile(int pid, const char *process) {
@@ -402,44 +407,116 @@ void profile(int pid, const char *process) {
         for (char &c : names[t]) if (c == ' ') c = '_';
         if (names[t].size() > 28) names[t].resize(28);
     }
-    std::vector<std::pair<uint64_t, unsigned>> pcs;
+    std::vector<std::pair<uint64_t, unsigned>> pcs, callers;
     std::vector<unsigned> perThread(threadCount);
+    std::vector<uint64_t> cpuSeen(threadCount);
+    std::vector<std::pair<std::string, unsigned>> sysctls;
+    // __sysctl's syscall instruction in the target (the shared cache maps at the same address in every process of a boot).
+    static uint64_t sysctlPc;
+    if (!sysctlPc) if (void *f = dlsym(RTLD_DEFAULT, "__sysctl")) sysctlPc = (uint64_t)f & 0x0000000fffffffffull;
     unsigned samples = 0;
     const uint64_t end = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 1000000000ull;
     while (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) < end) {
         for (unsigned t = 0; t < threadCount; ++t) {
             thread_basic_info_data_t basic = {};
             mach_msg_type_number_t n = THREAD_BASIC_INFO_COUNT;
-            if (thread_info(threads[t], THREAD_BASIC_INFO, (thread_info_t)&basic, &n) != KERN_SUCCESS || basic.run_state != TH_STATE_RUNNING) continue;
+            if (thread_info(threads[t], THREAD_BASIC_INFO, (thread_info_t)&basic, &n) != KERN_SUCCESS) continue;
+            // Only a thread whose CPU time moved since its last look (2026-11-03: a run loop asleep in mach_msg still showed as running
+            // and made 70 % of WebKit's samples); the first look at each thread only records its time.
+            const uint64_t cpu = (uint64_t)(basic.user_time.seconds + basic.system_time.seconds) * 1000000ull +
+                                 (uint64_t)(basic.user_time.microseconds + basic.system_time.microseconds);
+            const uint64_t before = cpuSeen[t];
+            cpuSeen[t] = cpu + 1;
+            if (!before || cpu + 1 == before) continue;
             arm_thread_state64_t state = {};
             n = ARM_THREAD_STATE64_COUNT;
             if (thread_get_state(threads[t], ARM_THREAD_STATE64, (thread_state_t)&state, &n) != KERN_SUCCESS) continue;
             const uint64_t pc = arm_thread_state64_get_pc(state) & 0x0000000fffffffffull;
+            // A thread in __sysctl: which MIB (x0 the name, x1 its length); for name2oid ({0, 3}, what sysctlbyname does first) the
+            // name string in x4.
+            if (sysctlPc && pc >= sysctlPc && pc < sysctlPc + 16) {
+                int mib[8] = {};
+                const uint64_t nameAt = state.__x[0] & 0x0000000fffffffffull, len = state.__x[1];
+                vm_size_t got = 0;
+                char what[64] = {};
+                if (len >= 1 && len <= 8 && vm_read_overwrite(task, (vm_address_t)nameAt, len * sizeof(int), (vm_address_t)mib, &got) == KERN_SUCCESS) {
+                    if (len >= 2 && mib[0] == 0 && mib[1] == 3) {
+                        char text[48] = {};
+                        if (vm_read_overwrite(task, (vm_address_t)(state.__x[4] & 0x0000000fffffffffull), sizeof text - 1, (vm_address_t)text, &got) != KERN_SUCCESS) strlcpy(text, "?", sizeof text);
+                        snprintf(what, sizeof what, "n2o:%.40s", text);
+                    } else {
+                        int at = 0;
+                        for (unsigned i = 0; i < len && at < (int)sizeof what - 12; ++i) at += snprintf(what + at, sizeof what - at, i ? ".%d" : "%d", mib[i]);
+                    }
+                    bool hit = false;
+                    for (auto &e : sysctls) if (e.first == what) {++e.second; hit = true; break;}
+                    if (!hit && sysctls.size() < 32) sysctls.push_back({what, 1});
+                }
+            }
             ++samples; ++perThread[t];
             bool found = false;
             for (auto &e : pcs) if (e.first == pc) {++e.second; found = true; break;}
             if (!found && pcs.size() < 4096) pcs.push_back({pc, 1});
+            // The callers: lr and the frame-pointer chain (16 frames), each return address once per sample (inclusive counts).
+            uint64_t chain[18]; unsigned depth = 0;
+            chain[depth++] = arm_thread_state64_get_lr(state) & 0x0000000fffffffffull;
+            uint64_t fp = arm_thread_state64_get_fp(state) & 0x0000000fffffffffull;
+            for (unsigned f = 0; f < 16 && fp && !(fp & 7); ++f) {
+                uint64_t pair[2] = {};
+                vm_size_t got = 0;
+                if (vm_read_overwrite(task, (vm_address_t)fp, sizeof pair, (vm_address_t)pair, &got) != KERN_SUCCESS || got != sizeof pair) break;
+                const uint64_t ret = pair[1] & 0x0000000fffffffffull, next = pair[0] & 0x0000000fffffffffull;
+                if (!ret) break;
+                chain[depth++] = ret;
+                if (next <= fp) break;
+                fp = next;
+            }
+            for (unsigned c = 0; c < depth; ++c) {
+                bool dup = false;
+                for (unsigned d = 0; d < c; ++d) if (chain[d] == chain[c]) dup = true;
+                if (dup) continue;
+                bool hit = false;
+                for (auto &e : callers) if (e.first == chain[c]) {++e.second; hit = true; break;}
+                if (!hit && callers.size() < 8192) callers.push_back({chain[c], 1});
+            }
         }
         usleep(2000);
     }
     if (samples) {
         std::sort(pcs.begin(), pcs.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
-        int at = snprintf(line, sizeof line, "CPUPC %s[%d] n%u:", process, pid, samples);
-        for (unsigned i = 0; i < pcs.size() && i < 14 && at < (int)sizeof line - 60; ++i) {
-            const uint64_t pc = pcs[i].first;
-            char where[64];
-            if (cacheBase && pc >= cacheBase && pc < cacheBase + 0x200000000ull) {
-                snprintf(where, sizeof where, "dsc:%llx", (unsigned long long)(pc - slide));
-            } else {
-                const Image *best = nullptr;
-                for (const Image &image : images) if (image.base <= pc && (!best || image.base > best->base)) best = &image;
-                if (best) snprintf(where, sizeof where, "%s+%llx", best->name, (unsigned long long)(pc - best->base));
-                else snprintf(where, sizeof where, "%llx", (unsigned long long)pc);
+        std::sort(callers.begin(), callers.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+        // Rows of 10: CPUPC the leaf PCs (top 40), CPUPI the return addresses in the stacks (top 80); counts are samples, not percent.
+        auto rows = [&](const char *tag, const std::vector<std::pair<uint64_t, unsigned>> &list, unsigned limit) {
+            for (unsigned first = 0; first < list.size() && first < limit; first += 10) {
+                int at = snprintf(line, sizeof line, "%s %s[%d] n%u r%u:", tag, process, pid, samples, first / 10);
+                for (unsigned i = first; i < list.size() && i < first + 10 && at < (int)sizeof line - 60; ++i) {
+                    const uint64_t pc = list[i].first;
+                    char where[64];
+                    if (cacheBase && pc >= cacheBase && pc < cacheBase + 0x200000000ull) {
+                        snprintf(where, sizeof where, "dsc:%llx", (unsigned long long)(pc - slide));
+                    } else {
+                        const Image *best = nullptr;
+                        for (const Image &image : images) if (image.base <= pc && (!best || image.base > best->base)) best = &image;
+                        if (best) snprintf(where, sizeof where, "%s+%llx", best->name, (unsigned long long)(pc - best->base));
+                        else snprintf(where, sizeof where, "%llx", (unsigned long long)pc);
+                    }
+                    at += snprintf(line + at, sizeof line - at, " %s %u", where, list[i].second);
+                }
+                snprintf(line + at, sizeof line - at, "\n");
+                emit(line);
             }
-            at += snprintf(line + at, sizeof line - at, " %s %u", where, pcs[i].second * 100 / samples);
+        };
+        rows("CPUPC", pcs, 40);
+        rows("CPUPI", callers, 80);
+        if (!sysctls.empty()) {
+            std::sort(sysctls.begin(), sysctls.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+            int at = snprintf(line, sizeof line, "CPUSC %s[%d] n%u:", process, pid, samples);
+            for (unsigned i = 0; i < sysctls.size() && i < 8 && at < (int)sizeof line - 70; ++i)
+                at += snprintf(line + at, sizeof line - at, " %s %u", sysctls[i].first.c_str(), sysctls[i].second);
+            snprintf(line + at, sizeof line - at, "\n");
+            emit(line);
         }
-        snprintf(line + at, sizeof line - at, "\n");
-        emit(line);
+        int at = 0;
         std::vector<unsigned> order(threadCount);
         for (unsigned t = 0; t < threadCount; ++t) order[t] = t;
         std::sort(order.begin(), order.end(), [&](unsigned a, unsigned b) { return perThread[a] > perThread[b]; });
@@ -623,18 +700,25 @@ void cpuTopPass(std::vector<Sample> &previous, std::vector<std::pair<uint64_t, u
     emit(line);
     static uint64_t lastProfile;
     const uint64_t nowNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    for (unsigned i = 0; i < now.size() && i < 2; ++i)
-        if (now[i].pid > 0 && now[i].pid != getpid() && percent(now[i].delta) >= 150 && nowNs - lastProfile > 30000000000ull) {
-            lastProfile = nowNs;
-            profile(now[i].pid, now[i].name);
-            break;
+    // Every 10 s one of the three busiest processes over 40 % of a core, in turn (frame-time work: 2026-11-03, TestUFO at 50 fps with
+    // backboardd, the WebKit content and GPU processes each at 50-65 %).
+    static unsigned profileTurn;
+    if (nowNs - lastProfile > 10000000000ull) {
+        unsigned busy = 0;
+        while (busy < now.size() && busy < 3 && now[busy].pid > 0 && percent(now[busy].delta) >= 40) ++busy;
+        if (busy) {
+            const Sample &pick = now[profileTurn++ % busy];
+            if (pick.pid != getpid()) {lastProfile = nowNs; profile(pick.pid, pick.name);}
         }
-    std::vector<std::pair<uint64_t, uint64_t>> threadsNow;
+    }
+    // CPUTHR <process>[pid] <total>: <thread> <percent of a core>/k<of which in the kernel> ...
+    static std::vector<std::pair<uint64_t, uint64_t>> sysBefore;
+    std::vector<std::pair<uint64_t, uint64_t>> threadsNow, sysNow;
     for (unsigned i = 0; i < now.size() && i < 3 && percent(now[i].delta) >= 10; ++i) {
         uint64_t handles[256];
         const int bytes = proc_pidinfo(now[i].pid, kPidListThreads, 0, handles, sizeof handles);
         if (bytes <= 0) continue;
-        struct Thread { uint64_t delta; char name[24]; };
+        struct Thread { uint64_t delta, sys; char name[24]; };
         std::vector<Thread> threads;
         uint64_t sum = 0;
         for (int t = 0; t < bytes / (int)sizeof(uint64_t); ++t) {
@@ -642,10 +726,13 @@ void cpuTopPass(std::vector<Sample> &previous, std::vector<std::pair<uint64_t, u
             if (proc_pidinfo(now[i].pid, kPidThreadInfo, handles[t], &info, sizeof info) != (int)sizeof info) continue;
             const uint64_t time = info.user_time + info.system_time;
             threadsNow.push_back({handles[t], time});
-            uint64_t delta = 0;
+            sysNow.push_back({handles[t], info.system_time});
+            uint64_t delta = 0, sys = 0;
             for (const auto &old : threadsBefore)
                 if (old.first == handles[t] && time >= old.second) delta = time - old.second;
-            Thread thread = {delta, {}};
+            for (const auto &old : sysBefore)
+                if (old.first == handles[t] && info.system_time >= old.second) sys = info.system_time - old.second;
+            Thread thread = {delta, sys, {}};
             if (info.name[0]) strlcpy(thread.name, info.name, sizeof thread.name);
             else snprintf(thread.name, sizeof thread.name, "t%llx", (unsigned long long)(handles[t] & 0xfffff));
             for (char &c : thread.name) if (c == ' ') c = '_';
@@ -657,11 +744,13 @@ void cpuTopPass(std::vector<Sample> &previous, std::vector<std::pair<uint64_t, u
         const unsigned whole = percent(now[i].delta);
         at = snprintf(line, sizeof line, "CPUTHR %s[%d] %u:", now[i].name, now[i].pid, whole);
         for (unsigned t = 0; t < threads.size() && t < 6 && threads[t].delta; ++t)
-            at += snprintf(line + at, sizeof line - at, " %s %u", threads[t].name, (unsigned)(threads[t].delta * whole / sum));
+            at += snprintf(line + at, sizeof line - at, " %s %u/k%u", threads[t].name, (unsigned)(threads[t].delta * whole / sum),
+                           (unsigned)(threads[t].sys * whole / sum));
         snprintf(line + at, sizeof line - at, "\n");
         emit(line);
     }
     threadsBefore = threadsNow;
+    sysBefore = sysNow;
 }
 
 

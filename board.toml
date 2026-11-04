@@ -244,8 +244,10 @@ kernel_args = [
   "pmap-ram-wc=1",
   # cpu clocks: vote every epss frequency domain its highest non-turbo level (package/CpuFreqProbe.cpp, alioth's, same sm8250
   # windows at 0x18591000/2000/3000). the usb log carries "PDX203 CPUFREQ" rows with each domain's level before and after the
-  # vote. sheng-cpufreq=1 only reads; sheng-cpufreq-cap=<MHz> caps the vote
-  "sheng-cpufreq=3",
+  # vote. sheng-cpufreq=1 only reads; sheng-cpufreq-cap=<MHz> caps the vote. 4 (2026-11-03): also keeps threads on the four
+  # cortex-a77s (cpus 4-7): xnu runs all eight cores as one smp cluster, and the frame threads of TestUFO (WebKit, backboardd)
+  # landing on the 1.8 GHz a55s made about one frame in five miss its refresh
+  "sheng-cpufreq=4",
   # persistent Data: NativeRamBlock keeps the Data seed's changed pages in a store window at the end of userdata (NativeUfs
   # store, the only path that writes; clear of the root image and a 1 GiB reserve), so iPadOS keeps Setup, settings and its
   # first-boot work across boots. 2 reads and writes, 1 only reads the store. a seed over 2 GiB (local/owner-data-64g.dbr, built

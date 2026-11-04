@@ -9,6 +9,7 @@
 //   1  read-only: report each domain's enable bit, current/requested level and its highest LUT entry
 //   2  additionally request that highest non-turbo level in domain 0 (the boot CPU's cluster)
 //   3  the same in every domain once it reads enabled, and the highest L3 level
+//   4  mode 3, and threads kept off the Cortex-A55 cluster (cpus 0-3; see pdx203-cores below)
 // Optional `sheng-cpufreq-cap=<MHz>`: mode 3 requests the highest non-turbo level at or below it (domains and L3).
 // Register layout is the qcom-cpufreq-hw "epss" data of the pinned mainline tree (reg_enable 0x0, reg_domain_state 0x20,
 // reg_dcvs_ctrl 0xb0, reg_freq_lut 0x100 with 4-byte rows, reg_perf_state 0x320, per-core perf_state rows +4*i for the
@@ -147,12 +148,28 @@ extern "C" void sheng_cpufreq_probe(void) {
 // every 30 s, and prints the CPUFREQ row to the console (and so the USB log) whenever it changes.
 #include <kern/thread.h>
 #include <libkern/libkern.h>
+// sheng-cpufreq=4 (mode 3's votes) or pdx203-cores=<mask>: the cores the scheduler may run threads on, applied once every domain has its
+// vote (or after the first minute); mode 4 means 0xf0 unless pdx203-cores says otherwise (the kernel command line has no room for both).
+// XNU sees this SoC as eight like cores in one cluster (ml_processor_register: cluster 0, type 0 for all, the Clutch SMP scheduler),
+// so the render server's, WebKit's and the compositor's frame threads land on the 1.8 GHz Cortex-A55s (cpus 0-3) as readily as on the
+// 2.4/2.8 GHz Cortex-A77s (4-7). 0xf0 keeps them on the A77s. The same call the performance controller makes to park cores
+// (sched_perfcontrol_update_recommended_cores): cores left out still take interrupts and run threads bound to them, and the scheduler's
+// own failsafe brings every core back while a realtime thread is starved. 0 (the default) leaves every core recommended.
+extern "C" void sched_perfcontrol_update_recommended_cores(uint32_t recommended_cores);
 namespace {
 void cpufreqThread(void *, wait_result_t)
 {
     char last[sizeof(native_cpufreq_row)] = {};
+    uint32_t cores = gMode >= 4 ? 0xf0 : 0;
+    PE_parse_boot_argn("pdx203-cores", &cores, sizeof(cores));
+    bool coresApplied = cores == 0;
     for (unsigned round = 0;; ++round) {
         sheng_cpufreq_poll();
+        if (!coresApplied && (round >= 60 || (gDomain[0].voted >= 0 && gDomain[1].voted >= 0 && gDomain[2].voted >= 0))) {
+            coresApplied = true;
+            sched_perfcontrol_update_recommended_cores(cores);
+            printf("PDX203 CORES recommended %#x (round %u)\n", cores, round);
+        }
         if (strncmp(last, native_cpufreq_row, sizeof(last)) != 0) {
             strlcpy(last, native_cpufreq_row, sizeof(last));
             printf("PDX203 %s\n", last);
