@@ -267,6 +267,19 @@ rtc_late=OUT/'Pdx203Rtc.late.o'
 run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_Pdx203Rtc.cpp',rtc_obj,rtc_late])
 require(code(rtc_obj.read_bytes(),macho(rtc_obj.read_bytes()))==code(rtc_late.read_bytes(),macho(rtc_late.read_bytes())),
         'Owned RTC instructions unchanged by late init staging')
+# the audio DSP (package/AdspProbe.cpp, sheng's ADSP bring-up with the SM8250 addresses) and its protocol cores, the stage 1 speaker
+# probe (package/Pdx203Audio.cpp: the CS35L41 amplifiers over GENI I2C and the APR core service). The C cores build with the kernel's
+# osfmk C line; the firmware reader (AdspFirmware.c, the modem_a FAT volume through NativeUfs) with the bsd one, as sheng builds it.
+adsp_src,adsp_probe=board_cpp('AdspProbe.cpp')
+audio_src,audio_probe=board_cpp('Pdx203Audio.cpp')
+# the headphone jack (WCD938x over SoundWire, the LPASS RX/TX macros), driven from Pdx203Audio.cpp
+hph_src,hph_obj=board_cpp('Pdx203Hph.cpp')
+# the audio service iOS's audio server plug-in opens (sheng's ShengAudioService.cpp): its classes register late from Pdx203Audio.cpp
+audio_svc_src,audio_svc_obj=board_cpp('ShengAudioService.cpp')
+audio_svc_late=OUT/'ShengAudioService.late.o'
+run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_ShengAudioService.cpp',audio_svc_obj,audio_svc_late])
+require(code(audio_svc_obj.read_bytes(),macho(audio_svc_obj.read_bytes()))==code(audio_svc_late.read_bytes(),macho(audio_svc_late.read_bytes())),
+        'Owned audio service instructions unchanged by late init staging')
 def board_c(name,json_rel):
     """compile a board C source of kits/pdx203 with the kernel C line of json_rel into OUT/<stem>.o"""
     j=json.loads((ROOT/'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837'/json_rel).read_text().strip().rstrip(','))
@@ -281,9 +294,11 @@ def board_c(name,json_rel):
     cmd+=['-Wall','-Wextra','-Werror','-Wno-unused-parameter','-mgeneral-regs-only','-I',str(ROOT/'.cache/xnu-work/osfmk')]
     run(cmd,cwd=j['directory'])
     return src,obj
-# the GENI I2C core the touch probe drives (with the kernel's osfmk C line). The audio DSP, battery, RTC and Wi-Fi objects of the
-# full pdx203 image return one at a time once the minimal format 2 image is stable.
-board_c_objs=[board_c('GeniI2c.c','osfmk/DEVELOPMENT/startup.o.json')]
+# the ADSP protocol cores and the GENI I2C core the touch probe drives, built with the kernel's osfmk C line; the firmware reader
+# (AdspFirmware.c, the modem_a FAT volume through NativeUfs) with the bsd one, as sheng builds it.
+adsp_c=[board_c(n+'.c','osfmk/DEVELOPMENT/startup.o.json') for n in
+        ('QcomMdt','FatVolume','QcomQrtr','ShengQrtr','QcomSmem','QcomSmp2p','QcomGlink','QcomQmp','QcomRpmh','GeniI2c')]
+adsp_c.append(board_c('AdspFirmware.c','bsd/DEVELOPMENT/kern_exec.o.json'))
 print(run(['python3',ROOT/'scripts/build-arm-driver.py','AppleKeyStoreState'],text=True),end='')
 keyevents=ROOT/'build/apple-key-store-state';keyevents_late=keyevents/'NativeKeyStoreEvents.late.o'
 run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_NativeKeyStoreEvents.cpp',
@@ -292,10 +307,10 @@ require(code((keyevents/'NativeKeyStoreEvents.o').read_bytes(),macho((keyevents/
         code(keyevents_late.read_bytes(),macho(keyevents_late.read_bytes())),'Owned keystore instructions unchanged by late init staging')
 archive=OUT/'libNativeLegacyDisplay.late.a';archive.unlink(missing_ok=True)
 run(['xcrun','ar','rcs',archive,late,OUT/'original-bindings.o',probe,hid_probe,touch_probe,hid/'NativeHidInput.late.o',hid/'hid-original-bindings.o',
-     keystore_probe,keyevents_late,cpufreq_probe,buttons_probe,battery_late,battery_probe,rtc_late,rtc_probe,*[o for _,o in board_c_objs]])
+     keystore_probe,keyevents_late,cpufreq_probe,buttons_probe,battery_late,battery_probe,rtc_late,rtc_probe,adsp_probe,audio_probe,hph_obj,audio_svc_late,*[o for _,o in adsp_c]])
 sources=[ROOT/'drivers/GopFramebuffer/NativeLegacyDisplay.cpp',ROOT/'drivers/GopFramebuffer/NativeLegacyRequest.h',source,
          hid_src,touch_src,ROOT/'drivers/ShengHidInput/NativeHidInput.cpp',keystore_src,ROOT/'drivers/AppleKeyStoreState/NativeKeyStoreEvents.cpp',cpufreq_src,buttons_src,
-         ROOT/'kits/pdx203/ButtonsCore.h',battery_src,battery_probe_src,rtc_src,rtc_probe_src,*[c for c,_ in board_c_objs]]
+         ROOT/'kits/pdx203/ButtonsCore.h',battery_src,battery_probe_src,rtc_src,rtc_probe_src,adsp_src,audio_src,hph_src,audio_svc_src,*[c for c,_ in adsp_c]]
 print(run(['python3',ROOT/'scripts/build-arm-driver.py','NativeGOPPresenter'],text=True),end='')
 gop=ROOT/'build/native-gop-presenter';gop_late=gop/'NativeGOPPresenter.late.o'
 run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_NativeGOPPresenter.cpp',

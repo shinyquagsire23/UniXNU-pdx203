@@ -32,3 +32,6 @@ zzzzzzzzzh-oslog-forwarder-mounts.patch
 zzzzzzzzzj-unixnu-jailbreak.patch
 # The addon's staged apps (apps/: TrollStore, Sileo) unioned over /Applications (mount10).
 zzzzzzzzzk-apps-addon-mount.patch
+# The board's audio server plug-in (ShengAudio.driver) in the addon's audio/, union-mounted over /System/Library/Audio/Plug-Ins/HAL
+# (mount5), and the native_gpu_addon5_* status globals package/Pdx203Audio.cpp reads.
+zzzzzzzzzl-audio-addon-mount.patch

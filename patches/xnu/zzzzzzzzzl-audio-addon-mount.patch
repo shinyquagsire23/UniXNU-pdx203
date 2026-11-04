@@ -1,0 +1,32 @@
+pdx203: the board's audio server plug-in union-mounted over /System/Library/Audio/Plug-Ins/HAL (mount5)
+
+The addon's audio/ directory carries UniXNU-sheng's ShengAudio.driver (an AudioServerPlugIn), staged by the kernel below
+/private/var/ngpu and union-mounted next to the system's so coreaudiod loads it; its CDHash is in the owner trust cache. Adds the
+native_gpu_addon5_* status globals that package/Pdx203Audio.cpp reads for its SERVE row. From the fork (zzy-zaudio-addon-mount.patch).
+
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7223,6 +7223,8 @@
+ volatile int native_gpu_addon6_status = -1;
+ volatile int native_gpu_addon7_stage = 0;
+ volatile int native_gpu_addon7_status = -1;
++volatile int native_gpu_addon5_stage = 0;
++volatile int native_gpu_addon5_status = -1;
+ /* mount10: the app bundles the payload's addon stages under apps/, unioned over /Applications so that LaunchServices and SpringBoard
+  * find them next to the sealed system apps. The bundles are unsigned or signed with a fake certificate; the kernel admits them only with
+  * the jailbreak switch (patches/xnu/zzzzzzzzzj-unixnu-jailbreak.patch, amfi=0x80's get-out-of-my-way bit). */
+@@ -7702,6 +7704,14 @@
+ 	    "/Applications/MobileSafari.app", "/Applications/TrollStore.app", &native_gpu_addon10_stage, &native_gpu_addon10_status);
+ 	printf("GPUADDON mount6 (usr/bin) %d/%d mount7 (logging prefs) %d/%d mount10 (/Applications) %d/%d\n", native_gpu_addon6_stage,
+ 	    native_gpu_addon6_status, native_gpu_addon7_stage, native_gpu_addon7_status, native_gpu_addon10_stage, native_gpu_addon10_status);
++	/* pdx203: the board's audio server plug-in (UniXNU-sheng's ShengAudio.driver) next to the system's. The audio server loads every
++	 * driver bundle in this directory; the addon's audio/ carries it and its CDHash is in the owner trust cache. Scratch slot 0xe80
++	 * lies above mount6/7/10. package/Pdx203Audio.cpp reads native_gpu_addon5_* to report the mount in its SERVE row. */
++	static const char audio_source[] = "/private/var/ngpu/audio", audio_point[] = "/System/Library/Audio/Plug-Ins/HAL";
++	native_gpu_addon_mount(p, scratch, 0xe80, audio_source, sizeof(audio_source), audio_point, sizeof(audio_point),
++	    "/System/Library/Audio/Plug-Ins/HAL/BuiltinAudioPlugin.driver", "/System/Library/Audio/Plug-Ins/HAL/ShengAudio.driver/Info.plist",
++	    &native_gpu_addon5_stage, &native_gpu_addon5_status);
++	printf("GPUADDON mount5 (audio HAL) %d/%d\n", native_gpu_addon5_stage, native_gpu_addon5_status);
+ 	native_cryptex_os_view(p, scratch);
+ 	native_gestalt_cache_drop(p, scratch);
+ 	native_ls_store_drop(p, scratch);

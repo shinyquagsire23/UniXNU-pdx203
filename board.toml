@@ -170,6 +170,14 @@ kernel_args = [
   # the PM8150 RTC as the IORTC resource (package/Pdx203Rtc.cpp, on by default: pdx203-rtc=0 turns it off), which ArmDTPlatform reads
   # (patches/modules/ArmDTPlatform)
   "pdx203-battery=1",
+  # the audio DSP (package/AdspProbe.cpp, sheng's ADSP bring-up for SM8250): 2 loads adsp from modem_a's FAT volume (read in place
+  # through NativeUfs), starts it with the secure world, answers its service locator and brings up GLINK (1 only surveys).
+  "pdx203-adsp=2",
+  # speaker path (package/Pdx203Audio.cpp): 1 the two CS35L41 amplifiers over I2C, 2 the DSP's APR channel, 4 the path (amplifiers
+  # without their DSP, SENARY_MI2S_RX, ASM/ADM) and the audio service for iOS's audio server plug-in (hal/ShengAudioPlugIn.c, in the
+  # gpu addon's audio/, kernel-mounted over /System/Library/Audio/Plug-Ins/HAL), 8 the headphone jack (package/Pdx203Hph.cpp: WCD938x
+  # over SoundWire, RX_CODEC_DMA_RX_0; the stream follows the jack). ADSP / QRTR / AUDIO / APR / PLAY / SERVE / HPH rows on the usb log.
+  "pdx203-audio=15",
   # the AppleKeyStore stand-in: "no passcode, nothing locked"
   "offline-key-events=1",
   "sheng-aks=1",
