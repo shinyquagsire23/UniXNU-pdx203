@@ -1419,6 +1419,11 @@ extern "C" volatile uint32_t native_adreno_ib_log[4][4+28], native_adreno_ib_log
 extern "C" volatile uint32_t native_adreno_stall[2+NativeAdrenoRingStallWords];
 struct Pdx203ClientRecord {char name[20]; uint32_t opens, refused, closes, slot, peak_mib, last_refusal;};
 extern "C" struct Pdx203ClientRecord native_adreno_client_log[8] __attribute__((weak_import));
+struct Pdx203AskerRecord {char name[20]; uint32_t reads;};
+extern "C" struct Pdx203AskerRecord native_adreno_metal_askers[12] __attribute__((weak_import));
+char gAskersPrinted[300];
+extern "C" char native_adreno_plugin_steps[8][48] __attribute__((weak_import));
+char gStepsPrinted[440];
 // NativeAdrenoPublish.cpp kClientWindows: slot 0 the render server's 1 GiB, three more of 170 MiB.
 static const struct {uint64_t start, bytes;} kCrashWindows[4] = {
     {0x20000000ull, 0x40000000ull}, {0x60000000ull, 0x0AAA9000ull}, {0x6AAA9000ull, 0x0AAA9000ull}, {0x75552000ull, 0x0AAA9000ull}};
@@ -1751,7 +1756,7 @@ void clientText() {
 void metalRows() {
     if (!&native_adreno_metal_diag) return;
     const Pdx203MetalDiag &d = native_adreno_metal_diag;
-    char line[200];
+    char line[440];
     snprintf(line, sizeof line, "METAL opens %u busy %u bad %u closes %u grants %u foreign %u/%x | open %.16s %.16s %.16s | start %.16s %.16s %.16s | mount fail %u/%x/%u/%u",
              d.opens, d.busy, d.bad, d.closes, d.grants, d.foreign_opens, d.foreign_type, d.opener[0], d.opener[1], d.opener[2],
              d.starter[0], d.starter[1], d.starter[2], &native_adreno_mount_fail ? native_adreno_mount_fail[0] : 0,
@@ -1766,6 +1771,22 @@ void metalRows() {
         snprintf(line, sizeof line, "METALCLI %.19s opens %u refused %u closes %u slot %u peak %u MiB last %x", c.name, c.opens, c.refused,
                  c.closes, c.slot, c.peak_mib, c.last_refusal);
         printIfChanged(gClientPrinted[i], sizeof gClientPrinted[i], line);
+    }
+    // The processes that read MetalPluginName, Metal's discovery of the accelerator (NativeAdrenoPublish.cpp native_adreno_metal_askers):
+    // which of them never opened a device after asking (WebKit.GPU drew with CoreAnimation's software renderer, 4.7 cores, usb-173).
+    if (&native_adreno_metal_askers) {
+        int n = snprintf(line, sizeof line, "METALASK");
+        for (unsigned i = 0; i < 12 && n > 0 && size_t(n) < sizeof line - 32; ++i)
+            if (native_adreno_metal_askers[i].name[0])
+                n += snprintf(line + n, sizeof line - n, " %.19s:%u", native_adreno_metal_askers[i].name, native_adreno_metal_askers[i].reads);
+        printIfChanged(gAskersPrinted, sizeof gAskersPrinted, line);
+    }
+    // The plugin's steps in processes that may never open a device (NativeAdrenoMetalPlugin.mm step), newest first.
+    if (&native_adreno_plugin_steps) {
+        int n = snprintf(line, sizeof line, "PLUGSTEP");
+        for (unsigned i = 0; i < 8 && n > 0 && size_t(n) < sizeof line - 50; ++i)
+            if (native_adreno_plugin_steps[i][0]) n += snprintf(line + n, sizeof line - n, " | %.47s", native_adreno_plugin_steps[i]);
+        printIfChanged(gStepsPrinted, sizeof gStepsPrinted, line);
     }
     clientText();
     if (&native_adreno_method_stats) {

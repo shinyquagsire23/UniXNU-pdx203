@@ -27,6 +27,8 @@
 #include <vector>
 #include <algorithm>
 #include <mach/mach_time.h>
+#include <mach/mach.h>
+#include <mach-o/dyld_images.h>
 #include <pthread.h>
 #include <time.h>
 
@@ -343,6 +345,145 @@ extern "C" int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int
 
 struct Sample { int pid; char name[20]; uint64_t ticks, delta; };
 
+// A one-second PC profile of a busy process (over 150 % of a core, at most every 30 s): every running thread's user PC sampled
+// (thread_get_state), the hottest PCs as "dsc:<unslid address>" in the shared cache (symbolize on the host with ipsw dyld a2s) or
+// "<image>+<offset>" in another image, then the samples by thread name:
+//   CPUPC <process>[pid] n<samples>: <where> <pct> ...
+//   CPUPT <process>[pid]: <thread> <samples> ...
+// It needs a task read port (task_for_pid with the task-port grants in build-oslog-console.py); a refusal is reported once.
+extern "C" kern_return_t task_read_for_pid(mach_port_t, int, mach_port_t *) __attribute__((weak_import));
+void profile(int pid, const char *process) {
+    static int refusals;
+    mach_port_t task = MACH_PORT_NULL;
+    kern_return_t kr = task_for_pid(mach_task_self(), pid, &task);
+    if (kr != KERN_SUCCESS && task_read_for_pid) kr = task_read_for_pid(mach_task_self(), pid, &task);
+    char line[480];
+    if (kr != KERN_SUCCESS) {
+        if (refusals++ < 2) {snprintf(line, sizeof line, "CPUPC %s[%d]: no task port (0x%x)\n", process, pid, kr); emit(line);}
+        return;
+    }
+    // The images: the shared cache's slide and base, and every other image's load address and name.
+    struct Image { uint64_t base; char name[40]; };
+    std::vector<Image> images;
+    uint64_t slide = 0, cacheBase = 0;
+    task_dyld_info_data_t dyld = {};
+    mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
+    if (task_info(task, TASK_DYLD_INFO, (task_info_t)&dyld, &count) == KERN_SUCCESS && dyld.all_image_info_addr) {
+        struct dyld_all_image_infos all = {};
+        vm_size_t got = 0;
+        if (vm_read_overwrite(task, dyld.all_image_info_addr, sizeof all, (vm_address_t)&all, &got) == KERN_SUCCESS) {
+            slide = all.sharedCacheSlide;
+            cacheBase = all.sharedCacheBaseAddress;
+            std::vector<struct dyld_image_info> infos(all.infoArrayCount < 2048 ? all.infoArrayCount : 2048);
+            if (!infos.empty() && vm_read_overwrite(task, (vm_address_t)all.infoArray, infos.size() * sizeof infos[0],
+                                                         (vm_address_t)infos.data(), &got) == KERN_SUCCESS) {
+                for (const auto &info : infos) {
+                    const uint64_t base = (uint64_t)info.imageLoadAddress;
+                    if (cacheBase && base >= cacheBase && base < cacheBase + 0x200000000ull) continue;
+                    char path[256] = {};
+                    vm_read_overwrite(task, (vm_address_t)info.imageFilePath, sizeof path - 1, (vm_address_t)path, &got);
+                    const char *name = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
+                    Image image = {base, {}};
+                    strlcpy(image.name, name, sizeof image.name);
+                    images.push_back(image);
+                }
+            }
+        }
+    }
+    thread_act_array_t threads = nullptr;
+    mach_msg_type_number_t threadCount = 0;
+    if (task_threads(task, &threads, &threadCount) != KERN_SUCCESS) {mach_port_deallocate(mach_task_self(), task); return;}
+    std::vector<std::string> names(threadCount);
+    for (unsigned t = 0; t < threadCount; ++t) {
+        thread_extended_info_data_t ext = {};
+        mach_msg_type_number_t n = THREAD_EXTENDED_INFO_COUNT;
+        if (thread_info(threads[t], THREAD_EXTENDED_INFO, (thread_info_t)&ext, &n) == KERN_SUCCESS && ext.pth_name[0]) names[t] = ext.pth_name;
+        else names[t] = "t" + std::to_string(t);
+        for (char &c : names[t]) if (c == ' ') c = '_';
+        if (names[t].size() > 28) names[t].resize(28);
+    }
+    std::vector<std::pair<uint64_t, unsigned>> pcs;
+    std::vector<unsigned> perThread(threadCount);
+    unsigned samples = 0;
+    const uint64_t end = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 1000000000ull;
+    while (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) < end) {
+        for (unsigned t = 0; t < threadCount; ++t) {
+            thread_basic_info_data_t basic = {};
+            mach_msg_type_number_t n = THREAD_BASIC_INFO_COUNT;
+            if (thread_info(threads[t], THREAD_BASIC_INFO, (thread_info_t)&basic, &n) != KERN_SUCCESS || basic.run_state != TH_STATE_RUNNING) continue;
+            arm_thread_state64_t state = {};
+            n = ARM_THREAD_STATE64_COUNT;
+            if (thread_get_state(threads[t], ARM_THREAD_STATE64, (thread_state_t)&state, &n) != KERN_SUCCESS) continue;
+            const uint64_t pc = arm_thread_state64_get_pc(state) & 0x0000000fffffffffull;
+            ++samples; ++perThread[t];
+            bool found = false;
+            for (auto &e : pcs) if (e.first == pc) {++e.second; found = true; break;}
+            if (!found && pcs.size() < 4096) pcs.push_back({pc, 1});
+        }
+        usleep(2000);
+    }
+    if (samples) {
+        std::sort(pcs.begin(), pcs.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+        int at = snprintf(line, sizeof line, "CPUPC %s[%d] n%u:", process, pid, samples);
+        for (unsigned i = 0; i < pcs.size() && i < 14 && at < (int)sizeof line - 60; ++i) {
+            const uint64_t pc = pcs[i].first;
+            char where[64];
+            if (cacheBase && pc >= cacheBase && pc < cacheBase + 0x200000000ull) {
+                snprintf(where, sizeof where, "dsc:%llx", (unsigned long long)(pc - slide));
+            } else {
+                const Image *best = nullptr;
+                for (const Image &image : images) if (image.base <= pc && (!best || image.base > best->base)) best = &image;
+                if (best) snprintf(where, sizeof where, "%s+%llx", best->name, (unsigned long long)(pc - best->base));
+                else snprintf(where, sizeof where, "%llx", (unsigned long long)pc);
+            }
+            at += snprintf(line + at, sizeof line - at, " %s %u", where, pcs[i].second * 100 / samples);
+        }
+        snprintf(line + at, sizeof line - at, "\n");
+        emit(line);
+        std::vector<unsigned> order(threadCount);
+        for (unsigned t = 0; t < threadCount; ++t) order[t] = t;
+        std::sort(order.begin(), order.end(), [&](unsigned a, unsigned b) { return perThread[a] > perThread[b]; });
+        at = snprintf(line, sizeof line, "CPUPT %s[%d] %u threads:", process, pid, threadCount);
+        for (unsigned i = 0; i < threadCount && i < 10 && perThread[order[i]] && at < (int)sizeof line - 40; ++i)
+            at += snprintf(line + at, sizeof line - at, " %s %u", names[order[i]].c_str(), perThread[order[i]]);
+        snprintf(line + at, sizeof line - at, "\n");
+        emit(line);
+    }
+    for (unsigned t = 0; t < threadCount; ++t) mach_port_deallocate(mach_task_self(), threads[t]);
+    vm_deallocate(mach_task_self(), (vm_address_t)threads, threadCount * sizeof threads[0]);
+    mach_port_deallocate(mach_task_self(), task);
+}
+
+
+// What a WebKit GPU process's sandbox lets it do with the Metal plugin (WebKit.GPU reads MetalPluginName but never runs the plugin,
+// usb-174/175): sandbox_check against that process, once per pid, for the plugin's files (file-read-data) and the accelerator's user
+// client (iokit-open-user-client, filter types 12..16 tried as the numbering is private).  SBCHECK <pid> <check>=<0 allowed|1 denied|-1>
+extern "C" int sandbox_check(pid_t, const char *, int, ...);
+extern "C" int proc_pidpath(int, void *, uint32_t);
+void sandboxCheck(int pid) {
+    static std::vector<int> done;
+    for (int d : done) if (d == pid) return;
+    done.push_back(pid);
+    char path[1024] = {};
+    if (proc_pidpath(pid, path, sizeof path) <= 0 || !strstr(path, "com.apple.WebKit.GPU")) return;
+    constexpr int kNoReport = 0x40000000, kFilterPath = 1;
+    const char *const files[] = {"/System/Library/Extensions/NativeAdrenoMetal.bundle/NativeAdrenoMetal",
+                                 "/System/Library/Extensions/NativeAdrenoMetal.bundle/Info.plist",
+                                 "/System/Library/Extensions/NativeAdrenoMetal.bundle/libvulkan_freedreno.dylib",
+                                 "/System/Library/Extensions/NativeAdrenoMetal.publish", "/System/Library/Extensions/NativeAdrenoMetal.clients",
+                                 "/System/Library/Extensions/AGXMetalA10.bundle/AGXMetalA10", nullptr};
+    char line[480];
+    int at = snprintf(line, sizeof line, "SBCHECK %d", pid);
+    for (unsigned i = 0; files[i]; ++i) {
+        const char *base = strrchr(files[i], '/') + 1;
+        at += snprintf(line + at, sizeof line - at, " %s=%d", base, sandbox_check(pid, "file-read-data", kFilterPath | kNoReport, files[i]));
+    }
+    at += snprintf(line + at, sizeof line - at, " map=%d", sandbox_check(pid, "file-map-executable", kFilterPath | kNoReport, files[0]));
+    for (int type = 12; type <= 16; ++type)
+        at += snprintf(line + at, sizeof line - at, " io%d=%d", type, sandbox_check(pid, "iokit-open-user-client", type | kNoReport, "AGXDeviceUserClient"));
+    snprintf(line + at, sizeof line - at, "\n");
+    emit(line);
+}
 void cpuTopPass(std::vector<Sample> &previous, std::vector<std::pair<uint64_t, uint64_t>> &threadsBefore, uint64_t intervalNs,
                 bool always, int &failures) {
     int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
@@ -367,6 +508,7 @@ void cpuTopPass(std::vector<Sample> &previous, std::vector<std::pair<uint64_t, u
             }
             continue;
         }
+        if (!strncmp(procs[i].kp_proc.p_comm, "com.apple.WebKi", 15)) sandboxCheck(pid);
         Sample sample = {pid, {}, info.total_user + info.total_system, 0};
         strlcpy(sample.name, procs[i].kp_proc.p_comm, sizeof sample.name);
         for (const Sample &old : previous)
@@ -387,6 +529,14 @@ void cpuTopPass(std::vector<Sample> &previous, std::vector<std::pair<uint64_t, u
         at += snprintf(line + at, sizeof line - at, " | %s[%d] %u", now[i].name, now[i].pid, percent(now[i].delta));
     snprintf(line + at, sizeof line - at, "\n");
     emit(line);
+    static uint64_t lastProfile;
+    const uint64_t nowNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    for (unsigned i = 0; i < now.size() && i < 2; ++i)
+        if (now[i].pid > 0 && now[i].pid != getpid() && percent(now[i].delta) >= 150 && nowNs - lastProfile > 30000000000ull) {
+            lastProfile = nowNs;
+            profile(now[i].pid, now[i].name);
+            break;
+        }
     std::vector<std::pair<uint64_t, uint64_t>> threadsNow;
     for (unsigned i = 0; i < now.size() && i < 3 && percent(now[i].delta) >= 10; ++i) {
         uint64_t handles[256];
@@ -421,6 +571,7 @@ void cpuTopPass(std::vector<Sample> &previous, std::vector<std::pair<uint64_t, u
     }
     threadsBefore = threadsNow;
 }
+
 
 void *cpuTop(void *) {
     std::vector<Sample> previous;
