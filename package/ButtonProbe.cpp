@@ -426,6 +426,15 @@ extern "C" void pdx203_halt_install(void) {
     uint8_t ctl = 0, ctl2 = 0;
     if (gPonWrite >= 0) {read8(gPonWrite, 0x5A, &ctl); read8(gPonWrite, 0x5B, &ctl2);}
     printf("BUTTONS halt/restart via PON apid %d (ps_hold_rst_ctl %02x ctl2 %02x) and PS_HOLD\n", gPonWrite, ctl, ctl2);
+    // Why the PMIC last started and stopped (usb-180 ended in a silent reset): PON gen2 registers 0xC0..0xCA, as Linux's
+    // qpnp-power-on reads them: PON_REASON1, -, WARM_RESET_REASON1/2, ON_REASON, POFF_REASON1/2, OFF_REASON, FAULT_REASON1/2,
+    // S3_RESET_REASON.
+    if (gPonWrite >= 0) {
+        uint8_t r[11] = {};
+        for (unsigned i = 0; i < 11; ++i) read8(gPonWrite, 0xC0 + i, &r[i]);
+        printf("BUTTONS pon reasons c0 %02x %02x warm %02x %02x on %02x poff %02x %02x off %02x fault %02x %02x s3 %02x\n", r[0], r[1],
+               r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10]);
+    }
     native_board_halt_restart = haltRestart;
 }
 

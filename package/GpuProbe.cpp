@@ -552,6 +552,7 @@ void gxOn() {
 }
 
 // Mode 9. GPU register access for NativeAdreno (dword indices) through the GPU window.
+extern "C" volatile uint32_t native_adreno_readonly_clean_ms __attribute__((weak_import));
 extern "C" {
 extern volatile uint32_t native_adreno_readonly_imports_owned;
 extern volatile uint32_t native_adreno_smmu_coherent_walk, native_adreno_wc_enabled, native_adreno_written_imports_owned,
@@ -630,6 +631,11 @@ bool gpuContext() {
     unsigned readOnlyOwned = 1;
     PE_parse_boot_argn("pipa-gpu-ro-own", &readOnlyOwned, sizeof readOnlyOwned);
     native_adreno_readonly_imports_owned = readOnlyOwned ? 1 : 0;
+    // How often the kernel still cleans every read-only import (ms): 50 cost about 60 MB and 5 ms of one submission every 50 ms
+    // (usb-179); pdx203-gpu-ro-ms sets it.
+    unsigned roMs = 200;
+    PE_parse_boot_argn("pdx203-gpu-ro-ms", &roMs, sizeof roMs);
+    if (&native_adreno_readonly_clean_ms && roMs) native_adreno_readonly_clean_ms = roMs;
     // MiB, the BO pool taken before memory fragments; pipa-gpu-pool=0 for scattered BOs only. 768 since Turnip keeps freed BOs for reuse
     // (tu_knl_darwin.cc BO cache, up to 48 MiB): at 384 the pool ran at 340 of 384 MiB without it (2026-10-25), and a BO past the pool is
     // scattered pages whose write-combine change and its undoing cost milliseconds each.
@@ -825,6 +831,9 @@ extern "C" volatile uint64_t native_adreno_submit_phase[7] __attribute__((weak_i
 // write-combine audit stopped trusting the client views (0 = never) and the pages the re-assertion found back at the default attribute.
 extern "C" volatile uint64_t native_adreno_cache_stats[5] __attribute__((weak_import));
 extern "C" volatile uint32_t native_adreno_wc_distrusted __attribute__((weak_import));
+// NativeAdrenoVm.cpp (NativeAdreno 0004): the write-combine walks done, skipped (no attribute event since the last), and the pages a
+// timed walk found reset with no event (attributes that changed by themselves); and the read-only imports' cleaning period.
+extern "C" volatile uint64_t native_adreno_wc_walks[3] __attribute__((weak_import));
 extern "C" volatile uint32_t native_adreno_wc_audit[6] __attribute__((weak_import));
 void submitRow() {
     if (!&native_adreno_submit_phase) return;
@@ -839,10 +848,12 @@ void submitRow() {
     char line[sizeof native_gpu_rows[0]];
     uint64_t maintained_ns = 0;
     if (&native_adreno_cache_stats) absolutetime_to_nanoseconds(native_adreno_cache_stats[0], &maintained_ns);
-    snprintf(line, sizeof line, "SUBT n%llu us check %llu sweep %llu wc %llu pub %llu tlb %llu ring %llu | mt %llu %lluMB %llums d%u r%u",
+    snprintf(line, sizeof line, "SUBT n%llu us check %llu sweep %llu wc %llu pub %llu tlb %llu ring %llu | wk %llu/%llu/%llu %lluMB %llums d%u r%u",
              (unsigned long long)n, (unsigned long long)us[0], (unsigned long long)us[1], (unsigned long long)us[2],
              (unsigned long long)us[3], (unsigned long long)us[4], (unsigned long long)us[5],
-             &native_adreno_cache_stats ? (unsigned long long)native_adreno_cache_stats[3] : 0ull,
+             &native_adreno_wc_walks ? (unsigned long long)native_adreno_wc_walks[0] : 0ull,
+             &native_adreno_wc_walks ? (unsigned long long)native_adreno_wc_walks[1] : 0ull,
+             &native_adreno_wc_walks ? (unsigned long long)native_adreno_wc_walks[2] : 0ull,
              &native_adreno_cache_stats ? (unsigned long long)(native_adreno_cache_stats[1] >> 20) : 0ull,
              (unsigned long long)(maintained_ns / 1000000), &native_adreno_wc_distrusted ? native_adreno_wc_distrusted : 0u,
              &native_adreno_wc_audit ? native_adreno_wc_audit[5] : 0u);
@@ -1462,6 +1473,26 @@ void crashWords(const char *label, uint64_t from, unsigned count) {
                w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
     }
 }
+// The newest kernel BoFree that unmapped the range holding iova (NativeAdrenoUserClient.cpp native_adreno_free_log): when, by whom, and
+// the fences then (newest handed out, completed). A free below the faulting job's fence came before that job was submitted.
+extern "C" volatile uint64_t native_adreno_free_log[256][5] __attribute__((weak_import));
+extern "C" volatile uint32_t native_adreno_free_log_count __attribute__((weak_import));
+extern "C" uint64_t (*native_adreno_vm_now_us)(void) __attribute__((weak_import));
+void crashFreed(const char *label, uint64_t iova) {
+    if (!&native_adreno_free_log || !&native_adreno_free_log_count || !iova) return;
+    const uint32_t count = native_adreno_free_log_count, n = count < 256 ? count : 256;
+    const uint64_t nowMs = &native_adreno_vm_now_us && native_adreno_vm_now_us ? native_adreno_vm_now_us() / 1000u : 0;
+    unsigned found = 0;
+    for (uint32_t k = 0; k < n && found < 2; ++k) {
+        const volatile uint64_t *r = native_adreno_free_log[(count - 1 - k) & 255u];
+        if (iova < r[0] || iova - r[0] >= r[1]) continue;
+        ++found;
+        printf("GPUFREE %s %llx in %llx+%llx h%llx pid %u sub %u done %u | %u ms ago (%u frees back)\n", label, (unsigned long long)iova,
+               (unsigned long long)r[0], (unsigned long long)r[1], (unsigned long long)r[2], (uint32_t)(r[3] >> 32), (uint32_t)r[3],
+               (uint32_t)(r[4] >> 32), (uint32_t)(nowMs - (uint32_t)r[4]), k);
+    }
+    if (!found) printf("GPUFREE %s %llx not among the last %u frees (of %u)\n", label, (unsigned long long)iova, n, count);
+}
 void crashReport(const char *why) {
     static bool done;
     if (done) return;
@@ -1481,6 +1512,9 @@ void crashReport(const char *why) {
     printf("GPUCRASH ib1 %llx+%x (%s) ib2 %llx+%x (%s) | rb r%x w%x | sub %u/%u | irq seen %x last %x n%u\n",
            (unsigned long long)ib1, rem1, crashOwner(ib1), (unsigned long long)ib2, rem2, crashOwner(ib2), gpuRead(0x806), gpuRead(0x807),
            st.submissions, st.completed, gIrqSeen, gIrqLast, gIrqCount);
+    crashFreed("far", far);
+    crashFreed("ib1", ib1);
+    crashFreed("ib2", ib2);
     for (unsigned slot = 0; slot < 4; ++slot) {
         const char *name = "-";
         if (&native_adreno_client_log) for (auto &r : native_adreno_client_log) if (r.name[0] && r.slot == slot) name = r.name;
