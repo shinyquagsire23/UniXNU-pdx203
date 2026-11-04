@@ -183,7 +183,16 @@ bool startLiveStream() {
 namespace {
 void launchServicesDatabase() {
     char line[600];
-    const bool rebuild = access("/private/var/ngpu/oslog/lsrebuild", F_OK) == 0 && access("/private/var/ngpu/oslog/lsrebuild2.done", F_OK) != 0;
+    // Rebuild once per marker content: the addon's lsrebuild file carries a token (the apps it stages), and .done keeps the token of
+    // the last rebuild. They differ when the apps change (or .done is absent on a fresh store), which is when LaunchServices must
+    // re-scan /Applications. The persistent Data store keeps .done across boots, so a fixed name would rebuild only once ever.
+    auto slurp = [](const char *path) {
+        char b[256]; int fd = open(path, O_RDONLY); if (fd < 0) return std::string();
+        ssize_t n = read(fd, b, sizeof b); close(fd); return std::string(b, n > 0 ? (size_t)n : 0);
+    };
+    const char *marker = "/private/var/ngpu/oslog/lsrebuild", *done = "/private/var/ngpu/oslog/lsrebuild.done";
+    const std::string token = slurp(marker);
+    const bool rebuild = !token.empty() && token != slurp(done);
     // every container tree (the system group containers included), the daemons' caches and /var/db; usb-128 found none in the narrower set
     char *roots[] = {(char *)"/private/var/containers", (char *)"/private/var/mobile/Containers", (char *)"/private/var/mobile/Library",
                      (char *)"/private/var/root/Library", (char *)"/private/var/db", nullptr};
@@ -214,12 +223,12 @@ void launchServicesDatabase() {
         snprintf(line, sizeof line, "OSLOG csstore: %u found; LaunchServices rebuild through LSApplicationWorkspace: %s\n", found,
                  !workspace ? "no workspace" : ![workspace respondsToSelector:rebuildSel] ? "no such call" : ok ? "done" : "refused");
         emit(line);
-        if (ok) {int fd = open("/private/var/ngpu/oslog/lsrebuild2.done", O_CREAT | O_WRONLY, 0644); if (fd >= 0) close(fd);}
+        if (ok) {int fd = open(done, O_CREAT | O_TRUNC | O_WRONLY, 0644); if (fd >= 0) {write(fd, token.data(), token.size()); close(fd);}}
         return;
     }
     if (!rebuild) {snprintf(line, sizeof line, "OSLOG csstore: %u found, %u removed\n", found, removed); emit(line); return;}
-    int fd = open("/private/var/ngpu/oslog/lsrebuild2.done", O_CREAT | O_WRONLY, 0644);   // only once something was removed
-    if (fd >= 0) close(fd);
+    int fd = open(done, O_CREAT | O_TRUNC | O_WRONLY, 0644);   // record this marker token as done
+    if (fd >= 0) {write(fd, token.data(), token.size()); close(fd);}
     // lsd by name from the kernel's process table (sysctl kern.proc.all; proc_listallpids found nothing in usb-128)
     int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
     size_t size = 0;

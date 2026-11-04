@@ -198,6 +198,11 @@ kernel_args = [
   # platform binary, and the board's log forwarder that the addon overlays as its executable is an owner-trusted one (f2g: AMFI
   # "Launch Constraint Violation ... (Constraint not matched)", SIGKILL at exec)
   "sheng-no-lc=1",
+  # the jailbreak switch: amfi=0x80 is AMFI's get-out-of-my-way bit, and patches/xnu/zzzzzzzzzj-unixnu-jailbreak.patch makes the kernel
+  # follow it (unsigned and fake-signed code runs: TrollStore, Sileo from the addon's apps/, mount10). 0x03 as the fork booted it
+  "amfi=0x83",
+  # the OS volume's deletable system apps copied once into Data for the first-boot migration (upstream zzy-staged-system-apps.patch)
+  "sheng-staged-apps=1",
 ]
 # Fixups of signed text beyond the OS profile's four (its [payload] text_fixups is replaced, so they are repeated here).
 text_fixups = [

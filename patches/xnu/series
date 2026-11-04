@@ -27,3 +27,8 @@ zzzzzzzzzg-native-adreno-kobj-filter-grant.patch
 # The board's unified-log forwarder (userland/OsLogConsole.mm) as the cached iomfb_fdr_loader job's /usr/bin executable, and the
 # Enable-Private-Data logging preference, both overlays of the GPU addon (sheng-gpu-addon=1).
 zzzzzzzzzh-oslog-forwarder-mounts.patch
+# The jailbreak switch (amfi=0x80's bit drives unixnu_jailbreak): MAC_CHECK iterates the policies, so AMFI's signature hook still stamps
+# cs_flags, then allows; unsigned and fake-signed code runs (TrollStore, Sileo). From the fork, with the iterate-then-allow fix (sa75).
+zzzzzzzzzj-unixnu-jailbreak.patch
+# The addon's staged apps (apps/: TrollStore, Sileo) unioned over /Applications (mount10).
+zzzzzzzzzk-apps-addon-mount.patch

@@ -1,0 +1,37 @@
+pdx203: the addon's staged apps over /Applications (mount10)
+
+The pdx203 fork's zzzzzzzzzi-apps-addon-mount.patch rewritten for upstream's addon mounts: /private/var/ngpu/apps (TrollStore,
+Sileo) unioned over /Applications. Their code signing passes only the jailbreak switch (amfi=0x80).
+
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 5fcb3a4..094f444 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7223,6 +7223,11 @@ volatile int native_gpu_addon6_stage = 0;
+ volatile int native_gpu_addon6_status = -1;
+ volatile int native_gpu_addon7_stage = 0;
+ volatile int native_gpu_addon7_status = -1;
++/* mount10: the app bundles the payload's addon stages under apps/, unioned over /Applications so that LaunchServices and SpringBoard
++ * find them next to the sealed system apps. The bundles are unsigned or signed with a fake certificate; the kernel admits them only with
++ * the jailbreak switch (patches/xnu/zzzzzzzzzj-unixnu-jailbreak.patch, amfi=0x80's get-out-of-my-way bit). */
++volatile int native_gpu_addon10_stage = 0;
++volatile int native_gpu_addon10_status = -1;
+ static void
+ native_gpu_addon_mount(proc_t p, user_addr_t scratch, user_addr_t offset, const char *source, size_t source_size,
+     const char *point, size_t point_size, const char *visible, const char *own, volatile int *stage, volatile int *status)
+@@ -7690,8 +7695,13 @@ native_gpu_addon_prepare(proc_t p, user_addr_t scratch)
+ 	native_gpu_addon_mount(p, scratch, 0xe40, logging_source, sizeof(logging_source), logging_point, sizeof(logging_point),
+ 	    "/Library/Preferences/Logging/Subsystems", "/Library/Preferences/Logging/com.apple.system.logging.plist",
+ 	    &native_gpu_addon7_stage, &native_gpu_addon7_status);
+-	printf("GPUADDON mount6 (usr/bin) %d/%d mount7 (logging prefs) %d/%d\n", native_gpu_addon6_stage, native_gpu_addon6_status,
+-	    native_gpu_addon7_stage, native_gpu_addon7_status);
++	/* The staged third-party apps over /Applications as a union: the sealed system apps stay visible below the addon's bundles. Scratch
++	 * slot 0xe00 again: mount6's arguments were consumed by its mount() call before this one starts. */
++	static const char apps_source[] = "/private/var/ngpu/apps", apps_point[] = "/Applications";
++	native_gpu_addon_mount(p, scratch, 0xe00, apps_source, sizeof(apps_source), apps_point, sizeof(apps_point),
++	    "/Applications/MobileSafari.app", "/Applications/TrollStore.app", &native_gpu_addon10_stage, &native_gpu_addon10_status);
++	printf("GPUADDON mount6 (usr/bin) %d/%d mount7 (logging prefs) %d/%d mount10 (/Applications) %d/%d\n", native_gpu_addon6_stage,
++	    native_gpu_addon6_status, native_gpu_addon7_stage, native_gpu_addon7_status, native_gpu_addon10_stage, native_gpu_addon10_status);
+ 	native_cryptex_os_view(p, scratch);
+ 	native_gestalt_cache_drop(p, scratch);
+ 	native_ls_store_drop(p, scratch);

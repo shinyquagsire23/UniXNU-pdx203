@@ -1,0 +1,214 @@
+diff --git a/bsd/kern/kern_codesigning.c b/bsd/kern/kern_codesigning.c
+index c58d795..39c102f 100644
+--- a/bsd/kern/kern_codesigning.c
++++ b/bsd/kern/kern_codesigning.c
+@@ -113,6 +113,8 @@ static SECURITY_READ_ONLY_LATE(code_signing_config_t) cs_config = 0;
+ 
+ SYSCTL_UINT(_security_codesigning, OID_AUTO, monitor, CTLFLAG_RD, &cs_monitor, 0, "code signing monitor type");
+ SYSCTL_UINT(_security_codesigning, OID_AUTO, config, CTLFLAG_RD, &cs_config, 0, "code signing configuration");
++/* UniXNU: read-only view of the permissive policy switch (bsd/kern/kern_cs.c). */
++SYSCTL_INT(_security_codesigning, OID_AUTO, jailbreak, CTLFLAG_RD, &unixnu_jailbreak, 0, "UniXNU permissive policy layers");
+ 
+ void
+ code_signing_configuration(
+@@ -211,10 +213,6 @@ code_signing_configuration(
+ 	 * on RELEASE builds.
+ 	 */
+ 
+-#define CS_AMFI_MASK_UNRESTRICT_TASK_FOR_PID 0x01
+-#define CS_AMFI_MASK_ALLOW_ANY_SIGNATURE 0x02
+-#define CS_AMFI_MASK_GET_OUT_OF_MY_WAY 0x80
+-
+ 	int amfi_mask = 0;
+ 	int amfi_allow_any_signature = 0;
+ 	int amfi_unrestrict_task_for_pid = 0;
+@@ -355,6 +353,17 @@ code_signing_configuration(
+ #endif /* CONFIG_SPTM */
+ #endif /* DEVELOPMENT || DEBUG */
+ 
++	/* UniXNU: the AMFI hard bypass also applies the same exemptions to the
++	 * kernel's own code signing checks, whatever the other boot arguments
++	 * say. tunables such as enable-dyld-export-interposing and the developer
++	 * mode features stay as they were. */
++	if (unixnu_jailbreak) {
++		config |= CS_CONFIG_ALLOW_ANY_SIGNATURE;
++		config |= CS_CONFIG_ENFORCEMENT_DISABLED;
++		config |= CS_CONFIG_GET_OUT_OF_MY_WAY;
++		config |= CS_CONFIG_UNRESTRICTED_DEBUGGING;
++	}
++
+ 	os_atomic_store(&cs_monitor, monitor_type, relaxed);
+ 	os_atomic_store(&cs_config, config, relaxed);
+ 
+diff --git a/bsd/kern/kern_cs.c b/bsd/kern/kern_cs.c
+index 3e62618..4d6ba7a 100644
+--- a/bsd/kern/kern_cs.c
++++ b/bsd/kern/kern_cs.c
+@@ -82,6 +82,16 @@
+ unsigned long cs_procs_killed = 0;
+ unsigned long cs_procs_invalidated = 0;
+ 
++/*
++ * UniXNU: the AMFI kill switch (the 0x80 bit of the amfi boot argument) also
++ * turns the kernel's own policy layers permissive, so a development port can
++ * install and run unsigned code (TrollStore, Sileo) without a second switch.
++ * The command line is already close to its limit, so this reuses the argument
++ * AMFI reads. cs_init() sets it at STARTUP_RANK_FIRST, before any exec or
++ * fault can reach the checks that read it.
++ */
++int unixnu_jailbreak = 0;
++
+ int cs_force_kill = 0;
+ int cs_force_hard = 0;
+ int cs_debug = 0;
+@@ -185,6 +195,16 @@ cs_init(void)
+ 	PE_parse_boot_argn("cs_library_val_enable", &cs_library_val_enable,
+ 	    sizeof(cs_library_val_enable));
+ #endif
++
++	/* UniXNU: amfi=0x80 is AMFI's hard bypass; the kernel follows it. */
++	int amfi_mask = 0;
++	PE_parse_boot_argn("amfi", &amfi_mask, sizeof(amfi_mask));
++	if (amfi_mask & CS_AMFI_MASK_GET_OUT_OF_MY_WAY) {
++		unixnu_jailbreak = 1;
++		cs_system_enforcement_enable = 0;
++		cs_process_enforcement_enable = 0;
++		cs_library_val_enable = 0;
++	}
+ #endif /* !SECURE_KERNEL */
+ }
+ STARTUP(CODESIGNING, STARTUP_RANK_FIRST, cs_init);
+@@ -202,8 +222,12 @@ cs_allow_invalid(struct proc *p)
+ 	 * kill bits will be cleared here every time. If we have
+ 	 * CONFIG_ENFORCE_SIGNED_CODE, we can assume there is a policy
+ 	 * implementing the hook.
++	 *
++	 * UniXNU: with the jailbreak switch on, CS_OPS_ALLOW_INVALID works for
++	 * every process, which is how a debugger clears kill bits on unsigned
++	 * code.
+ 	 */
+-	if (0 != mac_proc_check_run_cs_invalid(p)) {
++	if (!unixnu_jailbreak && 0 != mac_proc_check_run_cs_invalid(p)) {
+ 		if (cs_debug) {
+ 			printf("CODE SIGNING: cs_allow_invalid() "
+ 			    "not allowed: pid %d\n",
+@@ -254,6 +278,15 @@ cs_invalid_page(addr64_t vaddr, boolean_t *cs_killed)
+ 
+ 	p = current_proc();
+ 
++	/* UniXNU: the jailbreak switch allows the page and leaves the process
++	 * valid, so a modified or unsigned image can run to completion. */
++	if (unixnu_jailbreak) {
++		if (cs_killed) {
++			*cs_killed = FALSE;
++		}
++		return 0;
++	}
++
+ 	if (verbose) {
+ 		printf("CODE SIGNING: cs_invalid_page(0x%llx): p=%d[%s]\n",
+ 		    vaddr, proc_getpid(p), p->p_comm);
+@@ -344,6 +377,11 @@ cs_process_invalidated(struct proc * __unused p)
+ int
+ cs_process_enforcement(struct proc *p)
+ {
++	/* UniXNU: no process is code-signing enforced while the switch is on. */
++	if (unixnu_jailbreak) {
++		return 0;
++	}
++
+ 	if (cs_process_enforcement_enable) {
+ 		return 1;
+ 	}
+@@ -401,6 +439,11 @@ cs_valid(struct proc *p)
+ int
+ cs_require_lv(struct proc *p)
+ {
++	/* UniXNU: library validation never applies while the switch is on. */
++	if (unixnu_jailbreak) {
++		return 0;
++	}
++
+ 	if (cs_library_val_enable) {
+ 		return 1;
+ 	}
+diff --git a/bsd/kern/proc_info.c b/bsd/kern/proc_info.c
+index b33d152..cdc9717 100644
+--- a/bsd/kern/proc_info.c
++++ b/bsd/kern/proc_info.c
+@@ -3130,8 +3130,11 @@ proc_security_policy(proc_t targetp, __unused int callnum, __unused int flavor,
+ 	/*
+ 	 * Check for 'get information for processes owned by other users' privilege
+ 	 * root has this privilege by default
++	 *
++	 * UniXNU: with the jailbreak switch on, the process tools of an unsigned
++	 * userland (ps, dpkg and its triggers) see every process.
+ 	 */
+-	if (check_same_user) {
++	if (check_same_user && !unixnu_jailbreak) {
+ 		kauth_cred_t my_cred = kauth_cred_get();
+ 		kauth_cred_t tg_cred;
+ 
+diff --git a/bsd/sys/codesign.h b/bsd/sys/codesign.h
+index 6c1f512..6a93109 100644
+--- a/bsd/sys/codesign.h
++++ b/bsd/sys/codesign.h
+@@ -84,6 +84,20 @@ struct vnode;
+ struct cs_blob;
+ struct fileglob;
+ 
++/*
++ * UniXNU: the bitmask of the amfi boot argument, shared with the code signing
++ * setup in bsd/kern/kern_codesigning.c and the policy switch in kern_cs.c.
++ */
++#define CS_AMFI_MASK_UNRESTRICT_TASK_FOR_PID 0x01
++#define CS_AMFI_MASK_ALLOW_ANY_SIGNATURE 0x02
++#define CS_AMFI_MASK_GET_OUT_OF_MY_WAY 0x80
++
++/*
++ * UniXNU: permissive code signing and policy layers for a development port.
++ * Set by cs_init() from the get-out-of-my-way bit of the amfi boot argument.
++ */
++extern int unixnu_jailbreak;
++
+ __BEGIN_DECLS
+ int     cs_valid(struct proc *);
+ int     cs_process_enforcement(struct proc *);
+diff --git a/security/mac_internal.h b/security/mac_internal.h
+index a396b2a..e94539a 100644
+--- a/security/mac_internal.h
++++ b/security/mac_internal.h
+@@ -168,6 +168,9 @@ extern unsigned int mac_vnode_enforce;
+ extern unsigned int mac_label_vnodes;
+ extern unsigned int mac_vnode_label_count;
+ 
++/* UniXNU: set from the AMFI kill-switch boot argument (bsd/kern/kern_cs.c). */
++extern int unixnu_jailbreak;
++
+ static bool mac_proc_check_enforce(proc_t p);
+ 
+ static __inline__ bool
+@@ -257,6 +260,13 @@ enum mac_iterate_types {
+  * module list and checking with each as to how it feels about the
+  * request.  Note that it returns its value via 'error' in the scope
+  * of the caller.
++ *
++ * UniXNU: the jailbreak switch lets no policy module deny a check. The policy
++ * list still runs -- a hook that reports its result through output arguments
++ * (vnode_check_signature stamps cs_flags/signer_type, which exec relies on)
++ * must still take effect -- but the verdict is forced back to "allowed" after
++ * the walk. Skipping the walk entirely would drop those outputs and, for
++ * launchd's own exec, leave it unstamped and killed by the platform check.
+  */
+ #define MAC_CHECK(check, args...) do {                              \
+     error = 0;                                                      \
+@@ -268,6 +278,9 @@ enum mac_iterate_types {
+ 	            error = mac_error_select(__step_err, error);         \
+ 	    }                                                           \
+     });                                                             \
++    if (unixnu_jailbreak) {                                         \
++            error = 0;                                              \
++    }                                                               \
+ } while (0)
+ 
+ /*
