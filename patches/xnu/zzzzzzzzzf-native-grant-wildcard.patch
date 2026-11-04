@@ -1,0 +1,44 @@
+pdx203: the native GPU grant takes "*" (every process) and "!name" (refuse one)
+
+The Adreno 650 board probe names "*" in NativeSandboxGrantProcess: every process may run the Metal plugin
+(the fork's sa56). Upstream's grant matches exact names only, so "*" granted nobody and the render server
+never got a device (f2e: backboardd Vulkan -3). From the pdx203 fork's zzw-native-adreno-sandbox-grant.patch.
+
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+index c1c3a9c..e63386e 100644
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -4344,19 +4344,29 @@ native_sandbox_grant(IOService * service)
+ 		return false;
+ 	}
+ 	proc_selfname(name, sizeof(name));
++	/* "*" grants every process; "!name" refuses one, whatever else the list says (pdx203 sa56: every process may run the Metal plugin). */
++	bool all = false, named = false;
+ 	for (const char * at = list->getCStringNoCopy(); *at;) {
+ 		size_t length = 0;
+ 		while (at[length] && at[length] != ',') {
+ 			++length;
+ 		}
++		const bool refuse = length > 1 && at[0] == '!';
++		const char * entry = refuse ? at + 1 : at;
++		const size_t entry_length = refuse ? length - 1 : length;
+ 		/* A process name holds 16 characters, so a longer entry is compared by its first 16. */
+-		if (length && 0 == strncmp(name, at, length < sizeof(name) - 1 ? length : sizeof(name) - 1)
+-		    && (length >= sizeof(name) - 1 || name[length] == 0)) {
+-			return true;
++		if (entry_length == 1 && entry[0] == '*' && !refuse) {
++			all = true;
++		} else if (entry_length && 0 == strncmp(name, entry, entry_length < sizeof(name) - 1 ? entry_length : sizeof(name) - 1)
++		    && (entry_length >= sizeof(name) - 1 || name[entry_length] == 0)) {
++			if (refuse) {
++				return false;
++			}
++			named = true;
+ 		}
+ 		at += length + (at[length] == ',' ? 1 : 0);
+ 	}
+-	return false;
++	return all || named;
+ }
+ 
+ kern_return_t

@@ -20,3 +20,7 @@ zzzzzzzzzc-pmap-ram-wc.patch
 zzzzzzzzzd-stackshot-bounds.patch
 # Shutdown leaves the read-only root mounted.
 zzzzzzzzze-skip-ro-root-unmount.patch
+# The native GPU grant: "*" (every process) and "!name" in the Adreno driver's NativeSandboxGrantProcess (upstream matches exact
+# names only), and the same grant for connection ports in the kernel object filter (the WebKit GPU process maps its BOs).
+zzzzzzzzzf-native-grant-wildcard.patch
+zzzzzzzzzg-native-adreno-kobj-filter-grant.patch

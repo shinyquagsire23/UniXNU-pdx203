@@ -179,10 +179,16 @@ kernel_args = [
   "sheng-cpufreq=3",
   # the adreno 650, the board probe (package/GpuProbe.cpp) one mode at a time. 11: the GPU up and published for user clients with
   # the kernel's own self-test submissions; 12 adds the staged accelerator for Metal (with the gpu addon). GPUROW <n> rows on the usb log
-  "pipa-gpu=11",
+  "pipa-gpu=12",
   "pipa-gpu-perf=7",   # 670 MHz, the SD865 top level (Linux sm8250 gpu opp table)
   # the buffer pool in RAM darwinboot reserves outside the kernel window ([adt.chosen.bytes] darwinboot-gpu-pool), in MiB
   "pipa-gpu-pool=512",
+  # the Metal plugin (upstream AdrenoMetal: Turnip, the metal2vulkan bridge, NativeAdrenoMetal.bundle) and its probe daemon, written into
+  # Data from the payload's gpu addon (UniXNU scripts/make-gpu-addon.py, unixnu build payload --gpu-addon) and mounted before launchd;
+  # their CDHashes come from the owner trust bundle (scripts/make-owner-trust-bundle.py, --owner-trust-cache)
+  "sheng-gpu-addon=1",
+  # the GPU hand-off: composited frames go to the panel through the GOP presenter instead of a CPU copy
+  "sheng-fb-gpu=1",
 ]
 # Fixups of signed text beyond the OS profile's four (its [payload] text_fixups is replaced, so they are repeated here).
 text_fixups = [

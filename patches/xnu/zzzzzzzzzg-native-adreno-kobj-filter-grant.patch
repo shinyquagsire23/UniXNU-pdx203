@@ -1,0 +1,74 @@
+pdx203: the native GPU grant also covers a connection port in the kernel object filter
+
+A sandboxed process (the WebKit GPU process) was refused io_connect_map_memory_into_task (KERN_DENIED) by the kernel object
+filter, so the Metal plugin's BOs could not be mapped there. Only connection ports of a service whose grant names the process.
+From the pdx203 fork (zzzzzzzzzg-native-adreno-kobj-filter-grant.patch).
+
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+index e63386e..aea9ae1 100644
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -4699,6 +4699,30 @@ is_io_connect_set_notification_port_64(
+ 	return ret;
+ }
+ 
++/*
++ * The native GPU grant (native_sandbox_grant) for a message to a connection of such a service: the kernel object filter of a sandboxed
++ * process (ipc_kobject.c) refused io_connect_map_memory_into_task to the WebKit GPU process (KERN_DENIED), so the Metal plugin's BOs could
++ * not be mapped there. Only connection ports, and only of a service that names the process.
++ */
++extern "C" io_object_t iokit_lookup_connect_port(ipc_port_t port);   /* osfmk/device/iokit_rpc.c */
++
++extern "C" bool
++native_sandbox_grant_connect_port(ipc_port_t port)
++{
++	io_object_t object = iokit_lookup_connect_port(port);
++	if (!object) {
++		return false;
++	}
++	bool granted = false;
++	if (IOUserClient * client = OSDynamicCast(IOUserClient, object)) {
++		if (IOService * provider = client->getProvider()) {
++			granted = native_sandbox_grant(provider);
++		}
++	}
++	iokit_remove_connect_reference(object);
++	return granted;
++}
++
+ /* Routine io_connect_map_memory_into_task */
+ kern_return_t
+ is_io_connect_map_memory_into_task
+diff --git a/osfmk/kern/ipc_kobject.c b/osfmk/kern/ipc_kobject.c
+index f9a166f..c39b7cd 100644
+--- a/osfmk/kern/ipc_kobject.c
++++ b/osfmk/kern/ipc_kobject.c
+@@ -484,9 +484,11 @@ ipc_kobject_alloc_mig_error(void)
+  *	Conditions:
+  *		Nothing locked.
+  */
++extern bool native_sandbox_grant_connect_port(ipc_port_t port);
++
+ static kern_return_t
+ ipc_kobject_server_internal(
+-	__unused ipc_port_t port,
++	ipc_port_t          port,
+ 	ipc_kmsg_t          request,
+ 	ipc_kmsg_t          *replyp)
+ {
+@@ -592,11 +594,13 @@ ipc_kobject_server_internal(
+ 	int idx = ptr->kobjidx;
+ 	uint8_t *filter_mask = task_get_mach_kobj_filter_mask(curtask);
+ 
+-	/* Check kobject mig filter mask, if exists. */
++	/* Check kobject mig filter mask, if exists. A connection of a native GPU service that grants this process (IOUserClient.cpp
++	 * native_sandbox_grant_connect_port) is not filtered. */
+ 	if (filter_mask != NULL &&
+ 	    idx != KOBJ_IDX_NOT_SET &&
+ 	    !bitstr_test(filter_mask, idx) &&
+-	    mac_task_kobj_msg_evaluate != NULL) {
++	    mac_task_kobj_msg_evaluate != NULL &&
++	    !(ip_kotype(port) == IKOT_IOKIT_CONNECT && native_sandbox_grant_connect_port(port))) {
+ 		/* Not in filter mask, evaluate policy. */
+ 		kern_return_t kr = mac_task_kobj_msg_evaluate(curproc,
+ 		    request_msgh_id, idx);
