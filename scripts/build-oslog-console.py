@@ -26,7 +26,9 @@ entitlements = out / 'entitlements.plist'
 entitlements.write_bytes(plistlib.dumps({'com.apple.private.security.no-container': True,
                                          # CPUPC profiles (OsLogConsole.mm profile): another process's task read port and thread states
                                          'task_for_pid-allow': True, 'com.apple.system-task-ports': True, 'com.apple.system-task-ports.read': True,
-                                         'com.apple.private.thread-set-state': True, 'com.apple.logging.local-store': True,
+                                         'com.apple.private.thread-set-state': True,
+                                         # CPUK* profiles (OsLogConsole.mm kperfProfile): kperf and kdebug without root
+                                         'com.apple.private.ktrace-allow': True, 'com.apple.logging.local-store': True,
                                          'com.apple.lsapplicationworkspace.rebuildappdatabases': True,
                                          'com.apple.private.logging.admin': True,
                                          'com.apple.private.logging.diagnostic': True, 'com.apple.private.logging.stream': True,

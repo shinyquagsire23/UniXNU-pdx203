@@ -29,6 +29,20 @@ component = args.component
 recipe = ROOT / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/iokit/DEVELOPMENT/IOPlatformExpert.cpo.json'
 record = json.loads(recipe.read_text().strip().rstrip(','))
 source = ROOT / 'drivers' / ('NativeMobileDisplay' if component in ('NativeLegacyDisplay','NativeGOPPresenter') else 'NativeMetal' if component in ('NativeOfflineGPU','NativeOfflineAccelerator','NativeIOGPUProviderProbe') else component) / {'NativeAdreno':'NativeAdrenoService.cpp'}.get(component, component + '.cpp')
+
+# ArmCpu's board changes ride as patches (patches/modules/ArmCpu/*.patch in the UniXNU fork), applied as a stack like NativeAdreno's
+# (build-pdx203-adreno.py): the applied part is the longest prefix whose last patch reverses; one that applies neither way stops the build.
+if component == 'ArmCpu':
+    _patches = sorted((ROOT / 'patches/modules/ArmCpu').glob('*.patch'))
+    _applied = 0
+    for _k in range(len(_patches), 0, -1):
+        if subprocess.run(['git', '-C', str(source.parent.resolve()), 'apply', '--reverse', '--check', str(_patches[_k - 1].resolve())],
+                          capture_output=True).returncode == 0:
+            _applied = _k
+            break
+    for _patch in _patches[_applied:]:
+        subprocess.run(['git', '-C', str(source.parent.resolve()), 'apply', str(_patch.resolve())], check=True)
+        print('applied', _patch.name, 'to drivers/ArmCpu')
 out = ROOT / 'build' / {'ArmVirtPlatform': 'armvirt-platform', 'ArmDTPlatform': 'armdt-platform', 'ArmCpu': 'armcpu', 'NativeAES': 'native-aes',
                         'NativeVirtioBlock': 'native-virtio-block', 'NativeRamBlock': 'native-ram-block',
                         'NativeMobileDisplay': 'native-mobile-display', 'NativeVirtioConsole': 'native-virtio-console',

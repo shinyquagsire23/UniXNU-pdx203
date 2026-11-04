@@ -345,6 +345,370 @@ extern "C" int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int
 
 struct Sample { int pid; char name[20]; uint64_t ticks, delta; };
 
+// A process's images for naming sampled addresses: "dsc:<unslid address>" in the shared cache (symbolize on the host against the
+// shared cache's symbols), "<image>+<offset>" in another image, "jit" in JavaScriptCore's JIT region, else the raw address.
+struct TaskImages {
+    struct Image { uint64_t base; char name[40]; };
+    std::vector<Image> images;
+    uint64_t slide = 0, cacheBase = 0, jitStart = 0, jitEnd = 0;
+    mach_port_t task = MACH_PORT_NULL;
+    void load(mach_port_t t) {
+        task = t;
+        task_dyld_info_data_t dyld = {};
+        mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
+        if (task_info(task, TASK_DYLD_INFO, (task_info_t)&dyld, &count) != KERN_SUCCESS || !dyld.all_image_info_addr) return;
+        struct dyld_all_image_infos all = {};
+        vm_size_t got = 0;
+        if (vm_read_overwrite(task, dyld.all_image_info_addr, sizeof all, (vm_address_t)&all, &got) != KERN_SUCCESS) return;
+        slide = all.sharedCacheSlide;
+        cacheBase = all.sharedCacheBaseAddress;
+        std::vector<struct dyld_image_info> infos(all.infoArrayCount < 2048 ? all.infoArrayCount : 2048);
+        if (infos.empty() || vm_read_overwrite(task, (vm_address_t)all.infoArray, infos.size() * sizeof infos[0],
+                                               (vm_address_t)infos.data(), &got) != KERN_SUCCESS) return;
+        for (const auto &info : infos) {
+            const uint64_t base = (uint64_t)info.imageLoadAddress;
+            if (cacheBase && base >= cacheBase && base < cacheBase + 0x200000000ull) continue;
+            char path[256] = {};
+            vm_read_overwrite(task, (vm_address_t)info.imageFilePath, sizeof path - 1, (vm_address_t)path, &got);
+            const char *name = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
+            Image image = {base, {}};
+            strlcpy(image.name, name, sizeof image.name);
+            images.push_back(image);
+        }
+    }
+    // The region holding pc, when it is JavaScriptCore's executable allocator (VM_MEMORY_JAVASCRIPT_JIT_EXECUTABLE_ALLOCATOR, 64).
+    bool inJit(uint64_t pc) {
+        if (pc >= jitStart && pc < jitEnd) return true;
+        vm_address_t address = pc;
+        vm_size_t size = 0;
+        natural_t depth = 0;
+        vm_region_submap_info_data_64_t info = {};
+        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+        if (vm_region_recurse_64(task, &address, &size, &depth, (vm_region_recurse_info_t)&info, &count) != KERN_SUCCESS) return false;
+        if (address > pc || info.user_tag != 64) return false;
+        jitStart = address; jitEnd = address + size;
+        return true;
+    }
+    void where(uint64_t pc, char *out, size_t size) {
+        if (cacheBase && pc >= cacheBase && pc < cacheBase + 0x200000000ull) {snprintf(out, size, "dsc:%llx", (unsigned long long)(pc - slide)); return;}
+        const Image *best = nullptr;
+        for (const Image &image : images) if (image.base <= pc && (!best || image.base > best->base)) best = &image;
+        if (best && pc - best->base < 0x4000000ull) {snprintf(out, size, "%s+%llx", best->name, (unsigned long long)(pc - best->base)); return;}
+        if (task != MACH_PORT_NULL && inJit(pc)) {strlcpy(out, "jit", size); return;}
+        snprintf(out, size, "%llx", (unsigned long long)pc);
+    }
+};
+
+// Rows of 10 "<where> <count>" pairs (the counts are samples, not percent), the first `limit` of a list sorted by count.
+void emitRows(const char *tag, const char *process, int pid, unsigned samples, const std::vector<std::pair<std::string, unsigned>> &list,
+              unsigned limit) {
+    char line[480];
+    for (unsigned first = 0; first < list.size() && first < limit; first += 10) {
+        int at = snprintf(line, sizeof line, "%s %s[%d] n%u r%u:", tag, process, pid, samples, first / 10);
+        for (unsigned i = first; i < list.size() && i < first + 10 && at < (int)sizeof line - 60; ++i)
+            at += snprintf(line + at, sizeof line - at, " %s %u", list[i].first.c_str(), list[i].second);
+        snprintf(line + at, sizeof line - at, "\n");
+        emit(line);
+    }
+}
+
+// kperf, XNU's own sampler (KPERF is in this kernel): a 1 ms timer on every CPU samples the thread running there when it belongs to the
+// profiled process, and the kernel walks that thread's user stack when it next returns to user space (an AST on the same CPU). The leaf
+// is where the thread really was, not its next system call as with thread_get_state (profile below). One second, then the events are
+// read back from the kdebug buffer (class DBG_PERF only). It needs root and an unowned ktrace (nothing else tracing).
+//   CPUKC <process>[pid] n<samples> r<row>: <where> <samples> ...   leaf PCs, 10 a row
+//   CPUKI <process>[pid] n<samples> r<row>: <where> <samples> ...   every address in the stack once a sample (inclusive)
+//   CPUKS <process>[pid] <samples>: <where> <where> ...             the most frequent stacks, leaf first, 7 frames
+//   CPUKT <process>[pid] n<samples> e<events> w<wrapped>: <thread> <samples> ...
+// Addresses as TaskImages::where. An error at setup is reported as "CPUKP <step> errno <n>" (the first three times).
+#ifndef KERN_KDENABLE
+#define KERN_KDENABLE 3
+#endif
+#ifndef KERN_KDSETBUF
+#define KERN_KDSETBUF 4
+#endif
+#ifndef KERN_KDGETBUF
+#define KERN_KDGETBUF 5
+#endif
+#ifndef KERN_KDSETUP
+#define KERN_KDSETUP 6
+#endif
+#ifndef KERN_KDREMOVE
+#define KERN_KDREMOVE 7
+#endif
+#ifndef KERN_KDREADTR
+#define KERN_KDREADTR 10
+#endif
+#ifndef KERN_KDSET_TYPEFILTER
+#define KERN_KDSET_TYPEFILTER 22
+#endif
+struct KdBuf { uint64_t timestamp, arg1, arg2, arg3, arg4, arg5; uint32_t debugid, cpuid; uint64_t unused; };
+static_assert(sizeof(KdBuf) == 64, "kd_buf");
+// kbufinfo_t for KERN_KDGETBUF: the flags say whether the buffer wrapped (KDBG_WRAPPED 0x08).
+struct KdBufInfo { int nkdbufs, nolog, flags, nkdthreads, bufid; };
+int kdebugOp(int op, int value, bool withValue) {
+    int mib[4] = {CTL_KERN, KERN_KDEBUG, op, value};
+    size_t zero = 0;
+    return sysctl(mib, withValue ? 4 : 3, nullptr, &zero, nullptr, 0) ? errno : 0;
+}
+int kperfPair(const char *name, uint64_t a, uint64_t b) {
+    uint64_t in[2] = {a, b};
+    return sysctlbyname(name, nullptr, nullptr, in, sizeof in) ? errno : 0;
+}
+int kperfValue(const char *name, uint32_t value) {return sysctlbyname(name, nullptr, nullptr, &value, sizeof value) ? errno : 0;}
+// The kernel's interrupt-time sampler (ArmCpu 0001, sysctl kern.armcpu_upc): for two seconds every interrupt taken on a core running
+// this process's user code records the interrupted PC, the thread's LR and thread ID. Unlike thread_get_state (profile below), the PC is
+// where the thread really was. Rows (counts are samples):
+//   CPUIC <process>[pid] n<samples> r<row>: <where> <samples> ...   interrupted PCs, 10 a row
+//   CPUIL <process>[pid] n<samples> r<row>: <where> <samples> ...   their LRs (the caller, for a leaf that has not saved it)
+//   CPUIT <process>[pid] n<samples> irq<wanted> el1<in the kernel> other<other process> bad<saved PC != ELR>: <thread> <samples> ...
+// Addresses as TaskImages::where. False when the sysctl is missing or refuses (then thread_get_state's profile runs).
+bool irqProfile(int pid, const char *process, mach_port_t task) {
+    static int failures;
+    char line[480];
+    int32_t value = pid;
+    if (sysctlbyname("kern.armcpu_upc", nullptr, nullptr, &value, sizeof value)) {
+        if (failures++ < 2) {snprintf(line, sizeof line, "CPUIT %s[%d]: kern.armcpu_upc errno %d\n", process, pid, errno); emit(line);}
+        return false;
+    }
+    std::vector<std::pair<uint64_t, std::string>> names;
+    thread_act_array_t threads = nullptr;
+    mach_msg_type_number_t threadCount = 0;
+    if (task_threads(task, &threads, &threadCount) == KERN_SUCCESS) {
+        for (unsigned t = 0; t < threadCount; ++t) {
+            thread_identifier_info_data_t ident = {};
+            mach_msg_type_number_t n = THREAD_IDENTIFIER_INFO_COUNT;
+            thread_extended_info_data_t ext = {};
+            mach_msg_type_number_t m = THREAD_EXTENDED_INFO_COUNT;
+            if (thread_info(threads[t], THREAD_IDENTIFIER_INFO, (thread_info_t)&ident, &n) == KERN_SUCCESS) {
+                std::string name = thread_info(threads[t], THREAD_EXTENDED_INFO, (thread_info_t)&ext, &m) == KERN_SUCCESS && ext.pth_name[0]
+                                       ? std::string(ext.pth_name) : "t" + std::to_string(t);
+                for (char &c : name) if (c == ' ') c = '_';
+                if (name.size() > 28) name.resize(28);
+                names.push_back({ident.thread_id, name});
+            }
+            mach_port_deallocate(mach_task_self(), threads[t]);
+        }
+        vm_deallocate(mach_task_self(), (vm_address_t)threads, threadCount * sizeof threads[0]);
+    }
+    usleep(2000000);
+    value = 0;
+    sysctlbyname("kern.armcpu_upc", nullptr, nullptr, &value, sizeof value);
+    struct Record { uint64_t pc, lr, tid; };
+    std::vector<uint8_t> buffer(32 + 8192 * sizeof(Record));
+    size_t size = buffer.size();
+    if (sysctlbyname("kern.armcpu_upc", buffer.data(), &size, nullptr, 0) || size < 32) {
+        if (failures++ < 2) {snprintf(line, sizeof line, "CPUIT %s[%d]: read errno %d\n", process, pid, errno); emit(line);}
+        return false;
+    }
+    uint32_t header[8];
+    memcpy(header, buffer.data(), sizeof header);
+    const size_t records = std::min<size_t>(header[0], (size - 32) / sizeof(Record));
+    const Record *r = reinterpret_cast<const Record *>(buffer.data() + 32);
+    TaskImages images;
+    images.load(task);
+    std::vector<std::pair<uint64_t, unsigned>> pcs, lrs, perThread;
+    auto bump = [](std::vector<std::pair<uint64_t, unsigned>> &list, uint64_t key) {
+        for (auto &e : list) if (e.first == key) {++e.second; return;}
+        list.push_back({key, 1});
+    };
+    for (size_t i = 0; i < records; ++i) {
+        bump(pcs, r[i].pc & 0x0000000fffffffffull);
+        bump(lrs, r[i].lr & 0x0000000fffffffffull);
+        bump(perThread, r[i].tid);
+    }
+    auto named = [&](const std::vector<std::pair<uint64_t, unsigned>> &list) {
+        std::vector<std::pair<std::string, unsigned>> out;
+        for (const auto &e : list) {
+            char where[64];
+            images.where(e.first, where, sizeof where);
+            bool hit = false;
+            for (auto &o : out) if (o.first == where) {o.second += e.second; hit = true; break;}
+            if (!hit) out.push_back({where, e.second});
+        }
+        std::sort(out.begin(), out.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+        return out;
+    };
+    if (records) {
+        emitRows("CPUIC", process, pid, (unsigned)records, named(pcs), 60);
+        emitRows("CPUIL", process, pid, (unsigned)records, named(lrs), 40);
+    }
+    std::sort(perThread.begin(), perThread.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+    int at = snprintf(line, sizeof line, "CPUIT %s[%d] n%zu irq%u el1 %u other %u bad %u:", process, pid, records, header[1], header[2], header[3], header[4]);
+    for (unsigned i = 0; i < perThread.size() && i < 10 && at < (int)sizeof line - 40; ++i) {
+        std::string name = "tid" + std::to_string(perThread[i].first);
+        for (const auto &n : names) if (n.first == perThread[i].first) name = n.second;
+        at += snprintf(line + at, sizeof line - at, " %s %u", name.c_str(), perThread[i].second);
+    }
+    snprintf(line + at, sizeof line - at, "\n");
+    emit(line);
+    return true;
+}
+bool kperfProfile(int pid, const char *process, mach_port_t task) {
+    static int failures;
+    char line[480];
+    constexpr int kEvents = 65536;
+    constexpr uint32_t kUstack = 1u << 3, kThInfo = 1u << 0;
+    constexpr uint32_t kUhdr = (37u << 24) | (2u << 16) | (6u << 2), kUdata = (37u << 24) | (2u << 16) | (4u << 2);
+    mach_timebase_info_data_t timebase;
+    mach_timebase_info(&timebase);
+    const uint64_t periodTicks = 1000000ull * timebase.denom / timebase.numer;   // 1 ms
+    const char *step = nullptr;
+    int error = 0;
+    auto check = [&](const char *what, int e) {if (e && !step) {step = what; error = e;} return !e;};
+    // A previous run's leftovers, then the buffer, the type filter (DBG_PERF's 256 subclasses: bits 37*256..37*256+255) and kperf's
+    // action 1 (user stacks and thread info, this pid only) on timer 0.
+    kdebugOp(KERN_KDREMOVE, 0, false);
+    kperfValue("kperf.reset", 1);
+    check("setbuf", kdebugOp(KERN_KDSETBUF, kEvents, true)) && check("setup", kdebugOp(KERN_KDSETUP, 0, false));
+    if (!step) {
+        std::vector<uint8_t> filter(8192, 0);
+        memset(filter.data() + 37 * 32, 0xff, 32);
+        int mib[3] = {CTL_KERN, KERN_KDEBUG, KERN_KDSET_TYPEFILTER};
+        size_t size = filter.size();
+        check("typefilter", sysctl(mib, 3, filter.data(), &size, nullptr, 0) ? errno : 0);
+    }
+    if (!step) check("action.count", kperfValue("kperf.action.count", 1)) &&
+        check("action.samplers", kperfPair("kperf.action.samplers", 1, kUstack | kThInfo)) &&
+        check("action.filter_by_pid", kperfPair("kperf.action.filter_by_pid", 1, (uint64_t)pid)) &&
+        check("action.ucallstack_depth", kperfPair("kperf.action.ucallstack_depth", 1, 48)) &&
+        check("timer.count", kperfValue("kperf.timer.count", 1)) &&
+        check("timer.period", kperfPair("kperf.timer.period", 0, periodTicks)) &&
+        check("timer.action", kperfPair("kperf.timer.action", 0, 1)) &&
+        check("kdenable", kdebugOp(KERN_KDENABLE, 1, true)) &&
+        check("sampling", kperfValue("kperf.sampling", 1));
+    if (step) {
+        kperfValue("kperf.reset", 1);
+        kdebugOp(KERN_KDREMOVE, 0, false);
+        if (failures++ < 3) {snprintf(line, sizeof line, "CPUKP %s errno %d\n", step, error); emit(line);}
+        return false;
+    }
+    // Thread names by thread ID meanwhile (the samples carry the ID).
+    std::vector<std::pair<uint64_t, std::string>> names;
+    thread_act_array_t threads = nullptr;
+    mach_msg_type_number_t threadCount = 0;
+    if (task_threads(task, &threads, &threadCount) == KERN_SUCCESS) {
+        for (unsigned t = 0; t < threadCount; ++t) {
+            thread_identifier_info_data_t ident = {};
+            mach_msg_type_number_t n = THREAD_IDENTIFIER_INFO_COUNT;
+            thread_extended_info_data_t ext = {};
+            mach_msg_type_number_t m = THREAD_EXTENDED_INFO_COUNT;
+            if (thread_info(threads[t], THREAD_IDENTIFIER_INFO, (thread_info_t)&ident, &n) == KERN_SUCCESS) {
+                std::string name = thread_info(threads[t], THREAD_EXTENDED_INFO, (thread_info_t)&ext, &m) == KERN_SUCCESS && ext.pth_name[0]
+                                       ? std::string(ext.pth_name) : "t" + std::to_string(t);
+                for (char &c : name) if (c == ' ') c = '_';
+                if (name.size() > 28) name.resize(28);
+                names.push_back({ident.thread_id, name});
+            }
+            mach_port_deallocate(mach_task_self(), threads[t]);
+        }
+        vm_deallocate(mach_task_self(), (vm_address_t)threads, threadCount * sizeof threads[0]);
+    }
+    usleep(1000000);
+    kperfValue("kperf.sampling", 0);
+    kdebugOp(KERN_KDENABLE, 0, true);
+    KdBufInfo info = {};
+    {
+        int mib[3] = {CTL_KERN, KERN_KDEBUG, KERN_KDGETBUF};
+        size_t size = sizeof info;
+        sysctl(mib, 3, &info, &size, nullptr, 0);
+    }
+    std::vector<KdBuf> events(kEvents);
+    size_t count = events.size() * sizeof(KdBuf);
+    {
+        int mib[3] = {CTL_KERN, KERN_KDEBUG, KERN_KDREADTR};
+        if (sysctl(mib, 3, events.data(), &count, nullptr, 0)) count = 0;
+    }
+    kperfValue("kperf.reset", 1);
+    kdebugOp(KERN_KDREMOVE, 0, false);
+    // Each sample: a UHDR (flags, frames, async index, async frames) and then UDATA events of four frames, all on the sampled thread;
+    // the last frame of the stack is kperf's fixup word (the caller of a leaf without a frame), not a frame.
+    struct Pending { std::vector<uint64_t> frames; unsigned need; };
+    std::vector<std::pair<uint64_t, Pending>> pending;
+    std::vector<std::pair<uint64_t, unsigned>> leafs, inclusive, perThread;
+    std::vector<std::pair<std::vector<uint64_t>, unsigned>> stacks;
+    unsigned samples = 0;
+    auto bump = [](std::vector<std::pair<uint64_t, unsigned>> &list, uint64_t key, size_t cap) {
+        for (auto &e : list) if (e.first == key) {++e.second; return;}
+        if (list.size() < cap) list.push_back({key, 1});
+    };
+    for (size_t i = 0; i < count; ++i) {
+        const KdBuf &e = events[i];
+        const uint32_t code = e.debugid & ~3u;
+        if (code != kUhdr && code != kUdata) continue;
+        Pending *p = nullptr;
+        for (auto &q : pending) if (q.first == e.arg5) p = &q.second;
+        if (code == kUhdr) {
+            if (!p) {pending.push_back({e.arg5, {}}); p = &pending.back().second;}
+            p->frames.clear();
+            p->need = (e.arg1 & 1) ? (unsigned)(e.arg2 + e.arg4) : 0;   // CALLSTACK_VALID
+            if (p->need > 256) p->need = 0;
+            continue;
+        }
+        if (!p || !p->need) continue;
+        const uint64_t words[4] = {e.arg1, e.arg2, e.arg3, e.arg4};
+        for (unsigned k = 0; k < 4 && p->frames.size() < p->need; ++k) p->frames.push_back(words[k] & 0x0000000fffffffffull);
+        if (p->frames.size() < p->need) continue;
+        std::vector<uint64_t> frames = p->frames;
+        p->need = 0;
+        if (frames.size() >= 2) frames.pop_back();   // the fixup word
+        if (frames.empty() || !frames[0]) continue;
+        ++samples;
+        bump(perThread, e.arg5, 256);
+        bump(leafs, frames[0], 8192);
+        for (unsigned c = 0; c < frames.size(); ++c) {
+            bool dup = false;
+            for (unsigned d = 0; d < c && !dup; ++d) dup = frames[d] == frames[c];
+            if (!dup) bump(inclusive, frames[c], 16384);
+        }
+        std::vector<uint64_t> top(frames.begin(), frames.begin() + std::min<size_t>(frames.size(), 7));
+        bool hit = false;
+        for (auto &s : stacks) if (s.first == top) {++s.second; hit = true; break;}
+        if (!hit && stacks.size() < 4096) stacks.push_back({top, 1});
+    }
+    const bool wrapped = info.flags & 0x08;
+    TaskImages images;
+    images.load(task);
+    // Names, then merged by name: every JIT address is one "jit" entry.
+    auto named = [&](std::vector<std::pair<uint64_t, unsigned>> &list) {
+        std::vector<std::pair<std::string, unsigned>> out;
+        for (const auto &e : list) {
+            char where[64];
+            images.where(e.first, where, sizeof where);
+            bool hit = false;
+            for (auto &o : out) if (o.first == where) {o.second += e.second; hit = true; break;}
+            if (!hit) out.push_back({where, e.second});
+        }
+        std::sort(out.begin(), out.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+        return out;
+    };
+    if (samples) {
+        emitRows("CPUKC", process, pid, samples, named(leafs), 50);
+        emitRows("CPUKI", process, pid, samples, named(inclusive), 100);
+        std::sort(stacks.begin(), stacks.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+        for (unsigned s = 0; s < stacks.size() && s < 16; ++s) {
+            int at = snprintf(line, sizeof line, "CPUKS %s[%d] %u:", process, pid, stacks[s].second);
+            for (uint64_t pc : stacks[s].first) {
+                char where[64];
+                images.where(pc, where, sizeof where);
+                if (at < (int)sizeof line - 70) at += snprintf(line + at, sizeof line - at, " %s", where);
+            }
+            snprintf(line + at, sizeof line - at, "\n");
+            emit(line);
+        }
+    }
+    std::sort(perThread.begin(), perThread.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+    int at = snprintf(line, sizeof line, "CPUKT %s[%d] n%u e%zu w%d:", process, pid, samples, count, wrapped);
+    for (unsigned i = 0; i < perThread.size() && i < 10 && at < (int)sizeof line - 40; ++i) {
+        std::string name = "tid" + std::to_string(perThread[i].first);
+        for (const auto &n : names) if (n.first == perThread[i].first) name = n.second;
+        at += snprintf(line + at, sizeof line - at, " %s %u", name.c_str(), perThread[i].second);
+    }
+    snprintf(line + at, sizeof line - at, "\n");
+    emit(line);
+    return true;
+}
+
 // A one-second PC profile of a busy process (see cpuTopPass: every 10 s one of the three busiest over 40 %, in turn): the user PC of
 // every thread whose CPU time moved since its last look (thread_get_state), plus its callers (lr and the frame-pointer chain), the hottest
 // as "dsc:<unslid address>" in the shared cache (symbolize on the host against the shared cache's symbols) or "<image>+<offset>" in
@@ -353,8 +717,8 @@ struct Sample { int pid; char name[20]; uint64_t ticks, delta; };
 //   CPUPI <process>[pid] n<samples> r<row>: <where> <samples> ...   return addresses, each once a sample (inclusive)
 //   CPUPT <process>[pid]: <thread> <samples> ...
 //   CPUSC <process>[pid] n<samples>: <mib or n2o:name> <samples> ...
-// Caveat (pdx203, 2026-11-03): a thread running user code is stopped for thread_get_state only at its next kernel entry, so the leaf
-// PCs lean to system calls; CPUTHR's user/kernel split is the reliable figure.
+// Only threads running at the look are sampled (TH_STATE_RUNNING); the counts are of those looks, so a thread's share is of its
+// running time. Caveat (pdx203, 2026-11-03): before that filter the leaf PCs leaned to system calls (blocked threads were sampled too).
 // It needs a task read port (task_for_pid with the task-port grants in build-oslog-console.py); a refusal is reported once.
 extern "C" kern_return_t task_read_for_pid(mach_port_t, int, mach_port_t *) __attribute__((weak_import));
 void profile(int pid, const char *process) {
@@ -367,6 +731,11 @@ void profile(int pid, const char *process) {
         if (refusals++ < 2) {snprintf(line, sizeof line, "CPUPC %s[%d]: no task port (0x%x)\n", process, pid, kr); emit(line);}
         return;
     }
+    // kperf's samples where it works; thread_get_state's below otherwise. Off: sa63 (usb-211) froze for good within a second of its
+    // first kperf setup (no panic text, the USB log stopped), so it stays off until that is understood.
+    constexpr bool kUseKperf = false;
+    if (kUseKperf && kperfProfile(pid, process, task)) {mach_port_deallocate(mach_task_self(), task); return;}
+    if (irqProfile(pid, process, task)) {mach_port_deallocate(mach_task_self(), task); return;}
     // The images: the shared cache's slide and base, and every other image's load address and name.
     struct Image { uint64_t base; char name[40]; };
     std::vector<Image> images;
@@ -428,6 +797,9 @@ void profile(int pid, const char *process) {
             const uint64_t before = cpuSeen[t];
             cpuSeen[t] = cpu + 1;
             if (!before || cpu + 1 == before) continue;
+            // And only one running now: one that ran since the last look but is blocked again would be caught at its system call
+            // (2026-11-03, sa62: WebKit's samples were 35 % mach_msg and 63 % workq_kernreturn, its busy main thread hardly seen).
+            if (basic.run_state != TH_STATE_RUNNING) continue;
             arm_thread_state64_t state = {};
             n = ARM_THREAD_STATE64_COUNT;
             if (thread_get_state(threads[t], ARM_THREAD_STATE64, (thread_state_t)&state, &n) != KERN_SUCCESS) continue;
