@@ -133,7 +133,7 @@ volume = "PDX203ESP"
 # boot_a is 0x6000000 (96 mib, fastboot getvar partition-size:boot_a). the header page, the fd section (at most the 3 mib
 # fd plus its shim) and the kona dtb section (~1.5 mib) leave a little over 91 mib for the ramdisk. the first-console
 # kernel and its adt take ~50 mib. the loader ends the ramdisk at 0xb0000000, inside the 256 mib "Kernel" region
-size_mib = 88
+size_mib = 91   # pdx203: staged apps/ push the ramdisk to its ~91 MiB ceiling (85.66 MiB content); no room for more baked-in files
 loader = "firmware"
 title = "pdx203 first boot: source 4K XNU to console"
 dram_size = "0xfcc00000"           # the upper ddr bank, 0x1_00000000 + 0xfcc00000, verified as xnu's ram by ios-sweet
