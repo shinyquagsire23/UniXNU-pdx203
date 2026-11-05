@@ -1,0 +1,84 @@
+diff --git a/bsd/kern/kern_persona.c b/bsd/kern/kern_persona.c
+--- a/bsd/kern/kern_persona.c
++++ b/bsd/kern/kern_persona.c
+@@ -397,6 +397,51 @@ persona_lookup(uid_t id)
+ 	return persona;
+ }
+ 
++/*
++ * UniXNU (patches/xnu/zzzzzzzzzn-persona-wellknown.patch): a stock device has a
++ * set of well-known low-numbered personas created during setup; a fresh port of
++ * the OS onto new hardware never ran that setup, so those ids do not exist.
++ * Privileged helpers that adopt one by number (e.g. a root-spawn into persona 99)
++ * then fail at persona_lookup() with ESRCH and the spawn never happens.  Create
++ * the requested well-known persona on demand, once, as a system persona owned by
++ * root, so the adopt resolves exactly as it would on a stock device.  The caller
++ * (spawn_validate_persona) has already required the persona-management entitlement
++ * and superuser credentials before reaching here, so this does not widen who may
++ * adopt a persona -- it only supplies an id the port never populated.
++ */
++void
++native_persona_ensure_wellknown(uid_t id)
++{
++	struct persona *persona;
++	int error = 0;
++	char login[24];
++
++	if (id == PERSONA_ID_NONE || id >= FIRST_PERSONA_ID) {
++		return;                 /* only the fixed well-known range */
++	}
++
++	persona = persona_lookup(id);
++	if (persona) {
++		persona_put(persona);   /* already present: nothing to do */
++		return;
++	}
++
++	snprintf(login, sizeof(login), "unixnu-persona-%u", id);
++	persona = persona_alloc(id, login, PERSONA_SYSTEM, NULL, 0 /* root uid */, &error);
++	if (!persona) {
++		return;
++	}
++	error = persona_init_begin(persona);
++	if (error) {
++		/* lost a race to another spawn; the winner is now in the list */
++		persona_init_end(persona, error);
++		persona_put(persona);
++		return;
++	}
++	/* on success the allocation reference becomes the permanent list reference */
++	persona_init_end(persona, 0);
++}
++
+ struct persona *
+ persona_lookup_and_invalidate(uid_t id)
+ {
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -3226,6 +3226,9 @@ spawn_coalitions_release_all(coalition_t coal[COALITION_NUM_TYPES])
+ #endif
+ 
+ #if CONFIG_PERSONAS
++/* UniXNU: create a well-known persona id the port never populated (kern_persona.c) */
++extern void native_persona_ensure_wellknown(uid_t id);
++
+ static int
+ spawn_validate_persona(struct _posix_spawn_persona_info *px_persona)
+ {
+@@ -3243,6 +3246,15 @@ spawn_validate_persona(struct _posix_spawn_persona_info *px_persona)
+ 		}
+ 	}
+ 
++	/* UniXNU (patches/xnu/zzzzzzzzzn-persona-wellknown.patch): a fresh port never
++	 * populated the fixed low-numbered personas a stock device creates at setup, so
++	 * a root helper adopting one by id (e.g. persona 99) would fail below with ESRCH.
++	 * Create it on demand for a superuser caller -- the entitlement check above and
++	 * the uid/gid==0 superuser guard below still bound who may adopt it. */
++	if (kauth_cred_issuser(mycred)) {
++		native_persona_ensure_wellknown(px_persona->pspi_id);
++	}
++
+ 	persona = persona_lookup(px_persona->pspi_id);
+ 	if (!persona) {
+ 		return ESRCH;

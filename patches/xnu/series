@@ -38,3 +38,6 @@ zzzzzzzzzl-audio-addon-mount.patch
 # The board's PSCI halt/restart (halt_all_cpus calls native_board_halt_restart, set by package/ButtonProbe.cpp): shutdown and reboot
 # work instead of timing out at IOPlatformExpert.cpp:884.
 zzzzzzzzzm-halt-board.patch
+# A well-known persona id (e.g. 99) that a stock device creates at setup but a fresh port never populated: created on demand so a
+# root helper's persona-adopt spawn resolves instead of failing ESRCH (TrollStore's install helper, which spawns itself into persona 99).
+zzzzzzzzzn-persona-wellknown.patch
