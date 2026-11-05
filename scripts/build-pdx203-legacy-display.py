@@ -274,6 +274,21 @@ adsp_src,adsp_probe=board_cpp('AdspProbe.cpp')
 audio_src,audio_probe=board_cpp('Pdx203Audio.cpp')
 # the headphone jack (WCD938x over SoundWire, the LPASS RX/TX macros), driven from Pdx203Audio.cpp
 hph_src,hph_obj=board_cpp('Pdx203Hph.cpp')
+# the WiFi chip's PCIe bring-up (QCA6390 on PCIe0) and the WiFi module it starts (Ath11kWifi, a checkout next to the device repository or
+# $ATH11K_WIFI_DIR): scripts/build-ath11k-wifi.py compiles the module to kernel objects with every global but the nw_wifi_* ABI renamed
+wifi_module=Path(os.environ['ATH11K_WIFI_DIR']) if os.environ.get('ATH11K_WIFI_DIR') else (ROOT/'kits/pdx203').resolve().parent.parent/'Ath11kWifi'
+require((wifi_module/'include/nw_abi.h').exists(),f'Ath11kWifi checkout at {wifi_module}')
+wifi_src,wifi_obj=board_cpp('Pdx203Wifi.cpp',['-I',str(wifi_module/'include')])
+wifi_module_objs=[Path(l[4:]) for l in subprocess.check_output(['python3',str(ROOT/'scripts/build-ath11k-wifi.py'),'--module',str(wifi_module),'--tree',str(ROOT)],text=True,timeout=1800).splitlines()
+                  if l.startswith('OBJ ')]
+require(len(wifi_module_objs)>30,'Ath11kWifi objects built')
+# the network side (sheng's WifiNet.cpp: en0, the IO80211 registry entries, the Apple80211 requests): its classes register late from
+# Pdx203Wifi.cpp, so its static initialiser is globalised as the battery's
+wifinet_src,wifinet_obj=board_cpp('WifiNet.cpp',['-I',str(wifi_module/'include')])
+wifinet_late=OUT/'WifiNet.late.o'
+run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_WifiNet.cpp',wifinet_obj,wifinet_late])
+require(code(wifinet_obj.read_bytes(),macho(wifinet_obj.read_bytes()))==code(wifinet_late.read_bytes(),macho(wifinet_late.read_bytes())),
+        'Owned WifiNet instructions unchanged by late init staging')
 # the audio service iOS's audio server plug-in opens (sheng's ShengAudioService.cpp): its classes register late from Pdx203Audio.cpp
 audio_svc_src,audio_svc_obj=board_cpp('ShengAudioService.cpp')
 audio_svc_late=OUT/'ShengAudioService.late.o'
@@ -307,10 +322,10 @@ require(code((keyevents/'NativeKeyStoreEvents.o').read_bytes(),macho((keyevents/
         code(keyevents_late.read_bytes(),macho(keyevents_late.read_bytes())),'Owned keystore instructions unchanged by late init staging')
 archive=OUT/'libNativeLegacyDisplay.late.a';archive.unlink(missing_ok=True)
 run(['xcrun','ar','rcs',archive,late,OUT/'original-bindings.o',probe,hid_probe,touch_probe,hid/'NativeHidInput.late.o',hid/'hid-original-bindings.o',
-     keystore_probe,keyevents_late,cpufreq_probe,buttons_probe,battery_late,battery_probe,rtc_late,rtc_probe,adsp_probe,audio_probe,hph_obj,audio_svc_late,*[o for _,o in adsp_c]])
+     keystore_probe,keyevents_late,cpufreq_probe,buttons_probe,battery_late,battery_probe,rtc_late,rtc_probe,adsp_probe,audio_probe,hph_obj,wifi_obj,wifinet_late,*wifi_module_objs,audio_svc_late,*[o for _,o in adsp_c]])
 sources=[ROOT/'drivers/GopFramebuffer/NativeLegacyDisplay.cpp',ROOT/'drivers/GopFramebuffer/NativeLegacyRequest.h',source,
          hid_src,touch_src,ROOT/'drivers/ShengHidInput/NativeHidInput.cpp',keystore_src,ROOT/'drivers/AppleKeyStoreState/NativeKeyStoreEvents.cpp',cpufreq_src,buttons_src,
-         ROOT/'kits/pdx203/ButtonsCore.h',battery_src,battery_probe_src,rtc_src,rtc_probe_src,adsp_src,audio_src,hph_src,audio_svc_src,*[c for c,_ in adsp_c]]
+         ROOT/'kits/pdx203/ButtonsCore.h',battery_src,battery_probe_src,rtc_src,rtc_probe_src,adsp_src,audio_src,hph_src,wifi_src,wifinet_src,audio_svc_src,*[c for c,_ in adsp_c]]
 print(run(['python3',ROOT/'scripts/build-arm-driver.py','NativeGOPPresenter'],text=True),end='')
 gop=ROOT/'build/native-gop-presenter';gop_late=gop/'NativeGOPPresenter.late.o'
 run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_NativeGOPPresenter.cpp',

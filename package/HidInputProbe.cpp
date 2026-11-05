@@ -140,8 +140,11 @@ extern "C" int native_hid_input_probe(void) {
     native_hid_touch_status = touchStarted ? 1 : 2;
   }
   // The orientation device (NativeHidInput setOrientationOnly): locationd's always-on-orientation path reads it on a J120 identity and
-  // the UI rotates with what it reports; the volume up + down chord steps it (ButtonProbe.cpp). pdx203-orient=0 leaves it out.
-  unsigned orient = 1;
+  // the UI rotates with what it reports; the volume up + down chord steps it (ButtonProbe.cpp). pdx203-orient=1 turns it on.
+  // Default off: the GOP/legacy present path copies the composited surface straight to the portrait panel with no rotation, so any
+  // non-portrait orientation presents a geometry-mismatched surface -- the panel freezes on ~3 stale frames while the UI runs blind,
+  // and only portrait recovers (2026-11-04). Re-enable once the display driver rotates the surface on present.
+  unsigned orient = 0;
   PE_parse_boot_argn("pdx203-orient", &orient, sizeof orient);
   if (orient) {
     IOService *device2 = native_hid_orientation_allocate();

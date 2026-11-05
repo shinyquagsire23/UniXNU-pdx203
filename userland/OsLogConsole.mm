@@ -20,6 +20,7 @@
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <string>
@@ -181,6 +182,51 @@ bool startLiveStream() {
 // the database from the system's bundles. pdx203: WebKit's WebContent extension (in the OS cryptex, reached through the addon's overlay)
 // was not in the database ("Error launching process ... OSStatus error -10814"), so Safari never started a web process.
 namespace {
+// The addon's staged apps (apps/<Name>.app, union-mounted over /Applications by mount10) register in the LaunchServices database
+// through the rebuild below, but SpringBoard's icon data source still does not enumerate them (f2q usb-253: its "Application added"
+// list carried only the com.apple.* system apps, and the two apps' bundle ids appear nowhere in SpringBoard/LS) -- the uicache gap: a
+// blanket rebuild does not give them the User application type / install record SpringBoard's query wants. So each is registered
+// explicitly as a User app with -[LSApplicationWorkspace registerApplicationDictionary:] (the call uicache makes), built from its own
+// Info.plist with the path and type keys. Runs every boot (idempotent); the SpringBoard log says whether an icon then appears.
+void registerStagedApps() {
+    char line[600];
+    Class workspaceClass = objc_getClass("LSApplicationWorkspace");
+    id workspace = workspaceClass ? ((id (*)(Class, SEL))objc_msgSend)(workspaceClass, @selector(defaultWorkspace)) : nil;
+    SEL regSel = @selector(registerApplicationDictionary:);
+    if (!workspace || ![workspace respondsToSelector:regSel]) {
+        emit("OSLOG stagedapps: no LSApplicationWorkspace registerApplicationDictionary:\n");
+        return;
+    }
+    DIR *d = opendir("/private/var/ngpu/apps");
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        size_t n = strlen(e->d_name);
+        if (n < 5 || strcmp(e->d_name + n - 4, ".app")) continue;
+        // the union-mounted path (mount10) is what SpringBoard and LaunchServices see
+        NSString *path = [NSString stringWithFormat:@"/Applications/%s", e->d_name];
+        NSString *infoPath = [path stringByAppendingPathComponent:@"Info.plist"];
+        NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:infoPath];
+        NSString *bundleID = info[@"CFBundleIdentifier"];
+        if (!info || !bundleID) {
+            snprintf(line, sizeof line, "OSLOG stagedapps: %s has no Info.plist/CFBundleIdentifier\n", e->d_name);
+            emit(line);
+            continue;
+        }
+        NSMutableDictionary *dict = [info mutableCopy];
+        dict[@"ApplicationType"] = @"User";          // not System: SpringBoard enumerates User apps for icons
+        dict[@"CFBundleIdentifier"] = bundleID;
+        dict[@"Path"] = path;
+        dict[@"CFBundleExecutable"] = info[@"CFBundleExecutable"] ?: bundleID;
+        dict[@"LSInstallType"] = @1;
+        dict[@"_LSBundleIsEphemeral"] = @NO;
+        BOOL ok = ((BOOL (*)(id, SEL, id))objc_msgSend)(workspace, regSel, dict);
+        snprintf(line, sizeof line, "OSLOG stagedapps: registerApplicationDictionary %s (%s) = %s\n",
+                 e->d_name, bundleID.UTF8String, ok ? "ok" : "refused");
+        emit(line);
+    }
+    closedir(d);
+}
 void launchServicesDatabase() {
     char line[600];
     // Rebuild once per marker content: the addon's lsrebuild file carries a token (the apps it stages), and .done keeps the token of
@@ -1224,6 +1270,7 @@ int main() {
         pthread_t sampler;
         if (pthread_create(&sampler, nullptr, cpuTop, nullptr) == 0) pthread_detach(sampler);
         launchServicesDatabase();
+        registerStagedApps();
         installStagedSystemApps();
         if (startLiveStream()) {
             for (;;) {
