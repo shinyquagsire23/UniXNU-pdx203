@@ -242,6 +242,20 @@ text_fixups = [
   # skipped instead of crashing. 2026-11-04.
   "dyld_shared_cache_arm64.03,27f8964,80040035,80010035",
   "dyld_shared_cache_arm64.03,27f896c,400400b4,400100b4",
+  # BlueTool runCommandForCurrentConfig (0x100016bf8, the boot/init/deepsleep scripts bluetoothd asks for over XPC) answers 0 at once:
+  # its scripts are Broadcom's (hcd download, baud and sleep vendor commands) and the QCA6390 is brought up by the kernel
+  # (Pdx203Bluetooth.cpp). Its override scripts would need MobileGestalt ReleaseType Vendor/Internal. 2026-11-05.
+  "BlueTool,16bf8,fc6fbaa9fa6701a9,00008052c0035fd6",
+  # bluetoothd's POSIX transport open (0x1000ddaa8): its default port is the Skywalk one, com.apple.uart.sk.bluetooth, which goes on to an
+  # os_channel this kernel has no nexus for; the strcmp branch into that path (0x1000ddd20 cbz) becomes a nop, so the same control
+  # socket (Pdx203BtTty.c registers both names) carries the H4 stream with read/write. launchd runs the signed job cache, so the
+  # BT_HCI_TRANSPORT environment cannot be set instead. 2026-11-05.
+  "bluetoothd,ddd20,a0050034,1f2003d5",
+  # bluetoothd's diagnostics-mode getter (0x10036c24c, the platform's vtbl[0x160]; set from IODeviceTree:/product boot-ios-diagnostics)
+  # answers 1: readRootKeys makes temporary root keys in RAM instead of the keychain items under "BluetoothGlobal", whose read or
+  # write fails here (OI_STATUS_ACCESS_DENIED, "Bluetooth error - restarting { reason=130 }" every 10 s). Pairings do not survive a
+  # reboot until bluetoothd's keychain access works. 2026-11-05.
+  "bluetoothd,36c24c,fd7bbfa9fd030091,20008052c0035fd6",
 ]
 
 [payload.adt]

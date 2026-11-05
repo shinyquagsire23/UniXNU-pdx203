@@ -317,6 +317,10 @@ def board_c(name,json_rel):
 adsp_c=[board_c(n+'.c','osfmk/DEVELOPMENT/startup.o.json') for n in
         ('QcomMdt','FatVolume','QcomQrtr','ShengQrtr','QcomSmem','QcomSmp2p','QcomGlink','QcomQmp','QcomRpmh','GeniI2c')]
 adsp_c.append(board_c('AdspFirmware.c','bsd/DEVELOPMENT/kern_exec.o.json'))
+# Bluetooth (QCA6390 on QUP SE6 as a UART; pdx203-blue=<mode>): the hardware side with the kernel's IOKit C++ line, its tty
+# (/dev/cu.bluetooth, the kernel's tty layer) with the bsd C line
+blue_src,blue_obj=board_cpp('Pdx203Bluetooth.cpp')
+adsp_c.append(board_c('Pdx203BtTty.c','bsd/DEVELOPMENT/kern_exec.o.json'))
 print(run(['python3',ROOT/'scripts/build-arm-driver.py','AppleKeyStoreState'],text=True),end='')
 keyevents=ROOT/'build/apple-key-store-state';keyevents_late=keyevents/'NativeKeyStoreEvents.late.o'
 run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_NativeKeyStoreEvents.cpp',
@@ -325,10 +329,10 @@ require(code((keyevents/'NativeKeyStoreEvents.o').read_bytes(),macho((keyevents/
         code(keyevents_late.read_bytes(),macho(keyevents_late.read_bytes())),'Owned keystore instructions unchanged by late init staging')
 archive=OUT/'libNativeLegacyDisplay.late.a';archive.unlink(missing_ok=True)
 run(['xcrun','ar','rcs',archive,late,OUT/'original-bindings.o',probe,hid_probe,touch_probe,hid/'NativeHidInput.late.o',hid/'hid-original-bindings.o',
-     keystore_probe,keyevents_late,cpufreq_probe,buttons_probe,battery_late,battery_probe,rtc_late,rtc_probe,adsp_probe,audio_probe,hph_obj,wifi_obj,wifinet_late,*wifi_module_objs,audio_svc_late,*[o for _,o in adsp_c]])
+     keystore_probe,keyevents_late,cpufreq_probe,buttons_probe,battery_late,battery_probe,rtc_late,rtc_probe,adsp_probe,audio_probe,hph_obj,wifi_obj,wifinet_late,*wifi_module_objs,blue_obj,audio_svc_late,*[o for _,o in adsp_c]])
 sources=[ROOT/'drivers/GopFramebuffer/NativeLegacyDisplay.cpp',ROOT/'drivers/GopFramebuffer/NativeLegacyRequest.h',source,
          hid_src,touch_src,ROOT/'drivers/ShengHidInput/NativeHidInput.cpp',keystore_src,ROOT/'drivers/AppleKeyStoreState/NativeKeyStoreEvents.cpp',cpufreq_src,buttons_src,
-         ROOT/'kits/pdx203/ButtonsCore.h',battery_src,battery_probe_src,rtc_src,rtc_probe_src,adsp_src,audio_src,hph_src,wifi_src,wifinet_src,audio_svc_src,*[c for c,_ in adsp_c]]
+         ROOT/'kits/pdx203/ButtonsCore.h',battery_src,battery_probe_src,rtc_src,rtc_probe_src,adsp_src,audio_src,hph_src,wifi_src,wifinet_src,audio_svc_src,blue_src,*[c for c,_ in adsp_c]]
 print(run(['python3',ROOT/'scripts/build-arm-driver.py','NativeGOPPresenter'],text=True),end='')
 gop=ROOT/'build/native-gop-presenter';gop_late=gop/'NativeGOPPresenter.late.o'
 run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_NativeGOPPresenter.cpp',

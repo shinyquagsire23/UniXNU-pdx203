@@ -620,6 +620,9 @@ extern "C" void sheng_adsp_probe(void);
 extern "C" void pdx203_audio_probe(void);
 // the QCA6390 WiFi chip on PCIe0 (package/Pdx203Wifi.cpp; pdx203-wifi=<stage>): its rails go through the ADSP thread's RPMh helper
 extern "C" void pdx203_wifi_probe(void);
+// the QCA6390's Bluetooth on QUP SE6 (package/Pdx203Bluetooth.cpp; pdx203-blue=<mode>): waits for the WiFi bring-up's rails, then the UART,
+// the firmware and /dev/cu.bluetooth
+extern "C" void pdx203_bluetooth_probe(void);
 extern "C" void pdx203_shot_register(void);
 void native_legacy_display_late_probe(void) {
     // the rig's screenshot provider: flipReady() registers it on the page flip path, which only a display driver with the board
@@ -635,6 +638,7 @@ void native_legacy_display_late_probe(void) {
     sheng_adsp_probe();
     pdx203_audio_probe();
     pdx203_wifi_probe();
+    pdx203_bluetooth_probe();
     unsigned touch=0;
     if(PE_parse_boot_argn("pdx203-touch",&touch,sizeof(touch)) && touch==1)(void)pdx203_touch_start();
     IOService *display=pendingLegacyDisplay;if(!display)return;pendingLegacyDisplay=nullptr;

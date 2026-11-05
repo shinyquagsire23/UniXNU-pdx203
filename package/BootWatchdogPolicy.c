@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
-// From UniXNU-sheng 978e3f7 package/BootWatchdogPolicy.c (identical in UniXNU-alioth); unchanged below this line.
+// From UniXNU-sheng 978e3f7 package/BootWatchdogPolicy.c (identical in UniXNU-alioth); unchanged below this line but for pdx203:
+// com.apple.bluetoothd is no longer in the sheng-lite list (this board has Bluetooth: Pdx203Bluetooth.cpp).
 // Explicit temporary bring-up policy for an unavailable watchdog backend.
 // Runs after writable scratch Data mounts, before the unchanged launchd exec.
 #include <sys/param.h>
@@ -23,7 +24,7 @@ static const char policy_tail[]="</dict></plist>\n";
 // all of which start at the first boot of a fresh Data and compete with SpringBoard for the CPU and for memory. The first four are the
 // cycle of synchronous XPC waits the isolation work found. Labels are the ones in the target's own LaunchDaemons.
 static const char lite_jobs[]=
- "com.apple.identityservicesd,com.apple.locationd,com.apple.CommCenter,com.apple.bluetoothd,"
+ "com.apple.identityservicesd,com.apple.locationd,com.apple.CommCenter,"
  "com.apple.photoanalysisd,com.apple.mediaanalysisd,com.apple.mediastream.mstreamd,com.apple.icloud.searchpartyd,"
  "com.apple.findmy.findmybeaconingd,com.apple.familycircled,com.apple.financed,com.apple.softwareupdateservicesd,"
  "com.apple.ndoagent,com.apple.biomesyncd,com.apple.email.maild,com.apple.amsengagementd,com.apple.adid,com.apple.eyereliefd,"
