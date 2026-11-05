@@ -66,19 +66,41 @@ diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
  static int
  spawn_validate_persona(struct _posix_spawn_persona_info *px_persona)
  {
-@@ -3243,6 +3246,15 @@ spawn_validate_persona(struct _posix_spawn_persona_info *px_persona)
+@@ -3243,17 +3246,36 @@ spawn_validate_persona(struct _posix_spawn_persona_info *px_persona)
  		}
  	}
  
 +	/* UniXNU (patches/xnu/zzzzzzzzzn-persona-wellknown.patch): a fresh port never
 +	 * populated the fixed low-numbered personas a stock device creates at setup, so
-+	 * a root helper adopting one by id (e.g. persona 99) would fail below with ESRCH.
-+	 * Create it on demand for a superuser caller -- the entitlement check above and
-+	 * the uid/gid==0 superuser guard below still bound who may adopt it. */
-+	if (kauth_cred_issuser(mycred)) {
-+		native_persona_ensure_wellknown(px_persona->pspi_id);
-+	}
++	 * adopting one by id (e.g. persona 99) fails below with ESRCH.  Reaching here
++	 * means the task holds com.apple.private.persona-mgmt (checked above) -- the same
++	 * capability a stock device requires -- so create the requested well-known id on
++	 * demand.  On a stock device TrollStore's installer runs from the mobile user and
++	 * still adopts persona 99 as uid/gid 0; the entitlement, not being root, is the gate. */
++	native_persona_ensure_wellknown(px_persona->pspi_id);
 +
  	persona = persona_lookup(px_persona->pspi_id);
  	if (!persona) {
  		return ESRCH;
+ 	}
+ 
+-	// non-root process should not be allowed to set persona with uid/gid 0
++	/* A persona-mgmt-entitled task may adopt uid/gid 0 even when it is not already
++	 * root (the entitlement check at the top is the capability gate); a caller without
++	 * it still may not.  Since we only reach here when entitled, this preserves the
++	 * stock restriction for everyone else while letting the entitled installer through. */
+ 	if (!kauth_cred_issuser(mycred) &&
++	    !IOCurrentTaskHasEntitlement( PERSONA_MGMT_ENTITLEMENT) &&
+ 	    (px_persona->pspi_uid == 0 || px_persona->pspi_gid == 0)) {
++		persona_put(persona);
+ 		return EPERM;
+ 	}
+ 
++	printf("UNIXNU persona: id=%u uid=%u gid=%u flags=0x%x issuser=%d -> adopt\n",
++	    (unsigned)px_persona->pspi_id, (unsigned)px_persona->pspi_uid,
++	    (unsigned)px_persona->pspi_gid, (unsigned)px_persona->pspi_flags,
++	    kauth_cred_issuser(mycred));
++
+ 	persona_put(persona);
+ 	return error;
+ }
