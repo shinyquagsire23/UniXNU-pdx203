@@ -28,7 +28,9 @@
 
 extern "C" {
 char native_cpufreq_row[120];
+char native_thermal_row[120];
 volatile uint32_t native_cpufreq_stage;
+volatile int native_thermal_max_mc = -100000;   // hottest sensor, milliCelsius; the future throttle governor reads this
 }
 
 namespace {
@@ -51,6 +53,22 @@ Window gDomain[3];
 unsigned gMode;
 uint32_t gCapKHz;
 IOLock *gLock;
+
+// TSENS die temperature (qcom,tsens24xx v2, from this board's DTB tsens@c222000 / @c223000): two controllers, their thermal-
+// monitor (TM) blocks at 0x0c263000 (TSENS0) and 0x0c265000 (TSENS1), each with up to 16 sensors. Per-sensor status register at
+// TM + 0xa0 + 4*n: bit 21 = valid, bits[11:0] = a signed temperature code (sign-extend from bit 11), 0.1 C per LSB -- the mainline
+// qcom tsens driver converts v2 as sign_extend(code,11)*100 mC with no per-sensor slope. Only the NS-readable TM block is touched
+// (never SROT). Report each controller's hottest valid sensor and the overall max; no throttling yet (this is iteration 1).
+constexpr uint64_t kTsensTmBase[2] = {0x0c263000, 0x0c265000};
+constexpr uint32_t kTsensSnStatus = 0xa0;   // Sn_STATUS = 0xa0 + 4*n
+constexpr unsigned kTsensSensors = 16;
+Window gTsens[2];
+
+int tsensMilliC(uint32_t status) {
+    int code = (int)(status & 0xfff);
+    if (code & 0x800) code -= 0x1000;       // sign-extend the 12-bit field
+    return code * 100;                       // milliCelsius
+}
 
 uint32_t rd32(uintptr_t base, uint32_t reg) {return *reinterpret_cast<volatile uint32_t *>(base + reg);}
 void wr32(uintptr_t base, uint32_t reg, uint32_t value) {
@@ -115,6 +133,67 @@ void refreshRow() {
     }
 
 }
+
+void readThermal() {
+    char *out = native_thermal_row;
+    const size_t cap = sizeof(native_thermal_row);
+    unsigned n = (unsigned)snprintf(out, cap, "THERMAL");
+    int gmax = -100000;
+    for (unsigned t = 0; t < 2 && n < cap; ++t) {
+        Window &w = gTsens[t];
+        if (!w.va) {n += (unsigned)snprintf(out + n, cap - n, " t%u:nomap", t); continue;}
+        int tmax = -100000; unsigned valid = 0;
+        for (unsigned s = 0; s < kTsensSensors; ++s) {
+            uint32_t status = rd32(w.va, kTsensSnStatus + s * 4);
+            if (!((status >> 21) & 1)) continue;   // not valid / not yet sampled
+            ++valid;
+            int mC = tsensMilliC(status);
+            if (mC > tmax) tmax = mC;
+            if (mC > gmax) gmax = mC;
+        }
+        if (valid) n += (unsigned)snprintf(out + n, cap - n, " t%u %d.%dC/%u", t, tmax / 1000, (tmax % 1000) / 100, valid);
+        else n += (unsigned)snprintf(out + n, cap - n, " t%u:none", t);
+    }
+    native_thermal_max_mc = gmax;
+    if (gmax > -100000 && n < cap) snprintf(out + n, cap - n, " max %d.%dC", gmax / 1000, (gmax % 1000) / 100);
+}
+
+// Thermal governor: we pin the CPU domains at their highest non-turbo level for 60 fps, which cooks the SoC to ~88 C even on the
+// idle lock screen (TSENS). Step a frequency cap down when the hottest sensor crosses the high mark and re-vote every domain; step
+// it back up (toward uncapped) below the low mark. One step per poll with hysteresis. CPU only for now -- the GPU clock is pinned
+// separately (GpuProbe); if idle stays hot after this, a GPU step is the next iteration. Thresholds baked (the kernel command line
+// is at its 1000-byte limit, no room for boot-args); they stay mutable globals so a runtime knob can tune them later.
+int gThermHighMc = 83000, gThermLowMc = 73000;
+constexpr uint32_t kThrottleCapKHz[] = {0, 2400000, 2000000, 1612800, 1305600};  // step 0 = uncapped; higher step = cooler
+constexpr unsigned kThrottleSteps = sizeof(kThrottleCapKHz) / sizeof(kThrottleCapKHz[0]);
+unsigned gThermStep;
+
+uint32_t effectiveCapKHz() {
+    uint32_t cap = gCapKHz, t = kThrottleCapKHz[gThermStep];
+    if (t && (!cap || t < cap)) cap = t;
+    return cap;
+}
+void revoteAll() {
+    uint32_t saved = gCapKHz;
+    gCapKHz = effectiveCapKHz();           // pickLevel reads gCapKHz
+    for (unsigned d = 0; d < 3; ++d) {
+        Window &w = gDomain[d];
+        if (w.va && (rd32(w.va, kRegEnable) & 1)) {w.voted = -1; voteDomain(d);}
+    }
+    gCapKHz = saved;
+}
+void thermalGovern() {
+    int t = native_thermal_max_mc;
+    if (t <= -100000) return;              // no reading yet
+    unsigned old = gThermStep;
+    if (t > gThermHighMc && gThermStep + 1 < kThrottleSteps) ++gThermStep;
+    else if (t < gThermLowMc && gThermStep > 0) --gThermStep;
+    if (gThermStep != old) {
+        revoteAll();
+        uint32_t cap = effectiveCapKHz();
+        printf("PDX203 THROTTLE step %u cap %uMHz at %d.%dC\n", gThermStep, cap ? cap / 1000 : 0, t / 1000, (t % 1000) / 100);
+    }
+}
 }
 
 extern "C" void sheng_cpufreq_poll(void) {
@@ -126,6 +205,8 @@ extern "C" void sheng_cpufreq_poll(void) {
         if (w.va && wanted && w.voted < 0 && (rd32(w.va, kRegEnable) & 1)) voteDomain(d);
     }
     refreshRow();
+    readThermal();
+    thermalGovern();
     native_cpufreq_stage = 2;
     IOLockUnlock(gLock);
 }
@@ -140,6 +221,7 @@ extern "C" void sheng_cpufreq_probe(void) {
     native_cpufreq_stage = 1;
     gCapKHz = capMHz * 1000;
     for (unsigned d = 0; d < 3; ++d) mapWindow(gDomain[d], kDomainBase[d]);
+    for (unsigned t = 0; t < 2; ++t) mapWindow(gTsens[t], kTsensTmBase[t]);
     gMode = mode;
     sheng_cpufreq_poll();
 }
@@ -174,7 +256,12 @@ void cpufreqThread(void *, wait_result_t)
             strlcpy(last, native_cpufreq_row, sizeof(last));
             printf("PDX203 %s\n", last);
         }
-        IOSleep(round < 60 ? 1000 : 30000);
+        // Temperature changes every read, so print it every round (a warmup trace at 1 s for the first minute, then every 30 s) --
+        // this is the thermal visibility pass; a throttle governor off native_thermal_max_mc comes once we see how hot it runs.
+        printf("PDX203 %s\n", native_thermal_row);
+        // 1 s for the first minute (warmup + fast initial throttle response), then every 5 s so the governor still reacts to load
+        // within a few seconds rather than the old 30 s.
+        IOSleep(round < 60 ? 1000 : 5000);
     }
 }
 }
