@@ -41,3 +41,6 @@ zzzzzzzzzm-halt-board.patch
 # A well-known persona id (e.g. 99) that a stock device creates at setup but a fresh port never populated: created on demand so a
 # root helper's persona-adopt spawn resolves instead of failing ESRCH (TrollStore's install helper, which spawns itself into persona 99).
 zzzzzzzzzn-persona-wellknown.patch
+# The physical page's first user mapping (process name, pid, address), which the Adreno driver asks before freeing a BO's
+# owned pages. The board stub answered "mapped" for every page, so every freed BO was kept: a GPU-memory leak per app switch.
+zzzzzzzzzo-pmap-page-owner.patch

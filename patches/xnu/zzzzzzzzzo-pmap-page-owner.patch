@@ -1,0 +1,65 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -2903,10 +2903,59 @@ pmap_assert_free(ppnum_t ppnum)
+ 		const char *type = (pmap == kernel_pmap) ? "Kernel" : "User";
+ 
+ 		panic("%s: Found at least one mapping to %#llx. First PTEP (%p) is a "
+-		    "%s CPU mapping (pmap: %p)",
+-		    __func__, (uint64_t)pa, first_ptep, type, pmap);
++		    "%s CPU mapping (pmap: %p %s[%d] va 0x%llx)",
++		    __func__, (uint64_t)pa, first_ptep, type, pmap, pmap->pmap_procname, pmap->pmap_pid,
++		    (uint64_t)ptep_get_va(first_ptep));
+ 	}
+ }
++
++/*
++ * pdx203: the first user (non-kernel) mapping of a physical page, so a driver about to free a page can tell whether a process
++ * still maps it (and name that process: its pmap's recorded name and pid, and the mapping's virtual address) instead of freeing
++ * it into pmap_assert_free. The kernel's own mappings are skipped. 0 found, -1 not a managed page, -2 no user mapping.
++ * The board stub (Pdx203Stubs.c) answered 0 for every page, so the Adreno driver kept (leaked) every owned BO it freed.
++ */
++int native_pmap_page_owner(ppnum_t ppnum, char *name, size_t namelen, int *pid, uint64_t *va);
++int
++native_pmap_page_owner(ppnum_t ppnum, char *name, size_t namelen, int *pid, uint64_t *va)
++{
++	const pmap_paddr_t pa = ptoa(ppnum);
++	if (!pa_valid(pa)) {
++		return -1;
++	}
++	const unsigned int pai = pa_index(pa);
++	int result = -2;
++	pvh_lock(pai);
++	pv_entry_t **pvh = pai_to_pvh(pai);
++	pt_entry_t *found = PT_ENTRY_NULL;
++	if (pvh_test_type(pvh, PVH_TYPE_PTEP)) {
++		pt_entry_t *ptep = pvh_ptep(pvh);
++		if (ptep != PT_ENTRY_NULL && ptep_get_pmap(ptep) != kernel_pmap) {
++			found = ptep;
++		}
++	} else if (pvh_test_type(pvh, PVH_TYPE_PVEP)) {
++		for (pv_entry_t *pvep = pvh_pve_list(pvh); pvep != PV_ENTRY_NULL && found == PT_ENTRY_NULL; pvep = pve_next(pvep)) {
++			for (int i = 0; i < PTE_PER_PVE; i++) {
++				pt_entry_t *ptep = pve_get_ptep(pvep, i);
++				if (ptep != PT_ENTRY_NULL && ptep_get_pmap(ptep) != kernel_pmap) {
++					found = ptep;
++					break;
++				}
++			}
++		}
++	}
++	if (found != PT_ENTRY_NULL) {
++		pmap_t pmap = ptep_get_pmap(found);
++		*va = (uint64_t)ptep_get_va(found);
++		*pid = pmap->pmap_pid;
++		if (name && namelen) {
++			strlcpy(name, pmap->pmap_procname, namelen);
++		}
++		result = 0;
++	}
++	pvh_unlock(pai);
++	return result;
++}
+ #endif
+ 
+ 
