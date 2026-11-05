@@ -356,6 +356,54 @@ void launchServicesDatabase() {
 }
 }  // namespace
 
+// Display Zoom (Settings > Display & Brightness) makes backboardd render a differently sized canvas; the GOP/legacy present path only
+// takes the panel-native surface, so with it set the panel stays dark on every boot (2026-11-05, user report; same failure class as
+// rotation). dz1 (usb-274) found where it lives: com.apple.iokit.IOMobileGraphicsFamily.plist canvas_width = 1536, canvas_height =
+// 2048 (the zoomed canvas), and NativeLegacyDisplay "verify_swap failed" for every swap. Log every zoom/magnify/canvas preference key
+// and drop the display-zoom ones, those two included (each file is backed up to /private/var/ngpu/prefs-backup first). backboardd may already have read the value this boot, so one more reboot
+// applies the reset.
+namespace {
+void resetDisplayZoom() {
+    char line[600];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSRegularExpression *seen = [NSRegularExpression regularExpressionWithPattern:@"zoom|magnif|canvas" options:NSRegularExpressionCaseInsensitive error:nil];
+    NSRegularExpression *drop = [NSRegularExpression regularExpressionWithPattern:@"^canvas_(width|height)$|displayzoom|magnifymode|zoommode|^canvassize|displaycanvas"
+                                                                          options:NSRegularExpressionCaseInsensitive error:nil];
+    [fm createDirectoryAtPath:@"/private/var/ngpu/prefs-backup" withIntermediateDirectories:YES attributes:nil error:nil];
+    for (NSString *dir in @[@"/private/var/mobile/Library/Preferences", @"/private/var/preferences", @"/private/var/root/Library/Preferences"]) {
+        for (NSString *name in [fm contentsOfDirectoryAtPath:dir error:nil]) {
+            if (![name hasSuffix:@".plist"]) continue;
+            NSString *path = [dir stringByAppendingPathComponent:name];
+            NSMutableDictionary *prefs = [[NSDictionary dictionaryWithContentsOfFile:path] mutableCopy];
+            if (!prefs) continue;
+            NSMutableArray *removed = [NSMutableArray array];
+            for (NSString *key in prefs.allKeys) {
+                if (![key isKindOfClass:[NSString class]]) continue;
+                NSRange all = NSMakeRange(0, key.length);
+                if (![seen firstMatchInString:key options:0 range:all]) continue;
+                NSString *value = [[prefs[key] description] stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+                BOOL dropIt = [drop firstMatchInString:key options:0 range:all] != nil;
+                snprintf(line, sizeof line, "OSLOG zoomprefs: %s %s = %.160s%s\n", name.UTF8String, key.UTF8String, value.UTF8String,
+                         dropIt ? " [reset]" : "");
+                emit(line);
+                if (dropIt) [removed addObject:key];
+            }
+            if (!removed.count) continue;
+            NSString *backup = [@"/private/var/ngpu/prefs-backup" stringByAppendingPathComponent:name];
+            if (![fm fileExistsAtPath:backup]) [fm copyItemAtPath:path toPath:backup error:nil];
+            struct stat st;
+            bool haveOwner = stat(path.fileSystemRepresentation, &st) == 0;
+            [prefs removeObjectsForKeys:removed];
+            BOOL ok = [prefs writeToFile:path atomically:YES];
+            if (haveOwner) chown(path.fileSystemRepresentation, st.st_uid, st.st_gid);
+            snprintf(line, sizeof line, "OSLOG zoomprefs: %s reset %lu key(s): %s\n", name.UTF8String, (unsigned long)removed.count,
+                     ok ? "written" : "WRITE FAILED");
+            emit(line);
+        }
+    }
+}
+}  // namespace
+
 // The addon's apps never get an icon: every registration path (lsd.mapdb, containermanagerd, installcoordinationd's install) lives in the
 // mobile user session this root/system-session daemon cannot reach, and SystemAppMigrator only installs its fixed Apple manifest. So
 // skip installing altogether and overlay an app that IS installed: bindfs (MNT_UNION, so the target's own files show through where ours
@@ -1407,6 +1455,7 @@ int main() {
         gFilter = filter;
         pthread_t sampler;
         if (pthread_create(&sampler, nullptr, cpuTop, nullptr) == 0) pthread_detach(sampler);
+        resetDisplayZoom();
         launchServicesDatabase();
         overlayApps();
         // The staged-app registration needs containermanagerd and lsd up; at this point in boot they may not be. Try once now,
