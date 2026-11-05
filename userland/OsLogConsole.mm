@@ -189,8 +189,9 @@ namespace {
 // uikittools-ng): create the app's MCMAppDataContainer, build the record with ApplicationType System, CompatibilityState 0, the
 // container path and the PlugIns as _LSBundlePlugins, then -[LSApplicationWorkspace registerApplicationDictionary:]. Runs every boot
 // (idempotent); the SpringBoard log says whether an icon then appears. Apps in /Applications register as System, as uicache does.
-void registerStagedApps() {
+bool registerStagedApps() {
     char line[600];
+    unsigned appsTotal = 0, appsOk = 0;
     dlopen("/System/Library/PrivateFrameworks/MobileContainerManager.framework/MobileContainerManager", RTLD_NOW);
     Class workspaceClass = objc_getClass("LSApplicationWorkspace");
     id workspace = workspaceClass ? ((id (*)(Class, SEL))objc_msgSend)(workspaceClass, @selector(defaultWorkspace)) : nil;
@@ -200,17 +201,26 @@ void registerStagedApps() {
     SEL containerSel = @selector(containerWithIdentifier:createIfNecessary:existed:error:);
     if (!workspace || ![workspace respondsToSelector:regSel]) {
         emit("OSLOG stagedapps: no LSApplicationWorkspace registerApplicationDictionary:\n");
-        return;
+        return false;
     }
-    auto makeContainer = [&](Class cls, NSString *ident) -> NSString * {
-        if (!cls) return nil;
-        id c = ((id (*)(Class, SEL, id, BOOL, void *, void *))objc_msgSend)(cls, containerSel, ident, (BOOL)YES, nullptr, nullptr);
-        if (!c) return nil;
+    // Capture the MCM container-create error: on this port both the container create and the LS register were refused together
+    // (f2s container=n), the classic shape of the forwarder running before containermanagerd/lsd are up. The error says which.
+    auto makeContainer = [&](Class cls, NSString *ident, const char *what) -> NSString * {
+        if (!cls) { snprintf(line, sizeof line, "OSLOG stagedapps: %s MCM class missing\n", what); emit(line); return nil; }
+        NSError *err = nil;
+        id c = ((id (*)(Class, SEL, id, BOOL, void *, NSError **))objc_msgSend)(cls, containerSel, ident, (BOOL)YES, nullptr, &err);
+        if (!c) {
+            snprintf(line, sizeof line, "OSLOG stagedapps: %s MCM create failed: %s [%s %ld]\n", what,
+                     err ? err.localizedDescription.UTF8String : "nil error",
+                     err ? err.domain.UTF8String : "-", err ? (long)err.code : 0L);
+            emit(line);
+            return nil;
+        }
         id url = ((id (*)(id, SEL))objc_msgSend)(c, @selector(url));
         return url ? ((id (*)(id, SEL))objc_msgSend)(url, @selector(path)) : nil;
     };
     DIR *d = opendir("/private/var/ngpu/apps");
-    if (!d) return;
+    if (!d) return false;
     struct dirent *e;
     while ((e = readdir(d))) {
         size_t n = strlen(e->d_name);
@@ -224,7 +234,8 @@ void registerStagedApps() {
             emit(line);
             continue;
         }
-        NSString *containerPath = makeContainer(appContainerClass, bundleID);
+        appsTotal++;
+        NSString *containerPath = makeContainer(appContainerClass, bundleID, "app");
         NSMutableDictionary *plist = [NSMutableDictionary dictionary];
         plist[@"ApplicationType"] = @"System";
         plist[@"BundleNameIsLocalized"] = @1;
@@ -241,7 +252,7 @@ void registerStagedApps() {
             NSDictionary *pinfo = [NSDictionary dictionaryWithContentsOfFile:[fullPath stringByAppendingPathComponent:@"Info.plist"]];
             NSString *pid = pinfo[@"CFBundleIdentifier"];
             if (!pid) continue;
-            NSString *pcPath = makeContainer(pluginContainerClass, pid);
+            NSString *pcPath = makeContainer(pluginContainerClass, pid, "plugin");
             NSMutableDictionary *pp = [NSMutableDictionary dictionary];
             pp[@"ApplicationType"] = @"PluginKitPlugin";
             pp[@"BundleNameIsLocalized"] = @1;
@@ -254,11 +265,27 @@ void registerStagedApps() {
         }
         plist[@"_LSBundlePlugins"] = bundlePlugins;
         BOOL ok = ((BOOL (*)(id, SEL, id))objc_msgSend)(workspace, regSel, plist);
-        snprintf(line, sizeof line, "OSLOG stagedapps: registerApplicationDictionary %s (%s) container=%s = %s\n",
-                 e->d_name, bundleID.UTF8String, containerPath ? "y" : "n", ok ? "ok" : "refused");
+        const char *how = "dict";
+        // The dict path needs a data container, and this forwarder (root, SYSTEM session) cannot reach the per-user
+        // com.apple.containermanagerd (class-2 lookup is invalidated, 6 retries -> MCMErrorDomain 51); uicache works
+        // because it runs as mobile. lsd DOES reach containermanagerd (it runs as mobile) and it is lsd that executes the
+        // registration, so fall back to the URL-based registerApplication:, which has lsd scan the bundle and provision
+        // its container in lsd's own mobile context rather than us pre-creating one.
+        if (!ok) {
+            SEL regUrlSel = @selector(registerApplication:);
+            NSURL *url = [NSURL fileURLWithPath:path];
+            if (url && [workspace respondsToSelector:regUrlSel]) {
+                ok = ((BOOL (*)(id, SEL, id))objc_msgSend)(workspace, regUrlSel, url);
+                if (ok) how = "registerApplication";
+            }
+        }
+        if (ok) appsOk++;
+        snprintf(line, sizeof line, "OSLOG stagedapps: register %s (%s) container=%s via %s = %s\n",
+                 e->d_name, bundleID.UTF8String, containerPath ? "y" : "n", ok ? how : "both", ok ? "ok" : "refused");
         emit(line);
     }
     closedir(d);
+    return appsTotal > 0 && appsOk == appsTotal;
 }
 void launchServicesDatabase() {
     char line[600];
@@ -1303,12 +1330,17 @@ int main() {
         pthread_t sampler;
         if (pthread_create(&sampler, nullptr, cpuTop, nullptr) == 0) pthread_detach(sampler);
         launchServicesDatabase();
-        registerStagedApps();
+        // The staged-app registration needs containermanagerd and lsd up; at this point in boot they may not be. Try once now,
+        // then keep retrying on the 5 s crash-dump loop (up to ~2 min) until every app registers, so a daemon that comes up late
+        // still gets the icons placed (f2s: container=n + refused for both apps on the single startup attempt).
+        bool appsRegistered = registerStagedApps();
         installStagedSystemApps();
         if (startLiveStream()) {
+            unsigned appTries = 0;
             for (;;) {
                 sleep(5);
                 dumpNewCrashReports();
+                if (!appsRegistered && appTries++ < 24) appsRegistered = registerStagedApps();
                 if (gDropped) {snprintf(line, sizeof line, "OSLOG dropped %lu lines over the rate limit so far\n", gDropped); emit(line);}
             }
         }

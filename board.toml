@@ -124,7 +124,8 @@ kernel_args = [
   "sheng-pmgr=2",
   "serial=3",
   "debug=0x14e",
-  "-enable_kprintf_spam",
+  # (dropped -enable_kprintf_spam to stay under the 1000-byte kernel command-line limit when armcpu-edge=1 was added; it only
+  # gated extra early-boot kprintf verbosity -- the runtime PDX203/DISPLAY printf rows and the forwarder's output are unaffected)
   "kt_fixed_zones=120",
   "-no_slto_panic",
   # watchdogd's _PanicOnCrash: kern_exit.c's panic_on_crash_disabled stops proc_should_trigger_panic() first
@@ -191,6 +192,12 @@ kernel_args = [
   # the frame threads on the A77 P-cluster (cpus 4-7). TestUFO ran at 30 fps with 3 (WebKit/render/compositor threads landing on the
   # 1.8 GHz A55 E-cluster missed every other refresh); 4 is the fork's 60 fps lever ("PDX203 CORES recommended 0xf0" on the usb log).
   "sheng-cpufreq=4",
+  # activate the Edge (AMP) scheduler's cluster placement: ArmCpu gates ml_cpu_init_completed() behind this, which installs the
+  # real A77<->A55 migration matrix and sets the default preferred cluster to the A77 P-cluster for the UI/render/frame buckets
+  # (A55 E-cluster only for utility/background). Without it the Edge scheduler is compiled in (two psets from dts cluster-type
+  # E/P) but dormant: the default preference stays the boot cpu's A55 cluster, so cpufreq=4's recommended_cores(0xf0) is only a
+  # soft hint fighting that default -- TestUFO sat at 50 fps. This is the native "keep frame threads on the fast cores" lever
+  "armcpu-edge=1",
   # the adreno 650, the board probe (package/GpuProbe.cpp) one mode at a time. 11: the GPU up and published for user clients with
   # the kernel's own self-test submissions; 12 adds the staged accelerator for Metal (with the gpu addon). GPUROW <n> rows on the usb log
   "pipa-gpu=12",
