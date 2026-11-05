@@ -19,6 +19,7 @@
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
+#include <sys/mount.h>
 #include <fcntl.h>
 #include <dirent.h>
 #include <objc/message.h>
@@ -352,6 +353,83 @@ void launchServicesDatabase() {
     snprintf(line, sizeof line, "OSLOG csstore: %u found, %u removed, lsd stopped %u times (%u processes): LaunchServices rebuilds its database\n",
              found, removed, killed, seen);
     emit(line);
+}
+}  // namespace
+
+// The addon's apps never get an icon: every registration path (lsd.mapdb, containermanagerd, installcoordinationd's install) lives in the
+// mobile user session this root/system-session daemon cannot reach, and SystemAppMigrator only installs its fixed Apple manifest. So
+// skip installing altogether and overlay an app that IS installed: bindfs (MNT_UNION, so the target's own files show through where ours
+// do not shadow them) a copy of our bundle over the target's bundle directory, with our executable renamed to the target's
+// CFBundleExecutable and the Info.plist naming the target's id. LaunchServices and SpringBoard keep the target's record (icon, name,
+// data container); tapping it execs our binary -- the TrollStore persistence-helper trick, but nothing on disk is replaced and the
+// mount is gone after a reboot. Needs com.apple.private.bindfs-allow (bind_vfsops.c).
+namespace {
+void overlayApps() {
+    char line[600];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    // ov1 (usb-273): TrollStore over Tips launches and shows its UI. Sileo over Podcasts aborted at load ("Library not loaded:
+    // @rpath/libzstd.1.dylib"): it needs a rootless bootstrap under /var/jb, so it is left out and Podcasts stays itself.
+    NSDictionary *pairs = @{@"TrollStore.app": @"com.apple.tips"};
+    NSString *bundles = @"/private/var/containers/Bundle/Application";
+    NSError *err = nil;
+    NSArray *uuids = [fm contentsOfDirectoryAtPath:bundles error:&err];
+    if (!uuids) {
+        snprintf(line, sizeof line, "OSLOG overlay: cannot list %s: %s\n", bundles.UTF8String, err.localizedDescription.UTF8String);
+        emit(line);
+        return;
+    }
+    NSMutableDictionary *found = [NSMutableDictionary dictionary];
+    for (NSString *uuid in uuids) {
+        NSString *dir = [bundles stringByAppendingPathComponent:uuid];
+        for (NSString *name in [fm contentsOfDirectoryAtPath:dir error:nil]) {
+            if (![name hasSuffix:@".app"]) continue;
+            NSString *path = [dir stringByAppendingPathComponent:name];
+            NSString *ident = [NSDictionary dictionaryWithContentsOfFile:[path stringByAppendingPathComponent:@"Info.plist"]][@"CFBundleIdentifier"];
+            if (ident && [[pairs allValues] containsObject:ident]) found[ident] = path;
+        }
+    }
+    [fm createDirectoryAtPath:@"/private/var/ngpu/overlay" withIntermediateDirectories:YES attributes:nil error:nil];
+    for (NSString *ours in pairs) {
+        NSString *targetID = pairs[ours], *target = found[targetID];
+        NSString *src = [@"/private/var/ngpu/apps" stringByAppendingPathComponent:ours];
+        if (!target || ![fm fileExistsAtPath:src]) {
+            snprintf(line, sizeof line, "OSLOG overlay: %s -> %s skipped (target %s, source %s)\n", ours.UTF8String, targetID.UTF8String,
+                     target ? "found" : "not installed", [fm fileExistsAtPath:src] ? "present" : "missing");
+            emit(line);
+            continue;
+        }
+        struct statfs sf;
+        if (statfs(target.fileSystemRepresentation, &sf) == 0 && strcmp(sf.f_fstypename, "bindfs") == 0) {
+            snprintf(line, sizeof line, "OSLOG overlay: %s already over %s\n", ours.UTF8String, target.UTF8String);
+            emit(line);
+            continue;
+        }
+        NSString *exe = [NSDictionary dictionaryWithContentsOfFile:[target stringByAppendingPathComponent:@"Info.plist"]][@"CFBundleExecutable"];
+        NSString *upper = [@"/private/var/ngpu/overlay" stringByAppendingPathComponent:target.lastPathComponent];
+        [fm removeItemAtPath:upper error:nil];
+        err = nil;
+        BOOL ok = [fm copyItemAtPath:src toPath:upper error:&err];
+        NSString *ip = [upper stringByAppendingPathComponent:@"Info.plist"];
+        NSMutableDictionary *info = ok ? [[NSDictionary dictionaryWithContentsOfFile:ip] mutableCopy] : nil;
+        NSString *ourExe = info[@"CFBundleExecutable"];
+        if (info && exe && ourExe && ![exe isEqualToString:ourExe])
+            ok = [fm moveItemAtPath:[upper stringByAppendingPathComponent:ourExe] toPath:[upper stringByAppendingPathComponent:exe] error:&err];
+        if (ok && info && exe) {
+            info[@"CFBundleExecutable"] = exe;
+            info[@"CFBundleIdentifier"] = targetID;
+            ok = [info writeToFile:ip atomically:YES];
+        }
+        if (!ok || !info || !exe) {
+            snprintf(line, sizeof line, "OSLOG overlay: preparing %s for %s failed (exe %s): %s\n", ours.UTF8String, targetID.UTF8String,
+                     exe ? exe.UTF8String : "?", err ? err.localizedDescription.UTF8String : "no Info.plist");
+            emit(line);
+            continue;
+        }
+        int rc = mount("bindfs", target.fileSystemRepresentation, MNT_RDONLY | MNT_UNION, (void *)upper.fileSystemRepresentation);
+        snprintf(line, sizeof line, "OSLOG overlay: %s over %s (%s, exe %s): %s\n", ours.UTF8String, target.UTF8String, targetID.UTF8String,
+                 exe.UTF8String, rc == 0 ? "mounted" : strerror(errno));
+        emit(line);
+    }
 }
 }  // namespace
 
@@ -1330,6 +1408,7 @@ int main() {
         pthread_t sampler;
         if (pthread_create(&sampler, nullptr, cpuTop, nullptr) == 0) pthread_detach(sampler);
         launchServicesDatabase();
+        overlayApps();
         // The staged-app registration needs containermanagerd and lsd up; at this point in boot they may not be. Try once now,
         // then keep retrying on the 5 s crash-dump loop (up to ~2 min) until every app registers, so a daemon that comes up late
         // still gets the icons placed (f2s: container=n + refused for both apps on the single startup attempt).

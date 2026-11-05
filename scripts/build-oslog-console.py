@@ -35,7 +35,9 @@ entitlements.write_bytes(plistlib.dumps({'com.apple.private.security.no-containe
                                          # SystemAppMigrator run in-process (installStagedSystemApps): com.apple.datamigrator's install grants
                                          'com.apple.private.InstallCoordination.allowed': True,
                                          'com.apple.private.MobileContainerManager.allowed': True,
-                                         'com.apple.private.amfi.can-check-trust-cache': True, 'com.apple.appstored.private': True,
+                                         'com.apple.private.amfi.can-check-trust-cache': True,
+                                         # overlayApps: bindfs our app bundles over installed ones
+                                         'com.apple.private.bindfs-allow': True, 'com.apple.appstored.private': True,
                                          'com.apple.private.mobileinstall.allowedSPI': [
                                              'DataMigratorUpdateDataProtection', 'InstallForDataMigrator', 'InstallForLaunchServices',
                                              'RegisterSafeHarbor', 'ProcessRestoredContainer', 'UninstallForLaunchServices',
