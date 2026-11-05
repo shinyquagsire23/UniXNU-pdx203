@@ -184,19 +184,31 @@ bool startLiveStream() {
 namespace {
 // The addon's staged apps (apps/<Name>.app, union-mounted over /Applications by mount10) register in the LaunchServices database
 // through the rebuild below, but SpringBoard's icon data source still does not enumerate them (f2q usb-253: its "Application added"
-// list carried only the com.apple.* system apps, and the two apps' bundle ids appear nowhere in SpringBoard/LS) -- the uicache gap: a
-// blanket rebuild does not give them the User application type / install record SpringBoard's query wants. So each is registered
-// explicitly as a User app with -[LSApplicationWorkspace registerApplicationDictionary:] (the call uicache makes), built from its own
-// Info.plist with the path and type keys. Runs every boot (idempotent); the SpringBoard log says whether an icon then appears.
+// list carried only the com.apple.* system apps). A blanket rebuild, or a thin Info.plist dict, is not enough (f2r: the trimmed dict was
+// refused): LaunchServices wants a full registration record with a real data container. This is the uicache recipe (coolstar
+// uikittools-ng): create the app's MCMAppDataContainer, build the record with ApplicationType System, CompatibilityState 0, the
+// container path and the PlugIns as _LSBundlePlugins, then -[LSApplicationWorkspace registerApplicationDictionary:]. Runs every boot
+// (idempotent); the SpringBoard log says whether an icon then appears. Apps in /Applications register as System, as uicache does.
 void registerStagedApps() {
     char line[600];
+    dlopen("/System/Library/PrivateFrameworks/MobileContainerManager.framework/MobileContainerManager", RTLD_NOW);
     Class workspaceClass = objc_getClass("LSApplicationWorkspace");
     id workspace = workspaceClass ? ((id (*)(Class, SEL))objc_msgSend)(workspaceClass, @selector(defaultWorkspace)) : nil;
+    Class appContainerClass = objc_getClass("MCMAppDataContainer");
+    Class pluginContainerClass = objc_getClass("MCMPluginKitPluginDataContainer");
     SEL regSel = @selector(registerApplicationDictionary:);
+    SEL containerSel = @selector(containerWithIdentifier:createIfNecessary:existed:error:);
     if (!workspace || ![workspace respondsToSelector:regSel]) {
         emit("OSLOG stagedapps: no LSApplicationWorkspace registerApplicationDictionary:\n");
         return;
     }
+    auto makeContainer = [&](Class cls, NSString *ident) -> NSString * {
+        if (!cls) return nil;
+        id c = ((id (*)(Class, SEL, id, BOOL, void *, void *))objc_msgSend)(cls, containerSel, ident, (BOOL)YES, nullptr, nullptr);
+        if (!c) return nil;
+        id url = ((id (*)(id, SEL))objc_msgSend)(c, @selector(url));
+        return url ? ((id (*)(id, SEL))objc_msgSend)(url, @selector(path)) : nil;
+    };
     DIR *d = opendir("/private/var/ngpu/apps");
     if (!d) return;
     struct dirent *e;
@@ -205,24 +217,45 @@ void registerStagedApps() {
         if (n < 5 || strcmp(e->d_name + n - 4, ".app")) continue;
         // the union-mounted path (mount10) is what SpringBoard and LaunchServices see
         NSString *path = [NSString stringWithFormat:@"/Applications/%s", e->d_name];
-        NSString *infoPath = [path stringByAppendingPathComponent:@"Info.plist"];
-        NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:infoPath];
+        NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[path stringByAppendingPathComponent:@"Info.plist"]];
         NSString *bundleID = info[@"CFBundleIdentifier"];
         if (!info || !bundleID) {
             snprintf(line, sizeof line, "OSLOG stagedapps: %s has no Info.plist/CFBundleIdentifier\n", e->d_name);
             emit(line);
             continue;
         }
-        NSMutableDictionary *dict = [info mutableCopy];
-        dict[@"ApplicationType"] = @"User";          // not System: SpringBoard enumerates User apps for icons
-        dict[@"CFBundleIdentifier"] = bundleID;
-        dict[@"Path"] = path;
-        dict[@"CFBundleExecutable"] = info[@"CFBundleExecutable"] ?: bundleID;
-        dict[@"LSInstallType"] = @1;
-        dict[@"_LSBundleIsEphemeral"] = @NO;
-        BOOL ok = ((BOOL (*)(id, SEL, id))objc_msgSend)(workspace, regSel, dict);
-        snprintf(line, sizeof line, "OSLOG stagedapps: registerApplicationDictionary %s (%s) = %s\n",
-                 e->d_name, bundleID.UTF8String, ok ? "ok" : "refused");
+        NSString *containerPath = makeContainer(appContainerClass, bundleID);
+        NSMutableDictionary *plist = [NSMutableDictionary dictionary];
+        plist[@"ApplicationType"] = @"System";
+        plist[@"BundleNameIsLocalized"] = @1;
+        plist[@"CFBundleIdentifier"] = bundleID;
+        plist[@"CompatibilityState"] = @0;
+        if (containerPath) plist[@"Container"] = containerPath;
+        plist[@"IsDeletable"] = @0;
+        plist[@"Path"] = path;
+        // each PlugIns/*.appex as a PluginKitPlugin with its own data container, as uicache builds _LSBundlePlugins
+        NSMutableDictionary *bundlePlugins = [NSMutableDictionary dictionary];
+        NSString *pluginsPath = [path stringByAppendingPathComponent:@"PlugIns"];
+        for (NSString *pluginName in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:pluginsPath error:nil]) {
+            NSString *fullPath = [pluginsPath stringByAppendingPathComponent:pluginName];
+            NSDictionary *pinfo = [NSDictionary dictionaryWithContentsOfFile:[fullPath stringByAppendingPathComponent:@"Info.plist"]];
+            NSString *pid = pinfo[@"CFBundleIdentifier"];
+            if (!pid) continue;
+            NSString *pcPath = makeContainer(pluginContainerClass, pid);
+            NSMutableDictionary *pp = [NSMutableDictionary dictionary];
+            pp[@"ApplicationType"] = @"PluginKitPlugin";
+            pp[@"BundleNameIsLocalized"] = @1;
+            pp[@"CFBundleIdentifier"] = pid;
+            pp[@"CompatibilityState"] = @0;
+            if (pcPath) pp[@"Container"] = pcPath;
+            pp[@"Path"] = fullPath;
+            pp[@"PluginOwnerBundleID"] = bundleID;
+            bundlePlugins[pid] = pp;
+        }
+        plist[@"_LSBundlePlugins"] = bundlePlugins;
+        BOOL ok = ((BOOL (*)(id, SEL, id))objc_msgSend)(workspace, regSel, plist);
+        snprintf(line, sizeof line, "OSLOG stagedapps: registerApplicationDictionary %s (%s) container=%s = %s\n",
+                 e->d_name, bundleID.UTF8String, containerPath ? "y" : "n", ok ? "ok" : "refused");
         emit(line);
     }
     closedir(d);
