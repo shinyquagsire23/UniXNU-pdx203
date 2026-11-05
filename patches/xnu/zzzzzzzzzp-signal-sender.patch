@@ -1,0 +1,18 @@
+diff --git a/bsd/kern/kern_sig.c b/bsd/kern/kern_sig.c
+--- a/bsd/kern/kern_sig.c
++++ b/bsd/kern/kern_sig.c
+@@ -1398,6 +1398,14 @@ kill(proc_t cp, struct kill_args *uap, __unused int32_t *retval)
+ 			proc_rele(p);
+ 			return EPERM;
+ 		}
++		/*
++		 * pdx203: the render server and SpringBoard sometimes end on a SIGTERM whose sender nothing names (the exit log has only
++		 * the signal). A fatal signal sent to either with kill() is logged with the sender.
++		 */
++		if ((uap->signum == SIGTERM || uap->signum == SIGKILL || uap->signum == SIGABRT || uap->signum == SIGQUIT) &&
++		    (!strncmp(p->p_comm, "backboardd", sizeof(p->p_comm)) || !strncmp(p->p_comm, "SpringBoard", sizeof(p->p_comm)))) {
++			printf("SIGLOG %s[%d] -> %s[%d] sig %d\n", cp->p_comm, proc_getpid(cp), p->p_comm, proc_getpid(p), uap->signum);
++		}
+ 		if (uap->signum) {
+ 			psignal(p, uap->signum);
+ 		}

@@ -1791,6 +1791,7 @@ extern volatile uint32_t native_adreno_mount_fail[4] __attribute__((weak_import)
 extern volatile uint32_t native_adreno_method_stats[20][4] __attribute__((weak_import));
 extern volatile uint32_t native_adreno_window_overflow[4][3] __attribute__((weak_import));
 extern volatile uint32_t native_adreno_client_stats[5][6] __attribute__((weak_import));
+extern volatile uint32_t native_adreno_client_hist[5][10] __attribute__((weak_import));
 extern volatile uint64_t native_adreno_import_diag[10] __attribute__((weak_import));
 }
 extern "C" void pdx203_dpu_dump(void) __attribute__((weak_import));
@@ -1880,6 +1881,24 @@ void metalRows() {
                  (unsigned long long)native_adreno_import_diag[1], (unsigned long long)native_adreno_import_diag[2],
                  (unsigned long long)native_adreno_import_diag[3]);
         printIfChanged(last, sizeof last, line);
+    }
+    if (&native_adreno_client_stats) {
+        /* Live GPU objects per client slot now / their peak (slot 0 the render server): a count that climbs with each app switch and never
+         * comes back down is a client holding buffers, not the kernel. */
+        static char lastLive[120];
+        snprintf(line, sizeof line, "METALLIVE s0 %u/%u s1 %u/%u s2 %u/%u s3 %u/%u k %u/%u", native_adreno_client_stats[0][0],
+                 native_adreno_client_stats[0][1], native_adreno_client_stats[1][0], native_adreno_client_stats[1][1],
+                 native_adreno_client_stats[2][0], native_adreno_client_stats[2][1], native_adreno_client_stats[3][0],
+                 native_adreno_client_stats[3][1], native_adreno_client_stats[4][0], native_adreno_client_stats[4][1]);
+        printIfChanged(lastLive, sizeof lastLive, line);
+    }
+    if (&native_adreno_client_hist) {
+        /* The render server's live BOs by size (<=4K 16K 64K 256K 1M 4M 16M, larger), their MiB, and its imports. */
+        static char lastHist[160];
+        const volatile uint32_t *h = native_adreno_client_hist[0];
+        snprintf(line, sizeof line, "METALHIST s0 %u %u %u %u %u %u %u %u | %u MiB | imports %u | s1 %u MiB imports %u", h[0], h[1], h[2],
+                 h[3], h[4], h[5], h[6], h[7], h[8] >> 10, h[9], native_adreno_client_hist[1][8] >> 10, native_adreno_client_hist[1][9]);
+        printIfChanged(lastHist, sizeof lastHist, line);
     }
     if (&native_adreno_metal_rows) for (unsigned i = 0; i < 48; ++i) {
         if (!native_adreno_metal_rows[i][0] || !strncmp(gMetalPrinted[i], native_adreno_metal_rows[i], 96)) continue;

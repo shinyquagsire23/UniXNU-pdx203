@@ -1,0 +1,114 @@
+Subject: [PATCH] publish: log every user mapping the kernel takes down (GPUUNMAP)
+
+A client SIGSEGV/SIGBUS at a page-aligned address in Turnip's command-stream
+writes (r2d_src_buffer) means the stores ran past the end of a mapping. Each
+mapping the kernel removes (last unmap, a free or racing unmap, a stale view,
+the connection's close) is logged with its process, reason, token, BO handle,
+view size and user range, so the fault address can be matched to the view it
+was in or ran past.
+---
+diff --git a/NativeAdrenoPublish.cpp b/NativeAdrenoPublish.cpp
+--- a/NativeAdrenoPublish.cpp
++++ b/NativeAdrenoPublish.cpp
+@@ -21,6 +21,7 @@
+ #include "NativeAdrenoUserClient.h"
+ 
+ extern "C" void proc_selfname(char *, int);
++extern "C" int proc_selfpid(void);
+ /* The plugin's telemetry table (rows of text the Metal bridge keeps), sent as markers: 0xC000|row starts a row, 0x8000|(a<<7)|b appends two characters. */
+ extern "C" {char native_adreno_metal_rows[48][96];volatile uint32_t native_adreno_metal_rows_seq;}
+ 
+@@ -175,6 +176,7 @@ class AGXDeviceUserClient : public IOUserClient {
+     NativeAdrenoUserClient *core_=nullptr;   /* own core; deleted in free(), so a call that raced the close sees live_ false, never freed memory */
+     unsigned slot_=NativeAdrenoMaxClients;
+     char name_[20]{};
++    int pid_=-1;
+     /* One user-view descriptor per BO token, reused by every clientMemoryForType call. IOConnectUnmapMemory64 asks clientMemoryForType for
+      * the descriptor again and unmaps only a mapping that belongs to THAT descriptor (kIOMapReference); a fresh descriptor per call made the
+      * unmap a silent no-op, the user PTEs outlived BoCpuUnmap, and BoFree handed pages with a live user mapping to the VM:
+@@ -191,8 +193,9 @@ class AGXDeviceUserClient : public IOUserClient {
+     /* A token is its BO's entry index plus one, so it names its own slot (a walk over every slot ran on each CPU map and unmap). */
+     View *viewSlot(uint32_t token) {return views_ && token && token<=MaxViews?&views_[token-1]:nullptr;}
+     View *views_=nullptr;   /* on the heap: 1024 entries would make the client object too big for the kernel allocator's fixed-size classes */
+-    void dropViews(uint32_t token,uint64_t handle=0);
+-    void tearDownView(IOMemoryDescriptor *view);
++    /* reason (GPUUNMAP rows): 'u' last unmap, 'f' after a free or a racing unmap, 's' stale view of a reused token, 'c' connection close */
++    void dropViews(uint32_t token,uint64_t handle=0,char reason='u');
++    void tearDownView(IOMemoryDescriptor *view,char reason,uint32_t token,uint64_t handle);
+     static IOReturn action(OSObject *target,void *reference,IOExternalMethodArguments *arguments);
+     IOReturn run(uint32_t method,const void *input,size_t input_size,void *output,size_t output_size);
+ public:
+@@ -250,7 +253,7 @@ static NativeAdrenoClientRecord *clientRecord(const char *name)
+ }
+ bool AGXDeviceUserClient::mount(bool kernel)
+ {
+-    proc_selfname(name_,sizeof name_);
++    proc_selfname(name_,sizeof name_);pid_=proc_selfpid();
+     NativeAdrenoUserClient *core=new NativeAdrenoUserClient;
+     if(!core)return false;
+     IOLockLock(g.lock);
+@@ -308,24 +311,29 @@ bool AGXDeviceUserClient::mount(bool kernel)
+ }
+ /* Removes the cached view(s) of token (0 = all) and tears down every user mapping of them, so the BO's pages are never freed while a user
+  * PTE still points at them, whether or not the client unmapped. */
+-void AGXDeviceUserClient::dropViews(uint32_t token,uint64_t handle)
++void AGXDeviceUserClient::dropViews(uint32_t token,uint64_t handle,char reason)
+ {
+     for(;;) {
+-        IOMemoryDescriptor *view=nullptr;
++        IOMemoryDescriptor *view=nullptr;uint32_t viewToken=0;uint64_t viewHandle=0;
+         IOLockLock(g.lock);
+         if(token) {
+             View *v=viewSlot(token);
+             /* handle (non-zero): only the view made for that BO, never one a newer BO with the same token already took. */
+-            if(v && v->descriptor && v->token==token && (!handle || v->handle==handle)) {view=v->descriptor;v->descriptor=nullptr;v->token=0;v->handle=0;}
++            if(v && v->descriptor && v->token==token && (!handle || v->handle==handle)) {
++                view=v->descriptor;viewToken=v->token;viewHandle=v->handle;v->descriptor=nullptr;v->token=0;v->handle=0;
++            }
++        }
++        else if(views_)for(size_t i=0;i<MaxViews;++i) {
++            View &v=views_[i];
++            if(v.descriptor) {view=v.descriptor;viewToken=v.token;viewHandle=v.handle;v.descriptor=nullptr;v.token=0;v.handle=0;break;}
+         }
+-        else if(views_)for(size_t i=0;i<MaxViews;++i) {View &v=views_[i];if(v.descriptor) {view=v.descriptor;v.descriptor=nullptr;v.token=0;v.handle=0;break;}}
+         IOLockUnlock(g.lock);
+         if(!view)return;
+-        tearDownView(view);
++        tearDownView(view,token?reason:'c',viewToken,viewHandle);
+         if(token)return;
+     }
+ }
+-void AGXDeviceUserClient::tearDownView(IOMemoryDescriptor *view)
++void AGXDeviceUserClient::tearDownView(IOMemoryDescriptor *view,char reason,uint32_t token,uint64_t handle)
+ {
+     {
+         /* removeMappingForDescriptor hands back the map retained (IOUserClient.cpp) and out of the client's list; the map was dropped
+@@ -333,6 +341,10 @@ void AGXDeviceUserClient::tearDownView(IOMemoryDescriptor *view)
+          * and a VM-backed BO's free hit pmap_assert_free (pdx203 usb-60: 20 GPULEAK rows at SpringBoard's device closes). Unmap the user
+          * range now and drop the last reference. */
+         while(IOMemoryMap *map=removeMappingForDescriptor(view)) {
++            /* Every user mapping the kernel takes down, so a client's fault address can be matched to the BO view it was in or ran past. */
++            IOLog("GPUUNMAP %s[%d] %c tok %u h %llu bytes 0x%llx va 0x%llx len 0x%llx\n",name_,pid_,reason,(unsigned)token,
++                (unsigned long long)handle,(unsigned long long)view->getLength(),(unsigned long long)map->getAddress(),
++                (unsigned long long)map->getLength());
+             map->unmap();
+             map->release();
+             native_adreno_metal_diag.forced_unmaps=native_adreno_metal_diag.forced_unmaps+1;
+@@ -414,7 +426,7 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
+         native_adreno_view_stale[0]=native_adreno_view_stale[0]+1;
+         IOLog("GPUVIEW %s: stale view of token %u (BO %llu) evicted before mapping BO %llu\n",name_,(unsigned)type,
+             (unsigned long long)was,(unsigned long long)now);
+-        tearDownView(stale);
++        tearDownView(stale,'s',type,was);
+     }
+     IOLockLock(g.lock);
+     if(!views_)views_=IONewZero(View,MaxViews);
+@@ -592,7 +604,7 @@ IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input
+         IOLockUnlock(g.lock);
+         if(!leases && cached) {
+             native_adreno_view_stale[1]=native_adreno_view_stale[1]+1;
+-            dropViews(token,handle);
++            dropViews(token,handle,'f');
+         }
+     }
+     return status;
