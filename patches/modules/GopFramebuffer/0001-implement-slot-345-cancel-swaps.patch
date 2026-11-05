@@ -1,0 +1,24 @@
+diff --git a/NativeLegacyDisplay.cpp b/NativeLegacyDisplay.cpp
+index fb88750..ebd03e9 100644
+--- a/NativeLegacyDisplay.cpp
++++ b/NativeLegacyDisplay.cpp
+@@ -494,8 +494,18 @@ public:
+     LEAF(306)
+     LEAF(307)
+     LEAF(338)
+-    LEAF(345)
+ #undef LEAF
++    // Slot 345 = cancelSwapsAfterTimeout: the IOMobileFramebuffer family (swap_wait_gated) calls this when a swap has not completed
++    // in ~5 s ("CommandWake didn't happen even after 5 seconds ... cancelling swaps"), e.g. a heavy Safari launch stalls the GPU
++    // copy. It was a bare guard leaf, so the display thread panicked here (LegacyDisplayProbe.cpp, leaf=345). Instead drop the swaps
++    // this class tracks and let the family cancel its own queue: a GPU copy that finishes later finds no request (finishGpuSwap
++    // returns on gpuRequest==null) and the next frame is not held behind the cancelled one; frames meanwhile take the CPU copy.
++    bool cancelSwapsAfterTimeout() override {
++        printf("NativeLegacyDisplay: cancelSwapsAfterTimeout gpuReq=%llx\n",(uint64_t)(uintptr_t)gpuRequest);
++        for(auto &entry: validated)entry=nullptr;
++        gpuRequest=nullptr;gpuLength=0;transferred=false;gpuBypass=false;
++        return true;
++    }
+ };
+ OSDefineMetaClassAndStructors(NativeLegacyDisplay,IOMobileFramebufferLegacy)
+ IOService *native_legacy_display_allocate(void) {return new NativeLegacyDisplay;}
