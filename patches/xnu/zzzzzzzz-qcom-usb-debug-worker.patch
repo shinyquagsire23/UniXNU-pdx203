@@ -185,7 +185,7 @@ index 1ea6fcd..d4195ab 100644
 +			break;
 +		}
 +		qcom_usb_debug_get_status(&status);
-+		if (status.phase != QCOM_USB_DEBUG_ACTIVE) {
++		if (status.phase != QCOM_USB_DEBUG_ACTIVE && status.phase != QCOM_USB_DEBUG_IO_FAILED) {
 +			break;
 +		}
 +		qcom_usb_debug_poll();

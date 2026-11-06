@@ -1,0 +1,187 @@
+diff --git a/kernel/QcomXnuUsbDebug.c b/kernel/QcomXnuUsbDebug.c
+index 2e4b200..d4ee02d 100644
+--- a/kernel/QcomXnuUsbDebug.c
++++ b/kernel/QcomXnuUsbDebug.c
+@@ -306,6 +306,8 @@ static void loss_notice_owned(void)
+  * that survives is the frame buffer overlay. BootProgress reads these four. */
+ volatile uint32_t qcom_usb_diag_phase, qcom_usb_diag_failed, qcom_usb_diag_recoveries, qcom_usb_diag_dropped;
+ static uint32_t usb_recoveries;
++/* Set while the board reports no USB cable: the controller is stopped (its pull-up off) and nothing polls it until the cable is back. */
++static uint32_t usb_cable_off;
+ static void usb_diag_update(void)
+ {
+     qcom_usb_diag_phase = (uint32_t)native.status.phase;
+@@ -719,6 +721,9 @@ static int validate_static_pages(const uint8_t *arena, size_t arena_bytes, uint6
+     return 1;
+ }
+ 
++static const struct dwc3_identity usb_identity = {
++    QUD_USB_VID, QUD_USB_PID, "UniXNU", QUD_USB_PRODUCT, QUD_USB_SERIAL
++};
+ int qcom_usb_debug_init(void)
+ {
+     uint64_t flags, frequency, ctr;
+@@ -727,9 +732,6 @@ int qcom_usb_debug_init(void)
+     QUSB_DOMAIN_RESULT domain_result;
+     QUSB_INHERITED inherited;
+     struct dwc3_platform platform;
+-    static const struct dwc3_identity identity = {
+-        QUD_USB_VID, QUD_USB_PID, "UniXNU", QUD_USB_PRODUCT, QUD_USB_SERIAL
+-    };
+     if (native.status.phase == QCOM_USB_DEBUG_NOT_INITIALIZED) {
+         int diagnostic = 0;
+         if (QUD_PSCI_SMC_RESET &&
+@@ -895,7 +897,7 @@ int qcom_usb_debug_init(void)
+     platform.barrier = barrier; platform.trace = core_trace;
+     native.core = (struct dwc3 *)(void *)usb_context;
+     diag_checkpoint(QCOM_USB_DEBUG_DIAG_CORE_INIT);
+-    ret = dwc3_init(usb_context, sizeof(usb_context), &platform, &identity, usb_dma,
++    ret = dwc3_init(usb_context, sizeof(usb_context), &platform, &usb_identity, usb_dma,
+                          native.status.dma_iova, sizeof(usb_dma));
+     if (ret || native.status.io_failed) {
+         fail(QCOM_USB_DEBUG_CORE_INIT_FAILED, ret); (void)restore_after_failure(); ret = 0; goto out;
+@@ -961,6 +963,7 @@ static int poll_owned(void)
+ {
+     int ret;
+     if (native.status.phase != QCOM_USB_DEBUG_ACTIVE) return 0;
++    if (usb_cable_off) return 1;
+     backlog_drain_owned();
+     loss_notice_owned();
+     ret = dwc3_poll(native.core, 1);
+@@ -1450,6 +1453,87 @@ size_t qcom_usb_debug_enqueue(const void *bytes, size_t count)
+         native.status.phase == QCOM_USB_DEBUG_STOPPED) return 0;
+     return backlog_write(bytes, count);
+ }
++/* Link watchdog. dwc3_recover() only clears the event bookkeeping, it is capped at 64 per boot, and the worker thread used to
++ * exit at the first IO_FAILED, so a link that left the bus (a cable pulled or bumped, a host port reset, a stuck endpoint)
++ * stayed gone until the next boot: observed 2026-11-05 three times while the phone kept running, once coming back for four
++ * seconds and then never again. When the controller has gone unconfigured (or failed) for eight seconds, restart it from
++ * scratch: a soft disconnect, dwc3_init's core soft reset and full configuration, and RUN_STOP again, at most once every
++ * eight seconds. A host that is still attached sees the device leave and come back and enumerates it again; with no host
++ * the restart is a few register writes. The PHY lease, VBUS override and DMA domain from qcom_usb_debug_init stay valid. */
++static uint32_t usb_reinits;
++static uint64_t usb_unconfigured_since, usb_stalled_since, usb_last_reinit;
++static int reinit_owned(uint32_t reason)
++{
++    struct dwc3_platform platform;
++    char text[96], *p;
++    int ret;
++    if (native.core_initialized) (void)dwc3_stop(native.core);
++    bytes_zero(&platform, sizeof(platform));
++    platform.read32 = core_read; platform.write32 = core_write;
++    platform.delay_us = delay_us; platform.dma_sync = dma_sync;
++    platform.barrier = barrier; platform.trace = core_trace;
++    ret = dwc3_init(usb_context, sizeof(usb_context), &platform, &usb_identity, usb_dma,
++                    native.status.dma_iova, sizeof(usb_dma));
++    if (!ret) ret = dwc3_start(native.core);
++    usb_reinits++;
++    usb_last_reinit = counter();
++    usb_unconfigured_since = usb_stalled_since = 0;
++    p = append_text(text, "\nQCOM USB REINIT n=");
++    p = append_decimal(p, usb_reinits);
++    p = append_text(p, reason == 1 ? " after IO_FAILED" : reason == 2 ? " after 8 s stalled" : reason == 3 ? " after cable plug-in" :
++                       " after 8 s unconfigured");
++    p = append_text(p, " recoveries=");
++    p = append_decimal(p, usb_recoveries);
++    p = append_text(p, ret ? " FAILED\n" : " ok\n");
++    (void)backlog_write(text, (size_t)(p - text));
++    if (ret) return 0;
++    native.status.io_failed = 0;
++    native.status.core_result = 0;
++    native.status.error = 0;
++    native.status.phase = QCOM_USB_DEBUG_ACTIVE;
++    usb_recoveries = 0;
++    return 1;
++}
++/* The board's view of the USB cable (package/Pdx203Battery.cpp, from the charger): -1 unknown, 0 out, 1 in with the charger's port
++ * detection still on D+/D-, 2 in. Absent on boards without it; then only the timers below decide. */
++extern volatile int32_t pdx203_usb_cable __attribute__((weak_import));
++static void link_watchdog(void)
++{
++    uint64_t flags, now, limit = native.status.counter_frequency * 8u;
++    uint32_t failed;
++    if (!native.core_initialized || !limit || !acquire(&flags)) return;
++    now = counter();
++    /* Cable out: stop the controller, which takes the pull-up off (dwc3-qcom's vbus_session(0)), and leave it stopped. Cable back and
++     * the charger's detection done: restart it from scratch, so the host sees a fresh device after BC1.2 rather than during it. */
++    if (&pdx203_usb_cable) {
++        const int32_t cable = pdx203_usb_cable;
++        if (cable == 0 && !usb_cable_off) {
++            static const char text[] = "\nQCOM USB cable out: controller stopped\n";
++            if (native.core) (void)dwc3_stop(native.core);
++            usb_cable_off = 1;
++            usb_unconfigured_since = usb_stalled_since = 0;
++            (void)backlog_write(text, sizeof(text) - 1);
++        } else if (usb_cable_off && cable == 2) {
++            usb_cable_off = 0;
++            (void)reinit_owned(3);
++        }
++        if (usb_cable_off || cable == 1) {release(flags); return;}
++    }
++    failed = native.status.phase == QCOM_USB_DEBUG_IO_FAILED;
++    if (!failed && dwc3_configured(native.core)) {
++        /* Configured but not draining: the transmit ring has stayed over half full for eight seconds, so no IN transfer is
++         * completing (a host that dropped the device without a bus reset, or an endpoint the controller stopped serving). */
++        usb_unconfigured_since = 0;
++        if (dwc3_queued(native.core) < DWC3_TX_BYTES / 2u) usb_stalled_since = 0;
++        else if (!usb_stalled_since) usb_stalled_since = now;
++        else if (now - usb_stalled_since >= limit && now - usb_last_reinit >= limit) (void)reinit_owned(2);
++    } else {
++        if (!usb_unconfigured_since) usb_unconfigured_since = now;
++        if ((failed || now - usb_unconfigured_since >= limit) && now - usb_last_reinit >= limit)
++            (void)reinit_owned(failed);
++    }
++    release(flags);
++}
+ void qcom_usb_debug_poll(void)
+ {
+     uint64_t flags;
+@@ -1458,6 +1542,7 @@ void qcom_usb_debug_poll(void)
+     uint32_t generation = 0;
+     size_t control_bytes_count = 0;
+     int observed = 0;
++    if (native.status.phase == QCOM_USB_DEBUG_ACTIVE || native.status.phase == QCOM_USB_DEBUG_IO_FAILED) link_watchdog();
+     if (native.status.phase != QCOM_USB_DEBUG_ACTIVE || !acquire(&flags)) return;
+     (void)poll_owned();
+     if (__atomic_load_n(&control_enabled, __ATOMIC_ACQUIRE) &&
+diff --git a/scripts/build.py b/scripts/build.py
+index d2f531c..a978715 100644
+--- a/scripts/build.py
++++ b/scripts/build.py
+@@ -124,7 +124,10 @@ def main():
+                    # Optional: the board's own reset path, which maps the IMEM window with
+                    # the attributes the bootloader accepts. Weak, so a board without it
+                    # still links and falls back to this module's plain PSCI reset.
+-                   '_boot_reset_bootloader', '_qcom_usb_debug_board_input'}
++                   '_boot_reset_bootloader', '_qcom_usb_debug_board_input',
++                   # Optional: the board's USB cable state (pdx203 Pdx203Battery.cpp), which the link
++                   # watchdog stops and restarts the controller on. Weak.
++                   '_pdx203_usb_cable'}
+         if external - allowed:
+             raise RuntimeError('unexpected XNU imports: ' + str(sorted(external - allowed)))
+         required = {'_qcom_usb_debug_' + s for s in
+diff --git a/usb/Dwc3.c b/usb/Dwc3.c
+index 8a27eeb..fb3c8bf 100644
+--- a/usb/Dwc3.c
++++ b/usb/Dwc3.c
+@@ -649,6 +649,7 @@ size_t dwc3_read(struct dwc3 *d, void *bytes, size_t count)
+     return n;
+ }
+ int dwc3_ready(const struct dwc3 *d) { return d && d->running && !d->failed && d->configured && d->dtr; }
++int dwc3_configured(const struct dwc3 *d) { return d && d->running && !d->failed && d->configured; }
+ size_t dwc3_queued(const struct dwc3 *d) { return d ? d->tx_used : 0; }
+ uint64_t dwc3_dropped(const struct dwc3 *d) { return d ? d->dropped : 0; }
+ size_t dwc3_rx_pending(const struct dwc3 *d) { return d ? d->rx_used : 0; }
+diff --git a/usb/Dwc3.h b/usb/Dwc3.h
+index bc85676..bf4b4f3 100644
+--- a/usb/Dwc3.h
++++ b/usb/Dwc3.h
+@@ -68,6 +68,8 @@ size_t dwc3_queue(struct dwc3 *dev, const void *bytes, size_t count);
+  * advances rx_generation so a protocol parser can invalidate its state. */
+ size_t dwc3_read(struct dwc3 *dev, void *bytes, size_t count);
+ int dwc3_ready(const struct dwc3 *dev);
++/* Enumerated by a host (SET_CONFIGURATION seen) and not latched failed; unlike dwc3_ready it ignores DTR. */
++int dwc3_configured(const struct dwc3 *dev);
+ size_t dwc3_queued(const struct dwc3 *dev);
+ uint64_t dwc3_dropped(const struct dwc3 *dev);
+ size_t dwc3_rx_pending(const struct dwc3 *dev);

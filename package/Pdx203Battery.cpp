@@ -27,6 +27,12 @@ extern "C" int pdx203_spmi_read(uint32_t ppid, uint8_t addr, uint8_t *value);
 // [0] stage (1 class up, 2 timer running, 3 published; negative: the step that failed), [1] percent, [2] raw monotonic SOC,
 // [3] charger status, [4] USB present, [5] unused, [6] reads, [7] read failures, [8] last failure
 extern "C" {volatile int32_t native_battery_stats[10];}
+// The USB cable as the charger sees it, for the USB log's controller (drivers/QcomXnuUsbDebug link watchdog): -1 not read yet, 0 no
+// cable, 1 plugged with the charger's port detection (APSD, BC1.2) still running on D+/D-, 2 plugged and detection done (APSD_STATUS
+// 0x1307 bit 0 APSD_DTC_STATUS_DONE, or 1.5 s after the plug-in if that bit never comes). The controller keeps its pull-up off until 2,
+// as dwc3-qcom starts the gadget only after the charger reports the port type: a device that appears in the middle of BC1.2
+// detection fails its first enumeration and the host may give the port up (2026-11-05: an unplugged and replugged cable never came back).
+extern "C" {volatile int32_t pdx203_usb_cable = -1;}
 
 namespace {
 constexpr uint32_t kFastMs = 2000, kRefreshMs = 20000, kNominalMv = 3850;
@@ -36,7 +42,8 @@ constexpr uint32_t kSocPpid = 0x240, kChgrPpid = 0x210, kUsbPpid = 0x213;
 class Pdx203Battery : public IOPMPowerSource {
     OSDeclareDefaultStructors(Pdx203Battery)
     IOWorkLoop *loop = nullptr;
-    IOTimerEventSource *timer = nullptr;
+    IOTimerEventSource *timer = nullptr, *cableTimer = nullptr;
+    unsigned plugTicks = 0;
     bool published = false;
     int lastPercent = -1, lastStatus = -1, lastUsb = -1;
 
@@ -102,11 +109,36 @@ class Pdx203Battery : public IOPMPowerSource {
         sender->setTimeoutMS(kRefreshMs);
     }
 
+    static constexpr uint32_t kCableMs = 250, kApsdGraceTicks = 6;   // 1.5 s
+    static void cableAction(OSObject *owner, IOTimerEventSource *sender) {
+        Pdx203Battery *self = OSDynamicCast(Pdx203Battery, owner);
+        if (!self) return;
+        uint8_t rt = 0, apsd = 0;
+        if (pdx203_spmi_read(kUsbPpid, 0x10, &rt) == 0) {
+            const bool plugged = rt & (1u << 4);
+            int32_t state = 0;
+            if (plugged) {
+                const bool done = pdx203_spmi_read(kUsbPpid, 0x07, &apsd) == 0 && (apsd & 1u);
+                if (self->plugTicks < 1000) ++self->plugTicks;
+                state = done || self->plugTicks > kApsdGraceTicks ? 2 : 1;
+            } else self->plugTicks = 0;
+            const int32_t previous = pdx203_usb_cable;
+            if (state != previous) {
+                pdx203_usb_cable = state;
+                printf("PDX203 USB cable %s (apsd %#x)\n", state == 0 ? "out" : state == 1 ? "in, port detection running" : "in", apsd);
+                // Charging state follows the cable at once rather than at the next 20 s refresh.
+                if ((state == 0) != (previous == 0) && self->published && self->refresh()) self->updateStatus();
+            }
+        }
+        sender->setTimeoutMS(kCableMs);
+    }
 public:
     bool startBattery() {
         loop = IOWorkLoop::workLoop();
         timer = IOTimerEventSource::timerEventSource(this, &Pdx203Battery::timerAction);
         if (!loop || !timer || loop->addEventSource(timer) != kIOReturnSuccess) return false;
+        cableTimer = IOTimerEventSource::timerEventSource(this, &Pdx203Battery::cableAction);
+        if (cableTimer && loop->addEventSource(cableTimer) == kIOReturnSuccess) cableTimer->setTimeoutMS(kFastMs);
         native_battery_stats[0] = 2;
         timer->setTimeoutMS(kFastMs);
         return true;
