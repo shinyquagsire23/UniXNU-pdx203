@@ -220,12 +220,13 @@ kernel_args = [
   # the OS volume's deletable system apps copied once into Data for the first-boot migration (upstream zzy-staged-system-apps.patch)
   "sheng-staged-apps=1",
 ]
-# Fixups of signed text beyond the OS profile's four (its [payload] text_fixups is replaced, so they are repeated here).
+# Fixups of signed text beyond the OS profile's four (its [payload] text_fixups is replaced, so three of them are repeated here).
 text_fixups = [
   "dyld_shared_cache_arm64.15,421e8bc,28ad1bb0008544f9,c0035fd6008544f9",
   "dyld_shared_cache_arm64.13,1b05bec,44008052,24008052",
   "dyld_shared_cache_arm64.13,1b05b08,44008052,24008052",
-  "BTAudioHALPlugin,38bec,ffc300d1f44f01a9,000080d2c0035fd6",
+  # (the OS profile's fourth, "BTAudioHALPlugin,38bec,...": AudioServerPlugIn_Create returning NULL, is left out: with Bluetooth up the
+  # plug-in is the audio server's client of bluetoothd, without it A2DP headphones connect but are never published as a route)
   # CoreImage _CIGLIsUsable answers false: without a Metal device CIContext otherwise falls back to an OpenGL ES context
   # whose dispatch table is all zero, and SpringBoard died at pc 0 (2026-11-01)
   "dyld_shared_cache_arm64.07,2d00df8,fd7bbfa9fd030091,00008052c0035fd6",

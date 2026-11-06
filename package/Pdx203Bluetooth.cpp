@@ -559,7 +559,7 @@ uint8_t gCtlQ[8192];              // whole packets for the controller
 size_t gCtlLen;
 uint8_t gToHost[8192];            // whole packets for the host
 size_t gToHostLen;
-uint32_t gLogged, gEvLogged, gOtherLogged, gAclLogged;
+uint32_t gLogged, gEvLogged, gOtherLogged, gAclLogged, gAclBig;
 uint32_t gRemap;                  // LE Set Random Address commands sent for the host's 0xfd48, whose answers are dropped
 volatile uint32_t gResetFraming;
 
@@ -592,7 +592,10 @@ void hostPackets() {
             if (n > sizeof gHost) {gHostLen = 0; S[15] = S[15] + 1;}   // larger than any packet the controller takes
             return;
         }
-        if ((gHost[0] == 2 || gHost[0] == 5) && gAclLogged < 400) {
+        // large host ACL packets are media (A2DP) frames: counted, one line per 500, not logged one by one
+        if ((gHost[0] == 2 || gHost[0] == 5) && n > 120 && !(gAclBig++ % 500))
+            printf("PDX203 BLUE host acl big #%u len %u handle %02x%02x\n", gAclBig, (unsigned)n, gHost[2], gHost[1]);
+        if ((gHost[0] == 2 || gHost[0] == 5) && n <= 120 && gAclLogged < 4000) {
             ++gAclLogged;
             printf("PDX203 BLUE host acl %u:", (unsigned)n);
             for (size_t i = 1; i < n && i < 21; ++i) printf(" %02x", gHost[i]);
@@ -675,7 +678,7 @@ void controllerPackets() {
             for (size_t i = 2; i < n && i < 22; ++i) printf(" %02x", p[i]);
             printf("\n");
         }
-        if (p[0] == 2 && gAclLogged < 400) {
+        if (p[0] == 2 && gAclLogged < 4000) {
             ++gAclLogged;
             printf("PDX203 BLUE ctl acl %u:", (unsigned)n);
             for (size_t i = 1; i < n && i < 21; ++i) printf(" %02x", p[i]);
