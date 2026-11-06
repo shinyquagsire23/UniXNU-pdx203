@@ -245,6 +245,27 @@ extern "C" void native_legacy_swap_stage(unsigned stage) {
 }
 // Summary of the last 40 finished swaps for the periodic DISPLAY row (UI frame rate, 2026-11-03: ~23.5 presents/s): the interval between
 // submissions and the time from submission to the offer (hand-off start) and to retirement, average and maximum, in microseconds.
+// pdx203 per-swap trace (2026-11-06, for home-screen paging and app-launch hitches): the swaps finished since the last call, oldest
+// first, as "t<submit ms> <gap>/<done> ..." -- gap the ms since the previous submission, done the ms from submission to the end of the
+// copy -- at most 24 a call; CpuFreqProbe prints them as SWAPT rows every 100 ms. 0 when none finished; a swap the 64-entry ring lost is
+// skipped.
+extern "C" unsigned pdx203_swap_trace(char *out,unsigned cap) {
+    static uint32_t cursor;
+    const uint32_t total=swapEventCount;
+    if(total>64 && cursor<total-64)cursor=total-64;
+    uint64_t prev=cursor?swapEvents[(cursor-1)%64].submitted:0;
+    unsigned at=0,k=0;
+    while(cursor<total && k<24 && at+24<cap) {
+        const SwapEvent &e=swapEvents[cursor%64];
+        if(!e.done)break;
+        if(!k)at+=snprintf(out+at,cap-at,"t%llu",(unsigned long long)(e.submitted/1000));
+        const unsigned long long gap=prev && e.submitted>prev?(e.submitted-prev+500)/1000:0,
+            done=e.done>e.submitted?(e.done-e.submitted+500)/1000:0;
+        at+=snprintf(out+at,cap-at," %llu/%llu",gap,done);
+        prev=e.submitted;++cursor;++k;
+    }
+    return k?at:0;
+}
 extern "C" unsigned native_legacy_swap_summary(char *out,unsigned cap) {
     uint32_t total=swapEventCount,first=total>40?total-40:0;
     // Also: submission to retirement (ret), retirement to the next submission (the compositor's turn, nx), and the gaps by display

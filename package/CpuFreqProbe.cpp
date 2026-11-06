@@ -258,6 +258,8 @@ extern "C" void sched_perfcontrol_update_recommended_cores(uint32_t recommended_
 extern "C" {
 extern volatile uint32_t native_touch_seq;
 extern volatile uint32_t pdx203_swap_submits __attribute__((weak));
+unsigned pdx203_swap_trace(char *out, unsigned cap) __attribute__((weak_import));   // LegacyDisplayProbe
+extern volatile uint32_t pdx203_gpu_dcvs_stats[6] __attribute__((weak));            // GpuProbe: [0] the GPU level
 }
 namespace {
 constexpr uint64_t kTickMs = 25, kHoldMs = 1500;
@@ -307,6 +309,12 @@ void cpufreqThread(void *, wait_result_t)
                     IOLockLock(gLock);
                     revoteAll();
                     IOLockUnlock(gLock);
+                }
+                // SWAPT <b|i><GPU level> t<ms> <gap>/<done> ...: every finished swap (pdx203_swap_trace), every 100 ms.
+                if ((t & 3) == 3 && pdx203_swap_trace) {
+                    char trace[320];
+                    if (pdx203_swap_trace(trace, sizeof trace))
+                        printf("SWAPT %c%u %s\n", gIdle ? 'i' : 'b', &pdx203_gpu_dcvs_stats ? pdx203_gpu_dcvs_stats[0] : 0, trace);
                 }
                 IOSleep(kTickMs);
             }

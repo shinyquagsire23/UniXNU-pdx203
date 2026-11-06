@@ -1673,7 +1673,7 @@ void memBench() {
 // its top level (rpmhVoteDdr) for good, idle or not: most of the idle heat. Every 50 ms this reads the GMU's busy counter (19.2 MHz
 // ticks while the GPU works, as the heartbeat does), turns it into the MHz of work done and picks the lowest level that would run it
 // at most 70 % busy: up at once, down only after 300 ms of wanting less. While CpuFreqProbe's interactive boost holds (a touch or an
-// animation, pdx203_ui_boosted) the floor is perf 4 (490 MHz) and the DDR goes to its top level; otherwise the floor is perf 1
+// animation, pdx203_ui_boosted) the GPU runs at perf 7 (670 MHz) and the DDR at its top level; otherwise the floor is perf 1
 // (305 MHz) and the DDR vote drops to kDdrIdleVote. Above 85 C the GPU stays at perf 5 or below. The level changes go through the GMU
 // (A650GmuSetPerf, Linux's runtime GX_BW_PERF_VOTE); the DDR votes through AdspProbe's locked RSC sender (pdx203_rpmh_send), the same
 // BCM commands rpmhVoteDdr sends at boot. pipa-gpu-dcvs=0 keeps the old fixed levels.
@@ -1726,7 +1726,7 @@ void dcvsThread(void *, wait_result_t) {
         const uint32_t needMHz = kGpuMHz[perf] * permille / 700;
         unsigned want = 1;
         while (want < 7 && kGpuMHz[want] < needMHz) ++want;
-        if (boosted && want < 4) want = 4;
+        if (boosted) want = 7;   // dv1 floored at 4 (490 MHz) and felt less responsive (user, 2026-11-06)
         if (hot > 85000 && want > 5) want = 5;
         unsigned next = perf;
         if (want > perf) {next = want; down = 0;}
