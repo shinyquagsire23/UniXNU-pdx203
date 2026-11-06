@@ -1,0 +1,174 @@
+From: pdx203 <noreply@anthropic.com>
+Subject: ring: GPU timeline of each user submission
+
+A6XX user submissions get a CP_EVENT_WRITE RB_DONE_TS with TIMESTAMP (the always-on counter, 19.2 MHz)
+after the prologue and before the fence, into a 64-slot table at +1024 of the fence page. When a wait
+first sees a fence, the GPU time between the stamps, the host time from the WPTR write and the GPU's
+idle time before the submission are summed into native_adreno_ring_timeline, which the board prints
+(pdx203 GpuProbe.cpp GPUTL row). It showed the home-screen frame's submission busy 11.7 ms on the GPU
+around a 2.7 ms render pass (row-by-row shadow copies, fixed in the Metal frontend).
+
+diff --git a/NativeAdrenoRing.cpp b/NativeAdrenoRing.cpp
+--- a/NativeAdrenoRing.cpp
++++ b/NativeAdrenoRing.cpp
+@@ -2,6 +2,9 @@
+ #include "NativeAdrenoRing.h"
+ #include "AdrenoPM4.h"
+ #include <IOKit/IOLib.h>
++#ifdef KERNEL
++#include <kern/clock.h>
++#endif
+ 
+ /* Values are taken from the pinned Linux source, not guessed:
+  * drivers/gpu/drm/msm/registers/adreno/a6xx.xml (register offsets), and
+@@ -67,6 +70,14 @@
+     RingA6xxCcuInvalidateColor = 0x19,
+     RingA6xxCacheInvalidate = 0x31,
+     RingA6xxPrologueWords = 6,
++    /* pdx203 submission timeline: CP_EVENT_WRITE RB_DONE_TS (0x16) with TIMESTAMP (bit 30) writes the always-on counter (19.2 MHz) when
++     * the 3D pipeline drained, at a user submission's start and before its fence; slot = seqno % 64 of 16 bytes at RingStampOffset of the
++     * fence page. */
++    RingA6xxRbDoneTs = 0x16,
++    RingEventTimestamp = 1u << 30,
++    RingA6xxStampWords = 5,
++    RingStampOffset = 1024,
++    RingStampSlots = 64,
+     RingNoUpdate = 1u << 27
+ };
+ static uint32_t ilog2(size_t value)
+@@ -79,6 +90,49 @@
+ IOReturn NativeAdrenoRing::poison()
+ {
+     poisoned_=true;return kIOReturnIOError;
++}
++static size_t packet(uint32_t *words,size_t at,uint32_t opcode,const uint32_t *payload,uint32_t count);
++/* pdx203 submission timeline, over the user submissions retired since the GPU heartbeat last took it (GpuProbe.cpp GPUTL): [0] count,
++ * [1] GPU us summed (start to end stamp), [2] largest, [3] host us from the WPTR write to the first wait that saw the fence, summed,
++ * [4] largest, [5] GPU idle us before the submission (its start stamp less the previous submission's end stamp), summed, [6] count of
++ * those, [7] submissions without a usable stamp pair. */
++extern "C" {volatile uint64_t native_adreno_ring_timeline[8];}
++uint64_t NativeAdrenoRing::hostNow()
++{
++#ifdef KERNEL
++    uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);return ns/1000;
++#else
++    return 0;
++#endif
++}
++size_t NativeAdrenoRing::stampWords(uint32_t *words,size_t at,uint32_t seqno,uint32_t half) const
++{
++    const uint64_t base=fence_bytes_>=RingStampOffset+RingStampSlots*16?fence_iova_+RingStampOffset+(seqno%RingStampSlots)*16:fence_iova_+16;
++    const uint64_t address=base+half;
++    const uint32_t payload[4]={RingA6xxRbDoneTs|RingEventTimestamp,(uint32_t)address,(uint32_t)(address>>32),0};
++    return at?packet(words,at,RingFenceOpcode,payload,4):packet(words,0,RingFenceOpcode,payload,4);
++}
++void NativeAdrenoRing::noteRetired(uint32_t value)
++{
++    if(!fence_ || fence_bytes_<RingStampOffset+RingStampSlots*16)return;
++    const uint64_t now=hostNow();
++    if(value-timeline_.seen>RingStampSlots)timeline_.seen=value-RingStampSlots;
++    while(timeline_.seen!=value) {
++        const uint32_t seq=++timeline_.seen,slot=seq%RingStampSlots;
++        const uint64_t submitted=timeline_.submitted[slot];
++        timeline_.submitted[slot]=0;
++        if(!submitted)continue;   /* a kernel submission: no stamps */
++        const volatile uint32_t *w=fence_+(RingStampOffset+slot*16)/4;
++        const uint64_t start=(uint64_t)w[1]<<32|w[0],end=(uint64_t)w[3]<<32|w[2];
++        volatile uint64_t *t=native_adreno_ring_timeline;
++        const uint64_t lat=now>submitted?now-submitted:0;
++        t[3]=t[3]+lat;if(lat>t[4])t[4]=lat;
++        if(!(end>start && end-start<19200000ull)) {t[7]=t[7]+1;timeline_.lastEnd=0;continue;}
++        const uint64_t gpu=(end-start)*10/192;
++        t[0]=t[0]+1;t[1]=t[1]+gpu;if(gpu>t[2])t[2]=gpu;
++        if(timeline_.lastEnd && start>timeline_.lastEnd && start-timeline_.lastEnd<19200000ull) {t[5]=t[5]+(start-timeline_.lastEnd)*10/192;t[6]=t[6]+1;}
++        timeline_.lastEnd=end;
++    }
+ }
+ IOReturn NativeAdrenoRing::setGeneration(unsigned generation)
+ {
+@@ -88,7 +142,7 @@
+ }
+ uint32_t NativeAdrenoRing::prologueWords(bool reset) const
+ {
+-    return generation_==6?RingA6xxPrologueWords:RingPrologueWords+(reset?RingResetWords:0);
++    return generation_==6?RingA6xxPrologueWords+RingA6xxStampWords:RingPrologueWords+(reset?RingResetWords:0);
+ }
+ /* WPTR as a fenced register write: the GMU drops a write to CP_RB_WPTR that arrives while the GPU domain is not ready and flags it in
+  * its AHB fence status; the write is then given again, at most 200 times. i491: a fence stalled on almost every submission until the
+@@ -184,8 +238,10 @@
+         if(n)n=packet(words,n,RingFenceOpcode,&depth,1);
+         if(n)n=packet(words,n,RingFenceOpcode,&color,1);
+         if(n!=RingA6xxPrologueWords)return poison();
+-        for(uint32_t i=0;i<RingA6xxPrologueWords;++i)ring_[(at+i)&mask]=words[i];
+-        *end=(at+RingA6xxPrologueWords)&mask;return kIOReturnSuccess;
++        n=stampWords(words,n,seqno_+1,0);
++        if(n!=RingA6xxPrologueWords+RingA6xxStampWords)return poison();
++        for(uint32_t i=0;i<n;++i)ring_[(at+i)&mask]=words[i];
++        *end=(at+(uint32_t)n)&mask;return kIOReturnSuccess;
+     }
+     const uint32_t br=RingSyncThreads|RingThreadBr,syncBoth=RingSyncThreads|RingThreadBoth,both=RingThreadBoth,marker=0x101;
+     const uint32_t count=RingPrologueWords+(reset?RingResetWords:0);
+@@ -234,7 +290,13 @@
+  * submission while BV still works on it), then the ring timestamp with an interrupt, both threads and IFPC back on. */
+ IOReturn NativeAdrenoRing::emitFramedFence(uint32_t at,uint32_t seqno,uint32_t *end)
+ {
+-    if(generation_==6)return emitFence(at,seqno,end);   /* a6xx_submit: CP_SCRATCH(2), then CACHE_FLUSH_TS with IRQ */
++    if(generation_==6) {   /* a6xx_submit: CP_SCRATCH(2), then CACHE_FLUSH_TS with IRQ; before them the timeline's end stamp */
++        const uint32_t mask=(uint32_t)(ring_bytes_/4-1);
++        uint32_t words[RingA6xxStampWords]={0};
++        if(stampWords(words,0,seqno,8)!=RingA6xxStampWords)return poison();
++        for(uint32_t i=0;i<RingA6xxStampWords;++i)ring_[(at+i)&mask]=words[i];
++        return emitFence((at+RingA6xxStampWords)&mask,seqno,end);
++    }
+     const uint32_t mask=(uint32_t)(ring_bytes_/4-1);
+     uint32_t words[RingFramedFenceWords]={0};
+     if(AdrenoPM4Type4(RingScratch,1,&words[0])!=AdrenoPM4Success)return poison();
+@@ -310,7 +372,7 @@
+     if(!words || !word_count || word_count>SIZE_MAX/sizeof(uint32_t))return kIOReturnBadArgument;
+     const uint32_t size_words=(uint32_t)(ring_bytes_/4),mask=size_words-1;
+     const bool reset=framed && reset_pending_;
+-    const uint32_t extra=framed?prologueWords(reset)+(generation_==6?RingFenceWords:RingFramedFenceWords):RingFenceWords;
++    const uint32_t extra=framed?prologueWords(reset)+(generation_==6?RingFenceWords+RingA6xxStampWords:RingFramedFenceWords):RingFenceWords;
+     if(word_count>size_words-extra-8)return kIOReturnNoResources;
+     uint32_t rptr=0;IOReturn status=readRptr(&rptr);
+     if(status)return status;
+@@ -340,6 +402,7 @@
+     if(io_.barrier(io_.cookie))return poison();
+     if(writeWptr(end))return kIOReturnIOError;
+     next_=end;*fence=++seqno_;++submissions_;
++    if(framed)timeline_.submitted[seqno_%RingStampSlots]=hostNow();
+     if(reset)reset_pending_=false;
+     return kIOReturnSuccess;
+ }
+@@ -355,7 +418,7 @@
+         const uint32_t value=fence_[1];
+         if(observed)*observed=value;
+         if(value>seqno_) {poison();return NativeAdrenoRingFencePoisoned;}
+-        if(value>=fence)return NativeAdrenoRingFenceComplete;
++        if(value>=fence) {noteRetired(value);return NativeAdrenoRingFenceComplete;}
+         if(!clock || !clock->now_us)return NativeAdrenoRingFenceTimeout;
+         if(clock->now_us(clock->cookie)-start>=timeout_us)return NativeAdrenoRingFenceTimeout;
+         if(clock->idle && clock->idle(clock->cookie))return NativeAdrenoRingFenceTimeout;
+@@ -373,6 +436,7 @@
+         const uint32_t value=fence_[1];
+         if(observed)*observed=value;
+         if(value>=fence) {if(value>seqno_) {poison();return NativeAdrenoRingFencePoisoned;}completed_=value;
++            noteRetired(value);
+             return NativeAdrenoRingFenceComplete;}
+         if(!clock || !clock->now_us)return NativeAdrenoRingFenceTimeout;
+         if(clock->now_us(clock->cookie)-start>=timeout_us)return NativeAdrenoRingFenceTimeout;
+diff --git a/NativeAdrenoRing.h b/NativeAdrenoRing.h
+--- a/NativeAdrenoRing.h
++++ b/NativeAdrenoRing.h
+@@ -55,6 +55,11 @@
+     size_t ring_bytes_=0,fence_bytes_=0;
+     uint64_t ring_iova_=0,fence_iova_=0;
+     uint32_t next_=0,rptr_shadow_=0,seqno_=0,completed_=0,submissions_=0;
++    /* pdx203 submission timeline (NativeAdrenoRing.cpp native_adreno_ring_timeline) */
++    struct {uint64_t submitted[64];uint32_t seen;uint64_t lastEnd;} timeline_={};
++    static uint64_t hostNow();
++    size_t stampWords(uint32_t *words,size_t at,uint32_t seqno,uint32_t half) const;
++    void noteRetired(uint32_t value);
+     unsigned generation_=7;
+     bool attached_=false,poisoned_=false,reset_pending_=false;
+     uint32_t context_=0;

@@ -1,0 +1,353 @@
+From: pdx203 <noreply@anthropic.com>
+Subject: frontend: 64-byte IOSurface row alignment; render pass profile behind a switch
+
+QuartzCore sizes its IOSurfaces' rows by the device's iosurfaceReadOnlyTextureAlignmentBytes, which
+answered the runtime's 16-byte linear alignment: the render server's 1096-pixel surfaces had
+4384-byte rows. No linear image aliases such a texture on the Adreno (64-byte pitches), so each was a
+shadow image copied in for every command buffer, and Turnip split the copy into one 2D blit per row
+(4384 is not 64-byte aligned): ~13000 row blits and ~9 ms of GPU per home-screen frame. It now
+answers 64 (iosurfaceTextureAlignmentBytes stays unanswered). RhizomePoster then crosses its 200 MB
+memory high watermark once at boot (an EXC_RESOURCE report; it keeps running).
+
+Measured on pdx203 (home-screen paging): frame command buffer GPU 12.5 -> 3.3 ms,
+submission retire latency 13.4 -> 3.5 ms, median swap gap 29 -> 17 ms, GPU busy 28 -> 10 %.
+
+The profile that found it stays, off unless /private/var/ngpu/debug/pass-profile exists: Turnip's
+pass stamps in backboardd (SHENG_DIAG for Turnip and the runtime only), NBPassPoll's PDX203PASS /
+PASSTOP / CB / TL / COPY / BLIT rows through os_log. NBGpuTimes and the blit counters are always on.
+
+diff --git a/NativeAdrenoMetalPlugin.mm b/NativeAdrenoMetalPlugin.mm
+--- a/NativeAdrenoMetalPlugin.mm
++++ b/NativeAdrenoMetalPlugin.mm
+@@ -91,6 +91,7 @@
+ // 40 other places in QuartzCore read the same byte (XR formats, backdrop compute, ASTC ...). Holding the byte at 0 turned all of them, and the
+ // tablet drew light blue blocks. Here the byte stays 1 and only this branch is made a NOP, so the framebuffer is chosen as on a real device and
+ // nothing else changes. Marks 0x6E40 unreadable, 0x6E41 other instruction, 0x6E42 patched, 0x6E50|stage failures.
++extern "C" void NBDiagLatch(void) __attribute__((weak_import));
+ static bool bootArgSet(const char *key) {
+     char args[1100] = {};
+     size_t size = sizeof args - 1;
+@@ -243,6 +244,11 @@
+         // submission ring, the runtime's stage ring, and in the render server the status and telemetry lines. Without it none of them runs.
+         if (bootArgSet("sheng-diag=1") || bootArgSet("sheng-gpu-trace=1")) setenv("SHENG_DIAG", "1", 1);
+         else unsetenv("SHENG_DIAG");
++        // The render server's pass profile, while /private/var/ngpu/debug/pass-profile exists (an add-on can ship it): its passes are stamped
++        // (Turnip and the runtime read SHENG_DIAG at their first pass and command buffer) with the frontend's own diagnostics settled off
++        // first; NBPassPoll logs them (NativeBridgeMetalFrontend.mm). Off, nothing is stamped or logged.
++        if (!getenv("SHENG_DIAG") && !strcmp(getprogname(), "backboardd") && NBDiagLatch &&
++            access("/private/var/ngpu/debug/pass-profile", F_OK) == 0) {NBDiagLatch(); setenv("SHENG_DIAG", "1", 1);}
+         if (bootArgSet("sheng-gpu-trace=1")) setenv("SHENG_GPU_TRACE", "1", 1);
+         else unsetenv("SHENG_GPU_TRACE");
+         if (bootArgSet("sheng-wallpaper-freeze=1")) setenv("NATIVE_METAL_FREEZE_WALLPAPER", "1", 1);
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -36,6 +36,7 @@
+ #include <mach/mach.h>
+ #include <thread>
+ #include <fcntl.h>
++#include <os/log.h>
+ #include <unistd.h>
+ #include <sys/time.h>
+ #include <sys/sysctl.h>
+@@ -218,6 +219,9 @@
+ // Every diagnostic of this process (the frame trace, the sampler, Turnip's pass stamps and submission ring, the runtime's stage ring) runs only
+ // with SHENG_DIAG set, which the plugin sets from the boot argument sheng-diag=1 before the device opens (NativeAdrenoMetalPlugin.mm).
+ static bool diagOn() {static const bool on=getenv("SHENG_DIAG")!=nullptr;return on;}
++// Settles diagOn() for this process before the plugin sets SHENG_DIAG for Turnip's pass stamps alone, and turns NBPassPoll on.
++static bool gPassProfile;
++extern "C" void NBDiagLatch(void) {(void)diagOn();gPassProfile=true;}
+ static uint32_t threadCpuUs() {
+  thread_basic_info_data_t info;mach_msg_type_number_t count=THREAD_BASIC_INFO_COUNT;
+  if(thread_info(pthread_mach_thread_np(pthread_self()),THREAD_BASIC_INFO,(thread_info_t)&info,&count)!=KERN_SUCCESS)return 0;
+@@ -2586,6 +2590,10 @@
+ 
+ @interface NBBlitEncoder : NBEncoder
+ @end
++// Profile (NBPassPoll's PDX203BLIT row): blit operations by kind, [kind][0] count, [1] thousands of bytes or texels: 0 buffer to buffer, 1 fill,
++// 2 texture to texture, 3 buffer to texture, 4 texture to buffer, 5 mipmap generation.
++static std::atomic<uint64_t> gBlitOps[6][2];
++static void blitNote(int kind,uint64_t amount){gBlitOps[kind][0]++;gBlitOps[kind][1]+=amount/1000;}
+ @implementation NBBlitEncoder
+ // The arguments are passed as a plain array: an NSArray literal raises on a nil element, and a nil resource (a refused allocation) must fail the
+ // command buffer like any invalid argument, not abort the host process.
+@@ -2606,16 +2614,19 @@
+ }
+ - (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)so toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)dO size:(NSUInteger)n {
+  if(![self buffers:NB_OBJECTS(s,d) count:2])return;
++ blitNote(0,n);
+  ENCODE([self check:nmb_blit_copy_buffer(self.handle,[(NBBuffer *)s handle],so,[(NBBuffer *)d handle],dO,n) what:"copyFromBuffer:toBuffer:"]);
+ }
+ - (void)fillBuffer:(id<MTLBuffer>)b range:(NSRange)r value:(uint8_t)v {
+  if(![self buffers:NB_OBJECTS(b) count:1])return;
++ blitNote(1,r.length);
+  ENCODE([self check:nmb_blit_fill_buffer(self.handle,[(NBBuffer *)b handle],r.location,r.location+r.length,v) what:"fillBuffer"]);
+ }
+ - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
+               toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO {
+  if(![self textures:NB_OBJECTS(s,d) count:2])return;
+  const std::array<uint64_t,3> a={so.x,so.y,so.z},size={z.width,z.height,z.depth},b={dO.x,dO.y,dO.z};
++ blitNote(2,(uint64_t)z.width*z.height*z.depth);
+  ENCODE([self check:nmb_blit_copy_texture(self.handle,[(NBTexture *)s handle],ss,sl,a.data(),size.data(),[(NBTexture *)d handle],ds,dl,b.data())
+                 what:"copyFromTexture:toTexture:"]);
+ }
+@@ -2662,6 +2673,7 @@
+   return;
+  }
+  const std::array<uint64_t,3> size={z.width,z.height,z.depth},b={dO.x,dO.y,dO.z};
++ blitNote(3,(uint64_t)z.width*z.height*z.depth);
+  ENCODE([self check:nmb_blit_buffer_to_texture(self.handle,[(NBBuffer *)s handle],o,row,image,size.data(),[(NBTexture *)d handle],slice,level,b.data())
+                 what:"copyFromBuffer:toTexture:"]);
+ }
+@@ -2669,6 +2681,7 @@
+                toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)o destinationBytesPerRow:(NSUInteger)row destinationBytesPerImage:(NSUInteger)image {
+  if(![self textures:NB_OBJECTS(s) count:1] || ![self buffers:NB_OBJECTS(d) count:1])return;
+  const std::array<uint64_t,3> a={so.x,so.y,so.z},size={z.width,z.height,z.depth};
++ blitNote(4,(uint64_t)z.width*z.height*z.depth);
+  ENCODE([self check:nmb_blit_texture_to_buffer(self.handle,[(NBTexture *)s handle],slice,level,a.data(),size.data(),[(NBBuffer *)d handle],o,row,image)
+                 what:"copyFromTexture:toBuffer:"]);
+ }
+@@ -2677,6 +2690,7 @@
+  // A refusal names the texture's pixel format, type and levels: what decides whether the runtime can filter it.
+  const std::string what=[NSString stringWithFormat:@"generateMipmapsForTexture: (pixel format %lu, type %lu, %lu levels)",
+                          (unsigned long)t.pixelFormat,(unsigned long)t.textureType,(unsigned long)t.mipmapLevelCount].UTF8String;
++ blitNote(5,(uint64_t)t.width*t.height);
+  ENCODE([self check:nmb_blit_generate_mipmaps(self.handle,[(NBTexture *)t handle]) what:what.c_str()]);
+ }
+ - (void)synchronizeResource:(id<MTLResource>)r {(void)r;}
+@@ -3274,7 +3288,194 @@
+  NSArray *pending;@synchronized(gInFlight){pending=gInFlight.allObjects;}
+  for(NBCommandBuffer *commandBuffer in pending)
+   if(commandBuffer.committed && !commandBuffer.failedLocally && commandBuffer.committedUs<=beforeUs)nmb_command_buffer_wait(commandBuffer.handle,0);
++}
++// Render pass profile of the render server, read from Turnip's pass ring (tu_pass_ring_read: each pass's size, render mode, loads and
++// stores, draws, heaviest fragment shader, and GPU begin/end from timestamps around it; kept only with SHENG_DIAG, which the plugin sets
++// in backboardd for Turnip alone, while /private/var/ngpu/debug/pass-profile exists: NativeAdrenoMetalPlugin.mm). Called by the scanout
++// client's thread after every frame; reads the ring every 150 ms (512 passes, a pass's GPU times land within 300 ms) and logs every 3 s,
++// through os_log (the USB log's forwarder):
++//   PDX203PASS f<frames> lost<passes the ring dropped> unrun<passes without GPU times> | full|mid|small n<passes> us<GPU> g<GMEM passes>
++//     L<loading> S<storing> d<draws> k<thousands of pixels>   (full: 2 Mpx or more; mid: 200 kpx or more; small: less)
++//   PDX203PASSTOP <w>x<h> m<mode: 0 GMEM, 1 SYSMEM by the autotuner, 2 SYSMEM otherwise> fl<flags: 2 linear, 4 unpadded, 8 loaded,
++//     16 stored> d<draws> fmt<VkFormat> i<FS instructions> t<FS texture fetches> w<waves> r<GPRs> s<samples> v<vertices> us<GPU>  (the 4 heaviest)
++// The runtime's command buffer stages (nmb_stage_ring_read, stage_trace.rs), per command buffer from its commit to its completion, summed
++// over the same 3 s as the passes for those whose GPU part (first submission to completion seen) took 6 ms or more ("long") and for all:
++//   PDX203CB long|all n<command buffers> ch<commit to handed> hs<handed to first submission> ss<first submission begun to last ended>
++//     sd<last submission ended to completion seen> seg<segments> bat<batches> sub<submissions> step<host steps' us> held<held for, per
++//     reason: semaphore/reencode/decode/host step/check/event/earlier commit>   (averages, us)
++// Completed command buffers (host ns: commit, last submission ended, completion seen), for NBPassPoll's timeline of each full-screen pass.
++struct CbTimes {uint64_t commit,submitted,seen;};
++static CbTimes gCbRing[256];
++static uint32_t gCbNext;
++static void stagePoll(bool report) {
++ struct StageRec {uint64_t ns,id;uint32_t seq;uint16_t stage,arg;};
++ static_assert(sizeof(StageRec)==24,"stage record");
++ struct Cb {uint64_t commit=0,handed=0,firstSubmit=0,lastSubmitEnd=0,stepBegin=0,seen=0;uint32_t segments=0,batches=0,submits=0,stepUs=0,held=0;};
++ struct Sum {uint64_t n=0,ch=0,hs=0,ss=0,sd=0,seg=0,bat=0,sub=0,step=0,held[7]={};};
++ static std::unordered_map<uint64_t,Cb> open;
++ static Sum sums[2];
++ static uint64_t from=0;
++ StageRec recs[256];
++ for(;;) {
++  uint64_t next=from;
++  const size_t n=nmb_stage_ring_read(from,recs,256,&next);
++  for(size_t i=0;i<n;i++) {
++   const StageRec &r=recs[i];
++   if(!r.id)continue;
++   if(r.stage==1){open[r.id]=Cb();open[r.id].commit=r.ns;continue;}
++   auto it=open.find(r.id);
++   if(it==open.end())continue;
++   Cb &c=it->second;
++   switch(r.stage) {
++    case 4:c.segments=r.arg;break;
++    case 5:c.handed=r.ns;c.batches=r.arg;break;
++    case 7:{const unsigned why=(r.arg&0xff);if(why>=1 && why<=7)c.held|=1u<<(why-1);break;}
++    case 8:if(!c.firstSubmit)c.firstSubmit=r.ns;c.submits++;break;
++    case 9:c.lastSubmitEnd=r.ns;break;
++    case 10:c.stepBegin=r.ns;break;
++    case 11:if(c.stepBegin && r.ns>=c.stepBegin)c.stepUs+=(uint32_t)((r.ns-c.stepBegin)/1000);c.stepBegin=0;break;
++    case 14:if(!c.seen)c.seen=r.ns;break;
++    case 15: {
++     if(c.commit && c.handed>=c.commit && c.firstSubmit>=c.handed && c.lastSubmitEnd>=c.firstSubmit && c.seen>=c.lastSubmitEnd) {
++      const bool long_=c.seen-c.firstSubmit>=6000000;
++      gCbRing[gCbNext++%256]={c.commit,c.lastSubmitEnd,c.seen};
++      for(int k=0;k<2;k++) {
++       if(k==0 && !long_)continue;
++       Sum &s=sums[k];
++       s.n++;s.ch+=(c.handed-c.commit)/1000;s.hs+=(c.firstSubmit-c.handed)/1000;s.ss+=(c.lastSubmitEnd-c.firstSubmit)/1000;
++       s.sd+=(c.seen-c.lastSubmitEnd)/1000;s.seg+=c.segments;s.bat+=c.batches;s.sub+=c.submits;s.step+=c.stepUs;
++       for(int b=0;b<7;b++)if(c.held&(1u<<b))s.held[b]++;
++      }
++     }
++     open.erase(it);
++     break;
++    }
++   }
++  }
++  from=next;
++  if(n<256)break;
++ }
++ if(open.size()>4096)open.clear();
++ if(!report)return;
++ for(int k=0;k<2;k++) {
++  const Sum &s=sums[k];
++  const uint64_t d=s.n?s.n:1;
++  os_log(OS_LOG_DEFAULT,"PDX203CB %{public}s n%llu ch%llu hs%llu ss%llu sd%llu seg%llu.%llu bat%llu.%llu sub%llu.%llu step%llu held %llu/%llu/%llu/%llu/%llu/%llu/%llu",
++   k?"all":"long",(unsigned long long)s.n,(unsigned long long)(s.ch/d),(unsigned long long)(s.hs/d),(unsigned long long)(s.ss/d),(unsigned long long)(s.sd/d),
++   (unsigned long long)(s.seg/d),(unsigned long long)(s.seg*10/d%10),(unsigned long long)(s.bat/d),(unsigned long long)(s.bat*10/d%10),
++   (unsigned long long)(s.sub/d),(unsigned long long)(s.sub*10/d%10),(unsigned long long)(s.step/d),
++   (unsigned long long)s.held[0],(unsigned long long)s.held[1],(unsigned long long)s.held[2],(unsigned long long)s.held[3],(unsigned long long)s.held[4],
++   (unsigned long long)s.held[5],(unsigned long long)s.held[6]);
++ }
++ sums[0]=Sum();sums[1]=Sum();
+ }
++extern "C" void NBPassPoll(uint64_t frames) {
++ if(!gPassProfile)return;
++ struct PassRec {uint64_t ns;uint32_t seq;uint16_t width,height;uint8_t mode,colors,flags,swap;uint16_t draws,format;uint32_t kpx;uint64_t gpuBegin,gpuEnd;uint16_t fsInstrs,fsTex,fsSy,fsSs;int8_t fsWaves,fsRegs;uint8_t samples,ds;uint32_t bandwidth,verts,fsHash;};
++ static_assert(sizeof(PassRec)==72,"turnip pass record");
++ typedef uint32_t (*Read)(uint32_t,PassRec *,uint32_t,uint32_t *);
++ static Read passRead=nullptr;
++ static uint32_t from=0;
++ static uint64_t polled=0,reported=0,framesAt=0,lost=0,unrun=0;
++ struct Cat {uint64_t n,us,gmem,load,store,draws,kpx;};
++ static Cat cat[3];
++ struct Top {uint32_t us;PassRec p;};
++ static Top top[4];
++ const uint64_t now=nowUs();
++ if(now-polled<150000)return;
++ polled=now;
++ if(!passRead) {
++  if(gLoaderPath.empty())return;
++  void *turnip=dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
++  if(!turnip)return;
++  passRead=(Read)dlsym(turnip,"tu_pass_ring_read");
++  dlclose(turnip);
++  if(!passRead)return;
++  reported=now;framesAt=frames;
++ }
++ const bool due=!(now-reported<3000000 || frames==framesAt);
++ stagePoll(due);
++ // The timeline of each full-screen pass against its command buffer: begin = GPU begin - the submission's end, end = completion seen - GPU
++ // end (host CLOCK_UPTIME_RAW against the GPU's always-on counter, both 19.2 MHz from boot here; an offset between them shifts both).
++ struct Tl {int64_t n=0,bsum=0,bmin=INT64_MAX,bmax=INT64_MIN,esum=0,emin=INT64_MAX,emax=INT64_MIN,unmatched=0;};
++ static Tl tl;
++ PassRec recs[64];
++ for(;;) {
++  uint32_t newest=0;
++  const uint32_t n=passRead(from,recs,64,&newest);
++  if(!n)break;
++  if(from && recs[0].seq>from)lost+=recs[0].seq-from;
++  const uint64_t ripe=now-300000;
++  uint32_t taken=0;
++  for(;taken<n && recs[taken].ns/1000<=ripe;taken++) {
++   const PassRec &p=recs[taken];
++   if(!p.gpuBegin || p.gpuEnd<p.gpuBegin){unrun++;continue;}
++   const uint32_t us=(uint32_t)((p.gpuEnd-p.gpuBegin)/1000);
++   Cat &c=cat[p.kpx>=2000?0:p.kpx>=200?1:2];
++   c.n++;c.us+=us;c.gmem+=p.mode==0;c.load+=(p.flags&8)!=0;c.store+=(p.flags&16)!=0;c.draws+=p.draws;c.kpx+=p.kpx;
++   for(unsigned t=0;t<4;t++)if(us>top[t].us){for(unsigned u=3;u>t;u--)top[u]=top[u-1];top[t]={us,p};break;}
++   if(p.kpx>=2000) {   // its command buffer: the first submitted at or after the pass was recorded
++    const CbTimes *best=nullptr;
++    for(unsigned i=0;i<256;i++){const CbTimes &c=gCbRing[i];if(c.submitted>=p.ns && c.submitted-p.ns<200000000 && (!best || c.submitted<best->submitted))best=&c;}
++    if(!best){tl.unmatched++;}
++    else {
++     const int64_t b=((int64_t)p.gpuBegin-(int64_t)best->submitted)/1000,e=((int64_t)best->seen-(int64_t)p.gpuEnd)/1000;
++     tl.n++;tl.bsum+=b;tl.esum+=e;if(b<tl.bmin)tl.bmin=b;if(b>tl.bmax)tl.bmax=b;if(e<tl.emin)tl.emin=e;if(e>tl.emax)tl.emax=e;
++    }
++   }
++  }
++  if(!taken)break;
++  from=recs[taken-1].seq+1;
++  if(taken<n || n<64)break;
++ }
++ if(!due)return;
++ char line[400];
++ // Turnip's copies (tu_copy_row_stats, deltas): buffer to image copies / those split into one blit per row / their rows, the same for
++ // image to buffer, then the largest split copy's rows, pitch, width x height and VkFormat.
++ {
++  static void (*copyStats)(uint64_t *)=nullptr;static bool looked=false;static uint64_t last[16];
++  if(!looked && !gLoaderPath.empty()){looked=true;void *t=dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);if(t){copyStats=(void (*)(uint64_t *))dlsym(t,"tu_copy_row_stats");dlclose(t);}}
++  if(copyStats) {
++   uint64_t c[16]={};copyStats(c);
++   os_log(OS_LOG_DEFAULT,"PDX203COPY b2i %llu/%llu/%llu i2b %llu/%llu/%llu | largest rows %llu pitch %llu %llux%llu fmt %llu",
++    (unsigned long long)(c[0]-last[0]),(unsigned long long)(c[1]-last[1]),(unsigned long long)(c[2]-last[2]),(unsigned long long)(c[3]-last[3]),
++    (unsigned long long)(c[4]-last[4]),(unsigned long long)(c[5]-last[5]),(unsigned long long)c[6],(unsigned long long)c[7],
++    (unsigned long long)(c[8]&0xffffffff),(unsigned long long)(c[8]>>32),(unsigned long long)c[9]);
++   memcpy(last,c,sizeof last);
++  }
++ }
++ {
++  static uint64_t last[6][2],lastDispatches,lastPasses;
++  uint64_t now6[6][2];for(int k=0;k<6;k++)for(int j=0;j<2;j++)now6[k][j]=gBlitOps[k][j].load();
++  const uint64_t dispatches=gDispatches.load(),passes=gPasses.load();
++  os_log(OS_LOG_DEFAULT,"PDX203BLIT bb %llu/%lluk fill %llu/%lluk tt %llu/%lluk bt %llu/%lluk tb %llu/%lluk mip %llu | dispatches %llu passes %llu",
++   (unsigned long long)(now6[0][0]-last[0][0]),(unsigned long long)(now6[0][1]-last[0][1]),(unsigned long long)(now6[1][0]-last[1][0]),
++   (unsigned long long)(now6[1][1]-last[1][1]),(unsigned long long)(now6[2][0]-last[2][0]),(unsigned long long)(now6[2][1]-last[2][1]),
++   (unsigned long long)(now6[3][0]-last[3][0]),(unsigned long long)(now6[3][1]-last[3][1]),(unsigned long long)(now6[4][0]-last[4][0]),
++   (unsigned long long)(now6[4][1]-last[4][1]),(unsigned long long)(now6[5][0]-last[5][0]),(unsigned long long)(dispatches-lastDispatches),
++   (unsigned long long)(passes-lastPasses));
++  memcpy(last,now6,sizeof last);lastDispatches=dispatches;lastPasses=passes;
++ }
++ if(tl.n || tl.unmatched)
++  os_log(OS_LOG_DEFAULT,"PDX203TL n%lld unmatched%lld begin %lld/%lld/%lld end %lld/%lld/%lld",(long long)tl.n,(long long)tl.unmatched,
++   (long long)(tl.n?tl.bmin:0),(long long)(tl.n?tl.bsum/tl.n:0),(long long)(tl.n?tl.bmax:0),(long long)(tl.n?tl.emin:0),(long long)(tl.n?tl.esum/tl.n:0),
++   (long long)(tl.n?tl.emax:0));
++ tl=Tl();
++ int at=snprintf(line,sizeof line,"PDX203PASS f%llu lost%llu unrun%llu",(unsigned long long)(frames-framesAt),(unsigned long long)lost,(unsigned long long)unrun);
++ static const char *const names[3]={"full","mid","small"};
++ for(int k=0;k<3 && at>0 && at<(int)sizeof line;k++)
++  at+=snprintf(line+at,sizeof line-at," | %s n%llu us%llu g%llu L%llu S%llu d%llu k%llu",names[k],(unsigned long long)cat[k].n,(unsigned long long)cat[k].us,
++   (unsigned long long)cat[k].gmem,(unsigned long long)cat[k].load,(unsigned long long)cat[k].store,(unsigned long long)cat[k].draws,(unsigned long long)cat[k].kpx);
++ os_log(OS_LOG_DEFAULT,"%{public}s",line);
++ at=snprintf(line,sizeof line,"PDX203PASSTOP");
++ for(unsigned t=0;t<4 && top[t].us && at>0 && at<(int)sizeof line;t++) {
++  const PassRec &p=top[t].p;
++  at+=snprintf(line+at,sizeof line-at," %ux%u m%u fl%x d%u fmt%u i%u t%u w%d r%d s%u v%u us%u;",p.width,p.height,p.mode,p.flags,p.draws,p.format,
++   p.fsInstrs,p.fsTex,p.fsWaves,p.fsRegs,p.samples,p.verts,top[t].us);
++ }
++ os_log(OS_LOG_DEFAULT,"%{public}s",line);
++ memset(cat,0,sizeof cat);memset(top,0,sizeof top);lost=unrun=0;reported=now;framesAt=frames;
++}
+ static void scheduled(void *context) {[(__bridge NBCommandBuffer *)context didSchedule];}
+ // The runtime's completion: the command buffer's own reference, taken at commit, is given back here.
+ static void completed(void *context) {
+@@ -4039,11 +4240,17 @@
+ - (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(NSUInteger)format {
+  return ((NSUInteger (*)(id,SEL,NSUInteger))objc_msgSend)(self,sel_registerName("minimumLinearTextureAlignmentForPixelFormat:"),format);
+ }
+-// SPI: the row alignment a read-only texture over an IOSurface needs. Answered unasked it was 0 (a divisor for its callers); the linear
+-// texture alignment of the widest common format is the same rule this GPU applies to any linear image.
+-- (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes {
+- return ((NSUInteger (*)(id,SEL,NSUInteger))objc_msgSend)(self,sel_registerName("minimumLinearTextureAlignmentForPixelFormat:"),MTLPixelFormatRGBA16Float);
++// SPI: the row alignment a read-only texture over an IOSurface needs (QuartzCore sizes its surfaces' rows by it). Answered unasked it was
++// 0 (a divisor for its callers). iosurfaceTextureAlignmentBytes (Metal, CoreImage and VideoToolbox read it) stays unanswered, as before.
++// With 64 RhizomePoster, the wallpaper renderer, crosses its 200 MB memory high watermark once at boot (EXC_RESOURCE report, not fatal). 64 bytes, the Adreno's linear image pitch (fdl6 pitchalign): with the runtime's 16 the render server's
++// 1096-pixel surfaces had 4384-byte rows, which no linear image aliases, so every texture over them was a shadow image copied in for each
++// command buffer, one 2D blit per row (pdx203 2026-11-06: ~13000 row blits and ~9 ms of GPU a home-screen frame).
++static NSUInteger iosurfaceRowAlignment(id device) {
++ const NSUInteger linear=((NSUInteger (*)(id,SEL,NSUInteger))objc_msgSend)(device,sel_registerName("minimumLinearTextureAlignmentForPixelFormat:"),
++                                                                            MTLPixelFormatRGBA16Float);
++ return linear>64?linear:64;
+ }
++- (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes {return iosurfaceRowAlignment(self);}
+ - (uint64_t)registryID {return gRegistryID;}
+ - (NSUInteger)maxBufferLength {return nmb_device_max_buffer_length(gDevice);}
+ - (BOOL)hasUnifiedMemory {return YES;}
+diff --git a/NativeMetalBridgePhase.h b/NativeMetalBridgePhase.h
+--- a/NativeMetalBridgePhase.h
++++ b/NativeMetalBridgePhase.h
+@@ -87,6 +87,7 @@
+ // service. Reports on GPU7 only when the state changes: "P<step> e<hex>" (0 no connection, 1 no selector, 2 mode refused, 3 scanout not
+ // mappable/importable, 4 serving), then "PF <frames>/<failures> r<last result> v<verified>/<differing rows> t<ms>" at the first frame, every fifth after
+ // and the first failure, "PX ..." when serving stops. Returns when serving stops.
++extern "C" void NBPassPoll(uint64_t frames) __attribute__((weak_import));
+ struct ScanoutContext {
+     Gpu link;
+     Gpu *marker;
+@@ -124,6 +125,7 @@
+         if (opened) {
+             uint64_t reportedFrames = 0, reportedFailures = 0;
+             while (client.serveOne(500)) {
++                if (NBPassPoll) NBPassPoll(st.frames);   // the render server's pass profile (NativeBridgeMetalFrontend.mm)
+                 // The kernel shows only the newest line, sampled: once the copy is timed (PG below) PF stays for failures and every 2000th frame.
+                 const bool timed = st.frames > 120;
+                 const bool frame = st.frames && (st.frames == 1 || st.frames - reportedFrames >= (timed ? 2000u : 5u));

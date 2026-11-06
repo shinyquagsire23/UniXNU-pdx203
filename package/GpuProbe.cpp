@@ -1875,6 +1875,7 @@ extern volatile uint32_t native_adreno_fence_wait[8] __attribute__((weak_import)
 // stall handler tried ([0] attempts [1] last fence [2] attempts-until-complete [3] waits-then; [4] bus drains [8..11] stage recoveries
 // [12] worst timeouts), and where a submit's CPU time goes in mach ticks ([0] validate [1] sweep [2] wc audit [3] publish [4] coherence [5] ring, [6] count).
 extern volatile uint32_t native_adreno_fence_pending[8] __attribute__((weak_import));
+extern volatile uint64_t native_adreno_ring_timeline[8] __attribute__((weak_import));
 extern volatile uint32_t native_adreno_unstick[15] __attribute__((weak_import));
 extern volatile uint64_t native_adreno_submit_phase[7] __attribute__((weak_import));
 extern volatile uint64_t native_legacy_copy_n __attribute__((weak_import)), native_legacy_copy_last __attribute__((weak_import)),
@@ -2093,6 +2094,16 @@ void displayRow() {
             printf("FENCEPEND <1 %u <2 %u <4 %u <8 %u <16 %u <32 %u <64 %u 64+ %u\n",
                    native_adreno_fence_pending[0], native_adreno_fence_pending[1], native_adreno_fence_pending[2], native_adreno_fence_pending[3],
                    native_adreno_fence_pending[4], native_adreno_fence_pending[5], native_adreno_fence_pending[6], native_adreno_fence_pending[7]);
+        // The user submissions retired since the last row (Adreno650 NativeAdrenoRing.cpp): GPU time between the stamps at their start and
+        // end, host time from the WPTR write to the first wait that saw the fence, the GPU's idle time before each, in us.
+        if (&native_adreno_ring_timeline) {
+            volatile uint64_t *t = native_adreno_ring_timeline;
+            const uint64_t n = t[0], all = t[0] + t[7];
+            printf("GPUTL n %llu gpu %llu/%llu us | host %llu/%llu us | idle before %llu us (%llu) | unstamped %llu\n", (unsigned long long)n,
+                   (unsigned long long)(n ? t[1] / n : 0), (unsigned long long)t[2], (unsigned long long)(all ? t[3] / all : 0), (unsigned long long)t[4],
+                   (unsigned long long)(t[6] ? t[5] / t[6] : 0), (unsigned long long)t[6], (unsigned long long)t[7]);
+            for (int k = 0; k < 8; ++k) t[k] = 0;
+        }
         if (&native_adreno_unstick)
             printf("UNSTICK kick %u@f%u done@%u/%u | drains %u chalt %u ahalt %u @f%u done@%u | stage1 %u stage2 %u stage3 %u worst %u | poll_us %u\n",
                    native_adreno_unstick[0], native_adreno_unstick[1], native_adreno_unstick[2], native_adreno_unstick[3],
