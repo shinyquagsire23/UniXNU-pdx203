@@ -1,0 +1,300 @@
+From: pdx203 <noreply@anthropic.com>
+Subject: scanout: copy four pixels a thread; time the copy and the frame on the GPU
+
+The BGRA scanout copy (scanout_opaque, one 4-byte load and store a thread) took 5.1 ms of GPU a
+frame for 2 x 11 MB (1096x2560), measured with the runtime's GPU timestamps. scanout_opaque4 does
+16-byte loads and stores and takes 0.83 ms. It is used wherever both pitches and the width are
+multiples of 16 bytes, once its first frame matched the surface (else the one-pixel kernel stays).
+
+A "PG" report row every 120 frames gives the copy's GPU time, commit-to-scheduled and
+scheduled-to-completed, and the GPU time of the process's command buffers (full-screen passes and
+the rest, NBGpuTimes). PF rows are thinned once PG runs: the kernel shows only the newest line.
+
+diff --git a/GpuScanoutClient.h b/GpuScanoutClient.h
+index 7b259b5..5a3db60 100644
+--- a/GpuScanoutClient.h
++++ b/GpuScanoutClient.h
+@@ -109,6 +109,7 @@ public:
+         if (r == gpupresent::kOk) ++stats_->frames; else ++stats_->failures;
+         return true;
+     }
++    gpupresent::Presenter *presenter() const {return presenter_;}
+ private:
+     // Reads the scanout back with aligned 32-bit loads (the framebuffer is device memory; wider loads can fault) and compares the top rows with the
+     // surface the GPU copied. The lower part of the panel is skipped: the diagnostic renderer paints there. Evidence only; nothing is written.
+diff --git a/GpuScanoutPresenter.h b/GpuScanoutPresenter.h
+index 8c64a98..dd8cd2e 100644
+--- a/GpuScanoutPresenter.h
++++ b/GpuScanoutPresenter.h
+@@ -3,14 +3,15 @@
+ // imported without a copy (newBufferWithBytesNoCopy: pinned by the kernel and mapped into the GPU's 4 KiB context), the copy is a blit on
+ // the GPU's queue, and the call returns after the GPU retired it. A half-float frame (RGBA 16F, what iPadOS 27's render server draws
+ // once a Metal device renders) is converted by a compute kernel (shaders/scanout_convert.ll) through the display driver's own table of
+-// codes (NativeHalfCodes.h), so the bytes match its CPU path. A BGRA frame goes through the kernel scanout_opaque, which copies it with
+-// alpha 0xff, as the half-float conversion stores it: the display blends the scanout by its per-pixel alpha (SSPP SRC_FORMAT 0x237ff),
++// codes (NativeHalfCodes.h), so the bytes match its CPU path. A BGRA frame goes through the kernel scanout_opaque (scanout_opaque4, four pixels a
++// thread, where the pitches allow), which copies it with alpha 0xff, as the half-float conversion stores it: the display blends the scanout by its per-pixel alpha (SSPP SRC_FORMAT 0x237ff),
+ // and the compositor's framebuffer alpha is not opacity (translucent tinted blocks around Liquid Glass, i23c80d087); a device without
+ // the kernel blits it. No CPU touches a pixel; there is no staging copy and no software fallback here. Used through the public Metal API, on any device (the native frontend on the tablet, the Mac's device for the host check).
+ #pragma once
+ #import <Metal/Metal.h>
+ #include <unistd.h>
+ #include <stdint.h>
++#include <time.h>
+ #include <string.h>
+ #include <atomic>
+ #include "../GopFramebuffer/NativeGOPWire.h"
+@@ -19,6 +20,8 @@
+ // The conversion kernel's AIR and the frontend's loader for bare AIR (both in the plugin; weak, so a device without them only blits).
+ extern "C" const void *nmb_scanout_convert_air(size_t *length) __attribute__((weak_import));
+ extern "C" id native_bridge_metal_library_with_air(const void *bytes, size_t length) __attribute__((weak_import));
++// The frontend's GPU time of the process's command buffers (NativeBridgeMetalFrontend.mm), for the report next to the copy's.
++extern "C" void NBGpuTimes(uint64_t out[4]) __attribute__((weak_import));
+ 
+ namespace gpupresent {
+ 
+@@ -43,6 +46,18 @@ struct Frame {
+ 
+ enum Result { kOk = 0, kBadFrame, kBadScanout, kNoResource, kGpuFailed };
+ 
++// The BGRA copy's times. 2026-11-06 (ct2, usb-378): one pixel a thread (scanout_opaque, [0]) took 5.1 ms of GPU a frame, four pixels a thread
++// (scanout_opaque4, [1]: 16-byte loads and stores) 0.83 ms, for the same 2 x 11 MB. The four-pixel kernel copies every frame whose pitches
++// and width allow it once its first frame matched the surface. GPU time is GPUEndTime - GPUStartTime (the runtime's timestamps around the
++// command buffer); host is commit to completion, split at the scheduled handler.
++struct CopyTiming {
++    uint64_t frames[2] = {0, 0}, gpuUs[2] = {0, 0}, hostUs = 0;
++    uint64_t split = 0, toScheduledUs = 0, scheduledToDoneUs = 0;   // commit to the scheduled handler, and from it to completion
++    uint64_t gpuAt[4] = {0, 0, 0, 0};                               // NBGpuTimes when the counts started
++    uint32_t untimed = 0;
++    int wide = -1;   // the four-pixel kernel: -1 not tried, 0 refused or its first frame differed from the surface, 2 on trial, 1 in use
++};
++
+ class Presenter {
+ public:
+     Presenter(id<MTLDevice> device, const Scanout &scanout) : device_(device), scanout_(scanout) {
+@@ -64,19 +79,19 @@ public:
+         id<MTLBuffer> source = sourceFor(frame);
+         if (!source) return kNoResource;
+         if (!(frame.stride & 3) && !(scanout_.stride & 3) && pipeline(opaque_, opaqueFailed_, @"scanout_opaque")) {
+-            id<MTLCommandBuffer> commands = [queue_ commandBuffer];
+-            id<MTLComputeCommandEncoder> encoder = commands ? [commands computeCommandEncoder] : nil;
+-            if (!encoder) return kNoResource;
+-            const uint32_t params[4] = {frame.width, rows, (uint32_t)(frame.stride / 4), (uint32_t)(scanout_.stride / 4)};
+-            [encoder setComputePipelineState:opaque_];
+-            [encoder setBuffer:source offset:0 atIndex:0];
+-            [encoder setBuffer:target_ offset:0 atIndex:1];
+-            [encoder setBytes:params length:sizeof params atIndex:3];
+-            [encoder dispatchThreadgroups:MTLSizeMake((frame.width + 15) / 16, (rows + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+-            [encoder endEncoding];
+-            [commands commit];
++            const bool fits4 = !(frame.stride & 15) && !(scanout_.stride & 15) && !(frame.width & 3);
++            if (timing_.wide < 0 && fits4) timing_.wide = pipeline(opaque4_, opaque4Failed_, @"scanout_opaque4") ? 2 : 0;
++            const bool wide = fits4 && timing_.wide > 0;
++            const uint64_t began = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++            __block uint64_t scheduledNs = 0;
++            id<MTLCommandBuffer> commands = opaqueCopy(wide, source, frame.width, rows, frame.stride,
++                                                       ^(id<MTLCommandBuffer>) {scheduledNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);});
++            if (!commands) return kNoResource;
+             [commands waitUntilCompleted];
+-            return commands.status == MTLCommandBufferStatusCompleted ? kOk : kGpuFailed;
++            if (commands.status != MTLCommandBufferStatusCompleted) return kGpuFailed;
++            note(wide, commands, began, scheduledNs);
++            if (wide && timing_.wide == 2) timing_.wide = sameAsSurface(frame) ? 1 : 0;
++            return kOk;
+         }
+         id<MTLCommandBuffer> commands = [queue_ commandBuffer];
+         id<MTLBlitCommandEncoder> blit = commands ? [commands blitCommandEncoder] : nil;
+@@ -132,6 +147,14 @@ public:
+         [commands waitUntilCompleted];
+         return commands.status == MTLCommandBufferStatusCompleted ? kOk : kGpuFailed;
+     }
++    // The copy's times since the last restart (the client reports them every 120 frames).
++    const CopyTiming &timing() const {return timing_;}
++    void resetTiming() {
++        CopyTiming fresh;
++        fresh.wide = timing_.wide;
++        if (NBGpuTimes) NBGpuTimes(fresh.gpuAt);
++        timing_ = fresh;
++    }
+     // A kernel of the scanout library, made once; a failure is not retried (every later half-float frame then goes back to the display
+     // driver's own path, every BGRA frame to the blit).
+     bool pipeline(__strong id<MTLComputePipelineState> &state, bool &failed, NSString *name) {
+@@ -159,6 +182,47 @@ public:
+         return buffer;
+     }
+ private:
++    // One opaque copy of the frame into the scanout, committed (not waited for): `rows` rows of `width` pixels, four pixels a thread when `wide`.
++    id<MTLCommandBuffer> opaqueCopy(bool wide, id<MTLBuffer> source, uint32_t width, uint32_t rows, size_t pitch, MTLCommandBufferHandler scheduled) {
++        id<MTLCommandBuffer> commands = [queue_ commandBuffer];
++        if (commands && scheduled) [commands addScheduledHandler:scheduled];
++        id<MTLComputeCommandEncoder> encoder = commands ? [commands computeCommandEncoder] : nil;
++        if (!encoder) return nil;
++        const uint32_t unit = wide ? 16 : 4, w = wide ? width / 4 : width;
++        const uint32_t params[4] = {w, rows, (uint32_t)(pitch / unit), (uint32_t)(scanout_.stride / unit)};
++        [encoder setComputePipelineState:wide ? opaque4_ : opaque_];
++        [encoder setBuffer:source offset:0 atIndex:0];
++        [encoder setBuffer:target_ offset:0 atIndex:1];
++        [encoder setBytes:params length:sizeof params atIndex:3];
++        // 16 x 8 threads a group either way: a group covers 16 or 64 pixels of a row
++        [encoder dispatchThreadgroups:MTLSizeMake((w + 15) / 16, (rows + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
++        [encoder endEncoding];
++        [commands commit];
++        return commands;
++    }
++    void note(bool wide, id<MTLCommandBuffer> c, uint64_t beganNs, uint64_t scheduledNs) {
++        const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++        if (scheduledNs >= beganNs && scheduledNs <= now) {
++            ++timing_.split; timing_.toScheduledUs += (scheduledNs - beganNs) / 1000; timing_.scheduledToDoneUs += (now - scheduledNs) / 1000;
++        }
++        timing_.hostUs += (now - beganNs) / 1000;
++        const double start = c.GPUStartTime, end = c.GPUEndTime;
++        if (!(start > 0 && end >= start)) {++timing_.untimed; return;}
++        ++timing_.frames[wide]; timing_.gpuUs[wide] += (uint64_t)((end - start) * 1e6 + 0.5);
++    }
++    // The four-pixel kernel's first frame against the surface (the top 64 rows, alpha made opaque); the scanout is device memory, read in words.
++    bool sameAsSurface(const Frame &frame) const {
++        const uint32_t rows = frame.height < 64 ? frame.height : 64;
++        for (uint32_t y = 0; y < rows; ++y) {
++            const volatile uint32_t *a = (const volatile uint32_t *)((const uint8_t *)scanout_.base + (size_t)y * scanout_.stride);
++            const uint32_t *b = (const uint32_t *)((const uint8_t *)frame.base + (size_t)y * frame.stride);
++            for (uint32_t x = 0; x < frame.width; ++x) if (a[x] != (b[x] | 0xff000000u)) return false;
++        }
++        return true;
++    }
++    CopyTiming timing_;
++    id<MTLComputePipelineState> opaque4_ = nil;
++    bool opaque4Failed_ = false;
+     // The compositor cycles through a few surfaces and the kernel keeps each one's mapping under one id, so the GPU import (pinning and
+     // mapping the pages, milliseconds per frame otherwise) is made once per surface. The kernel keeps more mappings (6) than kSources, so
+     // every import cached here still has its mapping.
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index b56848c..f343347 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -175,6 +175,9 @@ static Timed gTimePipeline,gTimeLibrary,gTimeFunction,gTimeEncodeToCommit;
+ // Where a frame's time goes, as histograms over power-of-two millisecond buckets (<1, <2, <4 ... <256, more): commit to completion of the
+ // command buffers that hold a full-screen pass (a frame's), of every other one, and a frame's encoding (creation to commit).
+ static std::atomic<uint64_t> gHistFrameGpu[10],gHistOtherGpu[10],gHistFrameEncode[10];
++// GPU time (us) and count of the command buffers that drew or dispatched: [0]/[1] those holding a full-screen pass, [2]/[3] the rest.
++static std::atomic<uint64_t> gGpuTimes[4];
++extern "C" void NBGpuTimes(uint64_t out[4]) {for(int i=0;i<4;i++)out[i]=gGpuTimes[i].load(std::memory_order_relaxed);}
+ static void histAdd(std::atomic<uint64_t> *bins,uint64_t us) {unsigned b=0;const uint64_t ms=us/1000;while(b<9 && ms>=(1ull<<b))++b;bins[b]++;}
+ static Timed gTimeCompile;                     // the system compiler's requests (codeGenRequest), the shader cache's misses
+ static std::atomic<uint64_t> gCompileCached;   // requests the shader cache answered
+@@ -3294,6 +3297,11 @@ static void completed(void *context) {
+   {
+    const bool frame=commandBuffer->encodedWork.pixels>=2000000;
+    histAdd(frame?gHistFrameGpu:gHistOtherGpu,took);
++   if(!commandBuffer.failedLocally && (commandBuffer->encodedWork.draws || commandBuffer->encodedWork.dispatches)) {
++    // the GPU's own time of the work (its timestamps), for the scanout client's report (NBGpuTimes)
++    const double start=nmb_command_buffer_gpu_time(commandBuffer.handle,false),end=nmb_command_buffer_gpu_time(commandBuffer.handle,true);
++    if(start>0 && end>=start){gGpuTimes[frame?0:2]+=(uint64_t)((end-start)*1e6);gGpuTimes[frame?1:3]++;}
++   }
+    if(frame)histAdd(gHistFrameEncode,commandBuffer.committedUs-commandBuffer->createdUs);
+   }
+   gTimeEncodeToCommit.count++;gTimeEncodeToCommit.total+=took;
+diff --git a/NativeMetalBridgePhase.h b/NativeMetalBridgePhase.h
+index 1f7ce14..f6a2dfd 100644
+--- a/NativeMetalBridgePhase.h
++++ b/NativeMetalBridgePhase.h
+@@ -124,7 +124,9 @@ static void serveScanout(Gpu &gpu, id device) {
+         if (opened) {
+             uint64_t reportedFrames = 0, reportedFailures = 0;
+             while (client.serveOne(500)) {
+-                const bool frame = st.frames && (st.frames == 1 || st.frames - reportedFrames >= 5);
++                // The kernel shows only the newest line, sampled: once the copy is timed (PG below) PF stays for failures and every 2000th frame.
++                const bool timed = st.frames > 120;
++                const bool frame = st.frames && (st.frames == 1 || st.frames - reportedFrames >= (timed ? 2000u : 5u));
+                 if (frame || (st.failures && !reportedFailures)) {
+                     reportedFrames = st.frames ? st.frames : reportedFrames;
+                     reportedFailures = st.failures ? st.failures : reportedFailures;
+@@ -134,6 +136,25 @@ static void serveScanout(Gpu &gpu, id device) {
+                              (unsigned long long)(served ? st.totalMs / served : 0));
+                     streamText7(gpu, line);
+                 }
++                // The copy's times (GpuScanoutPresenter.h CopyTiming), in us, every 120 frames: "PG k<kernel: 1 four pixels a thread, 0 one>
++                // n<frames> g<copy GPU> c<commit to scheduled> d<scheduled to completed> f<GPU of a command buffer with a full-screen
++                // pass>/<count> o<GPU of any other drawing or dispatching one, the copies among them>/<count> h<host>".
++                if (gpupresent::Presenter *presenter = client.presenter()) {
++                    const gpupresent::CopyTiming &t = presenter->timing();
++                    const uint64_t n = t.frames[0] + t.frames[1] + t.untimed;
++                    if (n >= 120) {
++                        const int k = t.frames[1] ? 1 : 0;   // the kernel in use
++                        uint64_t now[4] = {0, 0, 0, 0};
++                        if (NBGpuTimes) NBGpuTimes(now);
++                        const uint64_t fn = now[1] - t.gpuAt[1], on = now[3] - t.gpuAt[3];
++                        snprintf(line, sizeof line, "PG k%d n%llu g%u c%u d%u f%u/%u o%u/%u h%u", k, (unsigned long long)n,
++                                 (unsigned)(t.frames[k] ? t.gpuUs[k] / t.frames[k] : 0), (unsigned)(t.split ? t.toScheduledUs / t.split : 0),
++                                 (unsigned)(t.split ? t.scheduledToDoneUs / t.split : 0), (unsigned)(fn ? (now[0] - t.gpuAt[0]) / fn : 0),
++                                 (unsigned)fn, (unsigned)(on ? (now[2] - t.gpuAt[2]) / on : 0), (unsigned)on, (unsigned)(t.hostUs / n));
++                        streamText7(gpu, line);
++                        presenter->resetTiming();
++                    }
++                }
+             }
+             snprintf(line, sizeof line, "PX %llu/%llu r%d e%x", (unsigned long long)st.frames, (unsigned long long)st.failures, st.lastResult,
+                      (unsigned)st.error);
+diff --git a/shaders/scanout_convert.ll b/shaders/scanout_convert.ll
+index 010993b..66a1a86 100644
+--- a/shaders/scanout_convert.ll
++++ b/shaders/scanout_convert.ll
+@@ -106,10 +106,50 @@ done:
+   ret void
+ }
+ 
++; scanout_opaque4: scanout_opaque with four pixels a thread (16-byte loads and stores); p in 16-byte units: width/4, height, source and
++; destination row pitches. Used where both pitches and the width are multiples of 16 bytes.
++;   kernel void scanout_opaque4(device const uint4 *src [[buffer(0)]], device uint4 *dst [[buffer(1)]], constant uint4 &p [[buffer(3)]],
++;                               uint2 gid [[thread_position_in_grid]])
++define void @scanout_opaque4(ptr addrspace(1) noundef readonly "air-buffer-no-alias" %src, ptr addrspace(1) noundef "air-buffer-no-alias" %dst, ptr addrspace(2) noundef readonly align 16 dereferenceable(16) "air-buffer-no-alias" %p, <2 x i32> noundef %gid) local_unnamed_addr #0 {
++entry:
++  %w = load i32, ptr addrspace(2) %p, align 16
++  %ph = getelementptr inbounds i32, ptr addrspace(2) %p, i64 1
++  %h = load i32, ptr addrspace(2) %ph, align 4
++  %pss = getelementptr inbounds i32, ptr addrspace(2) %p, i64 2
++  %ss = load i32, ptr addrspace(2) %pss, align 8
++  %pds = getelementptr inbounds i32, ptr addrspace(2) %p, i64 3
++  %ds = load i32, ptr addrspace(2) %pds, align 4
++  %x = extractelement <2 x i32> %gid, i64 0
++  %y = extractelement <2 x i32> %gid, i64 1
++  %inx = icmp ult i32 %x, %w
++  %iny = icmp ult i32 %y, %h
++  %in = and i1 %inx, %iny
++  br i1 %in, label %body, label %done
++
++body:
++  %x64 = zext i32 %x to i64
++  %y64 = zext i32 %y to i64
++  %ss64 = zext i32 %ss to i64
++  %srow = mul i64 %y64, %ss64
++  %si = add i64 %srow, %x64
++  %sp = getelementptr inbounds <4 x i32>, ptr addrspace(1) %src, i64 %si
++  %v = load <4 x i32>, ptr addrspace(1) %sp, align 16
++  %px = or <4 x i32> %v, <i32 -16777216, i32 -16777216, i32 -16777216, i32 -16777216>
++  %ds64 = zext i32 %ds to i64
++  %drow = mul i64 %y64, %ds64
++  %di = add i64 %drow, %x64
++  %dp = getelementptr inbounds <4 x i32>, ptr addrspace(1) %dst, i64 %di
++  store <4 x i32> %px, ptr addrspace(1) %dp, align 16
++  br label %done
++
++done:
++  ret void
++}
++
+ attributes #0 = { mustprogress nofree norecurse nosync nounwind willreturn "frame-pointer"="all" "min-legal-vector-width"="0" "no-builtins" "no-trapping-math"="true" "stack-protector-buffer-size"="8" }
+ 
+ !llvm.module.flags = !{!0, !1, !2, !3, !4, !5, !6, !7, !8}
+-!air.kernel = !{!9, !22}
++!air.kernel = !{!9, !22, !26}
+ !air.compile_options = !{!17, !18}
+ !llvm.ident = !{!19}
+ !air.version = !{!20}
+@@ -141,3 +181,7 @@ attributes #0 = { mustprogress nofree norecurse nosync nounwind willreturn "fram
+ !23 = !{!12, !13, !25, !24}
+ !24 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"gid"}
+ !25 = !{i32 2, !"air.buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 3, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"uint4", !"air.arg_name", !"p"}
++!26 = !{ptr @scanout_opaque4, !10, !27}
++!27 = !{!28, !29, !25, !24}
++!28 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"uint4", !"air.arg_name", !"src"}
++!29 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"uint4", !"air.arg_name", !"dst"}
