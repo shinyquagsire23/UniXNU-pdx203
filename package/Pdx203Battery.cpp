@@ -43,7 +43,7 @@ class Pdx203Battery : public IOPMPowerSource {
     OSDeclareDefaultStructors(Pdx203Battery)
     IOWorkLoop *loop = nullptr;
     IOTimerEventSource *timer = nullptr, *cableTimer = nullptr;
-    unsigned plugTicks = 0;
+    unsigned plugTicks = 0, outTicks = 0, glitches = 0;
     bool published = false;
     int lastPercent = -1, lastStatus = -1, lastUsb = -1;
 
@@ -109,20 +109,33 @@ class Pdx203Battery : public IOPMPowerSource {
         sender->setTimeoutMS(kRefreshMs);
     }
 
-    static constexpr uint32_t kCableMs = 250, kApsdGraceTicks = 6;   // 1.5 s
+    // kOutTicks: USBIN's plug bit must stay clear 1 s before the cable counts as out (2026-11-06: on the Mac's port it dropped for
+    // under a second every minute or two once the battery was full, and each drop stopped the USB log's controller).
+    static constexpr uint32_t kCableMs = 250, kApsdGraceTicks = 6, kOutTicks = 4;   // 1.5 s, 1 s
     static void cableAction(OSObject *owner, IOTimerEventSource *sender) {
         Pdx203Battery *self = OSDynamicCast(Pdx203Battery, owner);
         if (!self) return;
         uint8_t rt = 0, apsd = 0;
         if (pdx203_spmi_read(kUsbPpid, 0x10, &rt) == 0) {
             const bool plugged = rt & (1u << 4);
+            const int32_t previous = pdx203_usb_cable;
             int32_t state = 0;
             if (plugged) {
+                if (self->outTicks && self->outTicks < kOutTicks && previous > 0) {
+                    ++self->glitches;
+                    if (self->glitches <= 8 || !(self->glitches % 32))
+                        printf("PDX203 USB cable glitch #%u: plug bit clear %u ms\n", self->glitches, self->outTicks * kCableMs);
+                }
+                self->outTicks = 0;
                 const bool done = pdx203_spmi_read(kUsbPpid, 0x07, &apsd) == 0 && (apsd & 1u);
                 if (self->plugTicks < 1000) ++self->plugTicks;
                 state = done || self->plugTicks > kApsdGraceTicks ? 2 : 1;
-            } else self->plugTicks = 0;
-            const int32_t previous = pdx203_usb_cable;
+                if (previous == 2) state = 2;   // a glitch shorter than kOutTicks leaves an established cable alone
+            } else {
+                if (self->outTicks < 1000) ++self->outTicks;
+                state = previous > 0 && self->outTicks < kOutTicks ? previous : 0;
+                if (!state) self->plugTicks = 0;
+            }
             if (state != previous) {
                 pdx203_usb_cable = state;
                 printf("PDX203 USB cable %s (apsd %#x)\n", state == 0 ? "out" : state == 1 ? "in, port detection running" : "in", apsd);

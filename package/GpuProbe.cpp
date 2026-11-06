@@ -1683,6 +1683,8 @@ extern volatile uint32_t pdx203_ui_boosted __attribute__((weak));
 extern volatile int native_thermal_max_mc __attribute__((weak));
 int pdx203_rpmh_send(const uint32_t *addresses, const uint32_t *values, unsigned count) __attribute__((weak_import));
 volatile uint32_t pdx203_gpu_dcvs_stats[6];   // level, changes, GMU failures, DDR failures, DDR high, last busy permille
+// Rig knobs (LegacyDisplayProbe pdx203_knob_set): ddrlow 0 keeps the DDR at its top level, dcvs 0 pins the GPU at perf 7.
+volatile int32_t pdx203_knob_ddrlow = 1, pdx203_knob_dcvs = 1;
 }
 constexpr uint32_t kGpuMHz[8] = {0, 305, 400, 441, 490, 525, 587, 670};
 // BCM vote units: MC0's cmd-db unit 2700000 and width 16 make vote = peak kB/s / 2700, so about 5.9 per MHz of DDR clock (top
@@ -1726,10 +1728,11 @@ void dcvsThread(void *, wait_result_t) {
         const uint32_t needMHz = kGpuMHz[perf] * permille / 700;
         unsigned want = 1;
         while (want < 7 && kGpuMHz[want] < needMHz) ++want;
-        if (boosted) want = 7;   // dv1 floored at 4 (490 MHz) and felt less responsive (user, 2026-11-06)
+        if (boosted || !pdx203_knob_dcvs) want = 7;   // dv1 floored at 4 (490 MHz) and felt less responsive (user, 2026-11-06)
         if (hot > 85000 && want > 5) want = 5;
         unsigned next = perf;
-        if (want > perf) {next = want; down = 0;}
+        if (!pdx203_knob_dcvs) {next = 7; down = 0;}
+        else if (want > perf) {next = want; down = 0;}
         else if (want < perf) {
             downWant = down ? (want > downWant ? want : downWant) : want;
             if (++down >= kDownTicks) {next = downWant; down = 0;}
@@ -1745,7 +1748,7 @@ void dcvsThread(void *, wait_result_t) {
                 if (st == A650GmuPoisoned || st == A650GmuTimeout) dead = true;
             }
         }
-        const bool wantDdr = boosted || perf >= 6;
+        const bool wantDdr = boosted || perf >= 6 || !pdx203_knob_ddrlow;
         if (wantDdr != ddrHigh) {
             const int rc = ddrVote(wantDdr);
             if (rc >= 0) ddrHigh = wantDdr;

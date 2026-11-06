@@ -1011,8 +1011,19 @@ extern "C" int64_t native_legacy_vsync_phase(uint64_t now, uint64_t interval) {
     if (abs >= interval / 2) return 0;
     return corrUs < 0 ? -(int64_t)abs : (int64_t)abs;
 }
+// GpuProbe's governor knobs (2026-11-06): ddrlow 0 keeps the DDR at its top level when idle, dcvs 0 pins the GPU at perf 7.
+extern "C" volatile int32_t pdx203_knob_ddrlow __attribute__((weak)), pdx203_knob_dcvs __attribute__((weak));
 // Runtime knobs, set over the USB control channel (KEY:knob.<name>,<value>; Pdx203TouchProbe.cpp). 0 set, -1 no such knob, -2 out of range.
 extern "C" int pdx203_knob_set(const char *name, size_t length, int value) {
+    static const struct {const char *name; volatile int32_t *knob;} governor[] = {{"ddrlow", &pdx203_knob_ddrlow}, {"dcvs", &pdx203_knob_dcvs}};
+    for (auto &k : governor)
+        if (length == strlen(k.name) && !strncmp(name, k.name, length)) {
+            if (!k.knob) return -1;
+            if (value < 0 || value > 1) return -2;
+            *k.knob = value;
+            printf("PDX203 KNOB %s = %d\n", k.name, value);
+            return 0;
+        }
     static const struct {const char *name; volatile int32_t *knob; int lo, hi;} knobs[] = {
         {"vlock", &pdx203_knob_vlock, 0, 1}, {"vphase", &pdx203_knob_vphase, 0, 166}, {"vgain", &pdx203_knob_vgain, 0, 16},
         {"eretire", &pdx203_knob_eretire, 0, 1}};
