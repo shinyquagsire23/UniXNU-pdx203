@@ -251,11 +251,6 @@ text_fixups = [
   # socket (Pdx203BtTty.c registers both names) carries the H4 stream with read/write. launchd runs the signed job cache, so the
   # BT_HCI_TRANSPORT environment cannot be set instead. 2026-11-05.
   "bluetoothd,ddd20,a0050034,1f2003d5",
-  # bluetoothd's diagnostics-mode getter (0x10036c24c, the platform's vtbl[0x160]; set from IODeviceTree:/product boot-ios-diagnostics)
-  # answers 1: readRootKeys makes temporary root keys in RAM instead of the keychain items under "BluetoothGlobal", whose read or
-  # write fails here (OI_STATUS_ACCESS_DENIED, "Bluetooth error - restarting { reason=130 }" every 10 s). Pairings do not survive a
-  # reboot until bluetoothd's keychain access works. 2026-11-05.
-  "bluetoothd,36c24c,fd7bbfa9fd030091,20008052c0035fd6",
 ]
 
 [payload.adt]

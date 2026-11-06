@@ -1,0 +1,18 @@
+diff --git a/iokit/Kernel/IOUserServer.cpp b/iokit/Kernel/IOUserServer.cpp
+--- a/iokit/Kernel/IOUserServer.cpp
++++ b/iokit/Kernel/IOUserServer.cpp
+@@ -85,7 +85,13 @@
+ 
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+ 
+-TUNABLE(SInt64, gIODKDebug, "dk", kIODKEnable);
++/*
++ * pdx203: driverkitd never brings a dext's server up on this board, so a dext personality that outscores a kext (the
++ * Bluetooth keyboard's AppleUserHIDEventDriver over IOHIDEventDriver) holds its provider for the 120 s check-in timeout
++ * before the kext gets it. Dext launches are refused by default so matching falls through to the kext at once; the "dk"
++ * boot-arg still overrides.
++ */
++TUNABLE(SInt64, gIODKDebug, "dk", kIODKEnable | kIODKDisableDextLaunch);
+ 
+ #if DEBUG || DEVELOPMENT
+ TUNABLE(bool, disable_dext_crash_reboot, "disable_dext_crash_reboot", 0);

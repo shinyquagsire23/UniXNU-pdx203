@@ -1,0 +1,222 @@
+From: shinyquagsire23 <mtinc2@gmail.com>
+Subject: [PATCH] class-key wrap and unwrap (selectors 10/11) for securityd
+
+securityd's built-in libaks wraps every keychain item key and metadata key
+with aks_wrap_key (selector 10: scalar in {keybag handle, class}, a 32-byte
+key in, a 40-byte blob out, the class back) and unwraps it with selector 11.
+The stand-in answered both "unsupported", so no keychain item could be
+added: WiFi passwords and Bluetooth link and root keys were lost
+("ks_crypt: e00002c7 failed to 'oe' item (class 11, bag: 0)").
+
+The blob is opaque to securityd, so it is AES-256 key wrap (RFC 3394) under
+a per-class key derived with SHA-256 from /chosen unique-chip-id. Class 12
+(passcode only) has no key. Undecodable blobs answer 0xe007c013 so securityd
+does not retry them as ref keys. No SEP or passcode protects these keys.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Wby9vE95hj6m7p14a2x9aY
+---
+diff --git a/NativeKeyStoreEvents.cpp b/NativeKeyStoreEvents.cpp
+index 233d433..b257023 100644
+--- a/NativeKeyStoreEvents.cpp
++++ b/NativeKeyStoreEvents.cpp
+@@ -1,8 +1,8 @@
+ // SPDX-License-Identifier: BSD-2-Clause-Patent
+ // AppleKeyStore for an ephemeral offline fixture: a notification service (the public IOKit matching class used by
+ // MKBEventsRegister) and, only when sheng-aks=1 is set, a user client that answers the state queries of the unchanged
+-// libaks/MobileKeyBag truthfully for this environment: no keybag, no passcode, nothing locked. It provides no key,
+-// keybag, passcode or data-protection operation; every other selector fails with kIOReturnError exactly as an unreachable
++// libaks/MobileKeyBag truthfully for this environment: no keybag, no passcode, nothing locked. It provides no keybag,
++// passcode or data-protection operation beyond the class-key wrap below; every other selector fails as an unreachable
+ // AppleKeyStore does. It protects nothing and must not be taken for secure storage.
+ //
+ // Answers (selectors and layouts read from the unchanged target's libaks/MobileKeyBag, see docs/touch-nt36532e.md; the set that is
+@@ -12,8 +12,22 @@
+ //   7        aks_get_lock_state(device)            scalar out: bit 2 = unlocked since boot
+ //   17, 35   aks_get_(extended_)device_state       struct out: DER SET{ SEQUENCE{ UTF8String key, INTEGER value } ... }
+ //            keys ss sls sb sfa sgs sas sgpe srcd sms bh; ss = 4, sls = lock state (0 unlocked; 3 would be "no passcode").
++// pdx203 (patches/modules/AppleKeyStoreState): software class keys, so securityd can keep keychain items (WiFi passwords, Bluetooth
++// link and root keys). Layouts from securityd's built-in libaks (21H461):
++//   10       aks_wrap_key    scalar in {keybag handle, class}, struct in the key (32 bytes), struct out the blob (40), scalar out class
++//   11       aks_unwrap_key  scalar in {keybag handle, class}, struct in the blob, struct out the key
++// The blob is opaque to securityd: AES-256 key wrap (RFC 3394; 32 bytes -> 40, its IV the integrity check) under a key per class
++// (class & 0x1f) derived with SHA-256 from the board's /chosen unique-chip-id. There is no SEP and no passcode behind it: anyone who
++// can read this phone's storage and knows its chip id can unwrap its keychain. Class 12 (akpu, needs a passcode) has no key.
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
++#include <IOKit/IORegistryEntry.h>
++#include <IOKit/IODeviceTreeSupport.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/crypto/aes.h>
++#include <libkern/crypto/sha2.h>
++#include <string.h>
+ extern "C" void native_keyevents_open_refused(void);
+ extern "C" bool native_aks_state_enabled(void);
+ extern "C" uint32_t native_aks_lock_state(void);
+@@ -27,6 +41,145 @@ constexpr uint32_t kStateFlags = 4;
+ constexpr uint64_t kSystemHandle = 0;
+ constexpr IOReturn kAksError = (IOReturn)0xe00002bc;   // what libaks reports itself when the connection is missing
+ constexpr IOReturn kAksUnsupported = (IOReturn)0xe00002c7;
++constexpr uint32_t kSelWrapKey = 10, kSelUnwrapKey = 11;
++constexpr IOReturn kAksNoClassKey = (IOReturn)0xe00002f0;      // securityd: "No key available for class"
++constexpr IOReturn kAksUndecodable = (IOReturn)0xe007c013;     // securityd: the blob can't be decrypted on this device
++
++// The device secret: SHA-256 over a label and /chosen unique-chip-id; the same on every boot of this board.
++bool deviceSecret(uint8_t out[32]) {
++    static uint8_t secret[32];
++    static volatile bool have;
++    if (!have) {
++        IORegistryEntry *chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane);
++        OSData *id = chosen ? OSDynamicCast(OSData, chosen->getProperty("unique-chip-id")) : nullptr;
++        bool ok = id && id->getLength() >= 8;
++        if (ok) {
++            static const char label[] = "UniXNU native keystore: device secret v1";
++            SHA256_CTX c;
++            SHA256_Init(&c);
++            SHA256_Update(&c, label, sizeof label);
++            SHA256_Update(&c, id->getBytesNoCopy(), id->getLength());
++            SHA256_Final(secret, &c);
++            have = true;
++        }
++        if (chosen) chosen->release();
++        if (!ok) return false;
++    }
++    memcpy(out, secret, 32);
++    return true;
++}
++// The class key: SHA-256(secret, "class", class & 0x1f), for every class but 12 (akpu: only with a passcode, which this board
++// never has). Keychain classes are 6-11; the others (UntilReboot and the like) get one too rather than an error.
++bool classKey(uint32_t keyClass, uint8_t key[32]) {
++    const uint32_t c = keyClass & 0x1f;
++    if (c < 1 || c == 12) return false;
++    uint8_t secret[32];
++    if (!deviceSecret(secret)) return false;
++    static const char label[] = "class";
++    SHA256_CTX h;
++    SHA256_Init(&h);
++    SHA256_Update(&h, secret, sizeof secret);
++    SHA256_Update(&h, label, sizeof label);
++    SHA256_Update(&h, &c, sizeof c);
++    SHA256_Final(key, &h);
++    memset(secret, 0, sizeof secret);
++    return true;
++}
++// RFC 3394 AES key wrap with the default IV: n 64-bit blocks in, n + 1 out.
++void keyWrap(const uint8_t kek[32], const uint8_t *in, size_t n, uint8_t *out) {
++    aes_encrypt_ctx ctx[1];
++    aes_encrypt_key256(kek, ctx);
++    uint8_t a[8], b[16];
++    memset(a, 0xa6, 8);
++    memcpy(out + 8, in, n * 8);
++    for (uint64_t j = 0; j < 6; ++j) {
++        for (size_t i = 1; i <= n; ++i) {
++            memcpy(b, a, 8); memcpy(b + 8, out + 8 * i, 8);
++            aes_encrypt(b, b, ctx);
++            const uint64_t t = n * j + i;
++            for (int k = 0; k < 8; ++k) a[k] = b[k] ^ (uint8_t)(t >> (56 - 8 * k));
++            memcpy(out + 8 * i, b + 8, 8);
++        }
++    }
++    memcpy(out, a, 8);
++    memset(ctx, 0, sizeof ctx); memset(b, 0, sizeof b);
++}
++// The inverse: n + 1 blocks in, n out; false when the IV does not come back (another key, or a damaged blob).
++bool keyUnwrap(const uint8_t kek[32], const uint8_t *in, size_t n, uint8_t *out) {
++    aes_decrypt_ctx ctx[1];
++    aes_decrypt_key256(kek, ctx);
++    uint8_t a[8], b[16];
++    memcpy(a, in, 8);
++    memcpy(out, in + 8, n * 8);
++    for (int64_t j = 5; j >= 0; --j) {
++        for (size_t i = n; i >= 1; --i) {
++            const uint64_t t = n * (uint64_t)j + i;
++            for (int k = 0; k < 8; ++k) b[k] = a[k] ^ (uint8_t)(t >> (56 - 8 * k));
++            memcpy(b + 8, out + 8 * (i - 1), 8);
++            aes_decrypt(b, b, ctx);
++            memcpy(a, b, 8);
++            memcpy(out + 8 * (i - 1), b + 8, 8);
++        }
++    }
++    uint8_t bad = 0;
++    for (int k = 0; k < 8; ++k) bad |= (uint8_t)(a[k] ^ 0xa6);
++    memset(ctx, 0, sizeof ctx); memset(b, 0, sizeof b);
++    if (bad) memset(out, 0, n * 8);
++    return !bad;
++}
++// The call's struct input (inline or a descriptor) into buf; its length, or -1 when it does not fit.
++long structIn(IOExternalMethodArguments *args, uint8_t *buf, size_t cap) {
++    if (args->structureInputDescriptor) {
++        const size_t len = args->structureInputDescriptor->getLength();
++        if (len > cap) return -1;
++        return (long)args->structureInputDescriptor->readBytes(0, buf, len);
++    }
++    if (!args->structureInput || args->structureInputSize > cap) return -1;
++    memcpy(buf, args->structureInput, args->structureInputSize);
++    return (long)args->structureInputSize;
++}
++// len bytes as the call's struct output; false when the caller's buffer is smaller.
++bool structOut(IOExternalMethodArguments *args, const uint8_t *data, size_t len) {
++    if (args->structureOutputDescriptor) {
++        if (len > args->structureOutputDescriptor->getLength()) return false;
++        args->structureOutputDescriptor->writeBytes(0, data, len);
++        args->structureOutputDescriptorSize = (uint32_t)len;
++        return true;
++    }
++    if (!args->structureOutput || len > args->structureOutputSize) return false;
++    memcpy(args->structureOutput, data, len);
++    args->structureOutputSize = (uint32_t)len;
++    return true;
++}
++IOReturn wrapKey(IOExternalMethodArguments *args, bool wrap) {
++    if (args->scalarInputCount < 2 || !args->scalarInput) return kIOReturnBadArgument;
++    const uint32_t keyClass = (uint32_t)args->scalarInput[1];
++    uint8_t in[128], out[128], kek[32];
++    const long len = structIn(args, in, sizeof in);
++    if (len < 0 || len % 8) return kIOReturnBadArgument;
++    if (!classKey(keyClass, kek)) return kAksNoClassKey;
++    IOReturn rc;
++    if (wrap) {
++        if (len < 16 || len > (long)sizeof in - 8) rc = kIOReturnBadArgument;
++        else {
++            keyWrap(kek, in, (size_t)len / 8, out);
++            rc = structOut(args, out, (size_t)len + 8) ? kIOReturnSuccess : kIOReturnNoSpace;
++            if (rc == kIOReturnSuccess && args->scalarOutput && args->scalarOutputCount >= 1) {
++                args->scalarOutput[0] = keyClass;
++                args->scalarOutputCount = 1;
++            }
++        }
++    } else {
++        if (len < 24) rc = kAksUndecodable;
++        else if (!keyUnwrap(kek, in, (size_t)len / 8 - 1, out)) rc = kAksUndecodable;
++        else {
++            rc = structOut(args, out, (size_t)len - 8) ? kIOReturnSuccess : kIOReturnNoSpace;
++            args->scalarOutputCount = 0;
++        }
++    }
++    memset(kek, 0, sizeof kek); memset(in, 0, sizeof in); memset(out, 0, sizeof out);
++    return rc;
++}
+ 
+ struct DerWriter {
+     uint8_t *p; size_t cap, n = 0; bool ok = true;
+@@ -116,6 +269,10 @@ public:
+             }
+             break;
+         }
++        case kSelWrapKey:
++        case kSelUnwrapKey:
++            rc = wrapKey(args, selector == kSelWrapKey);
++            break;
+         default: break;
+         }
+         native_aks_call(selector, (int32_t)rc);
+@@ -144,7 +301,7 @@ public:
+         if (!IOService::start(provider)) return false;
+         setName("Native keystore state service");
+         if (!setProperty("NativeKeyStoreEvents", true) ||
+-            !setProperty("KeyOperationsAvailable", false)) {
++            !setProperty("KeyOperationsAvailable", true)) {
+             IOService::stop(provider);
+             return false;
+         }

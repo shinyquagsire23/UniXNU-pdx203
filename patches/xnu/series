@@ -46,3 +46,5 @@ zzzzzzzzzn-persona-wellknown.patch
 zzzzzzzzzo-pmap-page-owner.patch
 # A fatal signal sent with kill() to backboardd or SpringBoard, logged with its sender (SIGLOG): the render server's unexplained SIGTERMs.
 zzzzzzzzzp-signal-sender.patch
+# DriverKit dext launches refused by default (driverkitd never serves them here), so a Bluetooth keyboard gets IOHIDEventDriver at once instead of after a 120 s check-in timeout.
+zzzzzzzzzq-no-dext-launch.patch

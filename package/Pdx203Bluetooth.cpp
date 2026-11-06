@@ -559,7 +559,7 @@ uint8_t gCtlQ[8192];              // whole packets for the controller
 size_t gCtlLen;
 uint8_t gToHost[8192];            // whole packets for the host
 size_t gToHostLen;
-uint32_t gLogged, gEvLogged;
+uint32_t gLogged, gEvLogged, gOtherLogged, gAclLogged;
 uint32_t gRemap;                  // LE Set Random Address commands sent for the host's 0xfd48, whose answers are dropped
 volatile uint32_t gResetFraming;
 
@@ -592,10 +592,19 @@ void hostPackets() {
             if (n > sizeof gHost) {gHostLen = 0; S[15] = S[15] + 1;}   // larger than any packet the controller takes
             return;
         }
+        if ((gHost[0] == 2 || gHost[0] == 5) && gAclLogged < 400) {
+            ++gAclLogged;
+            printf("PDX203 BLUE host acl %u:", (unsigned)n);
+            for (size_t i = 1; i < n && i < 21; ++i) printf(" %02x", gHost[i]);
+            printf("\n");
+        }
         if (gHost[0] == 1) {
             const uint16_t op = (uint16_t)(gHost[1] | gHost[2] << 8);
             S[13] = S[13] + 1;
-            if (gLogged < 400) {
+            // the periodic scan and inquiry traffic and the vendor scan tuning are not logged
+            const bool routine = op == 0x200b || op == 0x200c || op == 0x0401 || op == 0x0402 || op == 0xfce9 || op == 0xfce2 ||
+                                 op == 0xfd47 || op == 0xfd48 || op == 0x2005;
+            if (!routine && gLogged < 3000) {
                 ++gLogged;
                 printf("PDX203 BLUE host cmd %04x len %u:", op, gHost[3]);
                 for (unsigned i = 0; i < gHost[3] && i < 12; ++i) printf(" %02x", gHost[4 + i]);
@@ -658,9 +667,26 @@ void controllerPackets() {
         }
         // Read Local Supported Commands: octet 18 bits 2 and 3, Read/Write Default Erroneous Data Reporting (answered by hostPackets)
         if (p[0] == 4 && p[1] == 0x0e && p[2] >= 4 + 64 && (p[4] | p[5] << 8) == 0x1002 && p[6] == 0) p[7 + 18] |= 0x0c;
+        // other events (connections, security, pairing), all but the advertising, inquiry and completed-packet traffic; controller ACL
+        if (p[0] == 4 && p[1] != 0x0e && p[1] != 0x0f && p[1] != 0x02 && p[1] != 0x22 && p[1] != 0x2f && p[1] != 0x13 &&
+            !(p[1] == 0x3e && (p[3] == 0x02 || p[3] == 0x0d || p[3] == 0x0b)) && gOtherLogged < 3000) {
+            ++gOtherLogged;
+            printf("PDX203 BLUE event %02x:", p[1]);
+            for (size_t i = 2; i < n && i < 22; ++i) printf(" %02x", p[i]);
+            printf("\n");
+        }
+        if (p[0] == 2 && gAclLogged < 400) {
+            ++gAclLogged;
+            printf("PDX203 BLUE ctl acl %u:", (unsigned)n);
+            for (size_t i = 1; i < n && i < 21; ++i) printf(" %02x", p[i]);
+            printf("\n");
+        }
         // every failed command, and the first 400 command events
         const bool failed = p[0] == 4 && ((p[1] == 0x0e && p[2] >= 4 && p[6]) || (p[1] == 0x0f && p[2] >= 4 && p[3]));
-        if (p[0] == 4 && (gEvLogged < 400 || (failed && gEvLogged < 3000)) && (p[1] == 0x0e || p[1] == 0x0f)) {
+        const uint16_t evOp = p[0] == 4 && p[1] == 0x0e && p[2] >= 3 ? (uint16_t)(p[4] | p[5] << 8)
+                              : p[0] == 4 && p[1] == 0x0f && p[2] >= 4 ? (uint16_t)(p[5] | p[6] << 8) : 0;
+        const bool routineEv = evOp == 0x200b || evOp == 0x200c || evOp == 0x0401 || evOp == 0x0402;
+        if (p[0] == 4 && (failed || !routineEv) && gEvLogged < 3000 && (p[1] == 0x0e || p[1] == 0x0f)) {
             ++gEvLogged;
             if (p[1] == 0x0e && p[2] >= 4) printf("PDX203 BLUE event cc %04x status %02x len %u\n", p[4] | p[5] << 8, p[6], p[2]);
             if (p[1] == 0x0f && p[2] >= 4) printf("PDX203 BLUE event cs %04x status %02x\n", p[5] | p[6] << 8, p[3]);
