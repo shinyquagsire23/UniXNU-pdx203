@@ -270,6 +270,13 @@ rtc_late=OUT/'Pdx203Rtc.late.o'
 run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_Pdx203Rtc.cpp',rtc_obj,rtc_late])
 require(code(rtc_obj.read_bytes(),macho(rtc_obj.read_bytes()))==code(rtc_late.read_bytes(),macho(rtc_late.read_bytes())),
         'Owned RTC instructions unchanged by late init staging')
+# the panel brightness (DCS 0x51 over DSI0's command FIFO) and the AppleARMBacklight-shaped service CoreBrightness drives: its class registers
+# from its own probe, so its static initializer is globalised as the RTC's
+backlight_src,backlight_obj=board_cpp('Pdx203Backlight.cpp')
+backlight_late=OUT/'Pdx203Backlight.late.o'
+run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_Pdx203Backlight.cpp',backlight_obj,backlight_late])
+require(code(backlight_obj.read_bytes(),macho(backlight_obj.read_bytes()))==code(backlight_late.read_bytes(),macho(backlight_late.read_bytes())),
+        'Owned backlight instructions unchanged by late init staging')
 # the audio DSP (package/AdspProbe.cpp, sheng's ADSP bring-up with the SM8250 addresses) and its protocol cores, the stage 1 speaker
 # probe (package/Pdx203Audio.cpp: the CS35L41 amplifiers over GENI I2C and the APR core service). The C cores build with the kernel's
 # osfmk C line; the firmware reader (AdspFirmware.c, the modem_a FAT volume through NativeUfs) with the bsd one, as sheng builds it.
@@ -329,10 +336,10 @@ require(code((keyevents/'NativeKeyStoreEvents.o').read_bytes(),macho((keyevents/
         code(keyevents_late.read_bytes(),macho(keyevents_late.read_bytes())),'Owned keystore instructions unchanged by late init staging')
 archive=OUT/'libNativeLegacyDisplay.late.a';archive.unlink(missing_ok=True)
 run(['xcrun','ar','rcs',archive,late,OUT/'original-bindings.o',probe,hid_probe,touch_probe,hid/'NativeHidInput.late.o',hid/'hid-original-bindings.o',
-     keystore_probe,keyevents_late,cpufreq_probe,buttons_probe,battery_late,battery_probe,rtc_late,rtc_probe,adsp_probe,audio_probe,hph_obj,wifi_obj,wifinet_late,*wifi_module_objs,blue_obj,audio_svc_late,*[o for _,o in adsp_c]])
+     keystore_probe,keyevents_late,cpufreq_probe,buttons_probe,battery_late,battery_probe,rtc_late,rtc_probe,backlight_late,adsp_probe,audio_probe,hph_obj,wifi_obj,wifinet_late,*wifi_module_objs,blue_obj,audio_svc_late,*[o for _,o in adsp_c]])
 sources=[ROOT/'drivers/GopFramebuffer/NativeLegacyDisplay.cpp',ROOT/'drivers/GopFramebuffer/NativeLegacyRequest.h',source,
          hid_src,touch_src,ROOT/'drivers/ShengHidInput/NativeHidInput.cpp',keystore_src,ROOT/'drivers/AppleKeyStoreState/NativeKeyStoreEvents.cpp',cpufreq_src,buttons_src,
-         ROOT/'kits/pdx203/ButtonsCore.h',battery_src,battery_probe_src,rtc_src,rtc_probe_src,adsp_src,audio_src,hph_src,wifi_src,wifinet_src,audio_svc_src,blue_src,*[c for c,_ in adsp_c]]
+         ROOT/'kits/pdx203/ButtonsCore.h',battery_src,battery_probe_src,rtc_src,rtc_probe_src,backlight_src,adsp_src,audio_src,hph_src,wifi_src,wifinet_src,audio_svc_src,blue_src,*[c for c,_ in adsp_c]]
 print(run(['python3',ROOT/'scripts/build-arm-driver.py','NativeGOPPresenter'],text=True),end='')
 gop=ROOT/'build/native-gop-presenter';gop_late=gop/'NativeGOPPresenter.late.o'
 run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_NativeGOPPresenter.cpp',

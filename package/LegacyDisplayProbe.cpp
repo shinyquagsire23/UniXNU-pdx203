@@ -217,10 +217,13 @@ extern "C" {volatile uint32_t native_legacy_early_retires,native_legacy_early_fa
 static volatile uint64_t paceGap[6],paceLat[9],paceDone[9],paceN,paceLastSubmit;
 static volatile uint64_t paceTickUs;   // the latest refresh tick (native_legacy_vsync_phase)
 static inline unsigned paceBin2ms(uint64_t us) {return us>=16000?8:(unsigned)(us/2000);}
+// Every submitted swap, for the CPU frequency governor's frame boost (CpuFreqProbe.cpp, sheng-cpufreq=5).
+extern "C" {volatile uint32_t pdx203_swap_submits;}
 extern "C" void native_legacy_swap_stage(unsigned stage) {
     const uint64_t now=probeNowUs();
     uint32_t total=swapEventCount;
     if(stage==0) {
+        pdx203_swap_submits=pdx203_swap_submits+1;
         SwapEvent &e=swapEvents[total%64];e={now,0,0,0,total+1};swapEventCount=total+1;
         paceN=paceN+1;
         if(paceLastSubmit && now>paceLastSubmit){const uint64_t r=(now-paceLastSubmit+16667/2)/16667;paceGap[r>5?5:r]=paceGap[r>5?5:r]+1;}
@@ -614,6 +617,8 @@ extern "C" void pdx203_battery_probe(void);
 // the time of day (package/Pdx203Rtc.cpp; pdx203-rtc=0 turns it off): the PM8150 RTC plus an offset kept in the RTC alarm registers,
 // published as the IORTC resource AppleARMPE reads the calendar from; needs the arbiter the button thread maps
 extern "C" void pdx203_rtc_probe(void);
+// the panel brightness and its iOS service (package/Pdx203Backlight.cpp; pdx203-backlight=0 leaves the panel alone)
+extern "C" void pdx203_backlight_probe(void);
 // the audio DSP (package/AdspProbe.cpp, sheng's for SM8250; pdx203-adsp=<mode>) and the speaker path on top of it
 // (package/Pdx203Audio.cpp; pdx203-audio=<bits>): their own threads, nothing without the arguments
 extern "C" void sheng_adsp_probe(void);
@@ -635,6 +640,7 @@ void native_legacy_display_late_probe(void) {
     pdx203_buttons_probe();
     pdx203_battery_probe();
     pdx203_rtc_probe();
+    pdx203_backlight_probe();
     sheng_adsp_probe();
     pdx203_audio_probe();
     pdx203_wifi_probe();

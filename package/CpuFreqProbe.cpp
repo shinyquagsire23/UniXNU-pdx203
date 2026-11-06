@@ -10,6 +10,8 @@
 //   2  additionally request that highest non-turbo level in domain 0 (the boot CPU's cluster)
 //   3  the same in every domain once it reads enabled, and the highest L3 level
 //   4  mode 3, and threads kept off the Cortex-A55 cluster (cpus 0-3; see pdx203-cores below)
+//   5  mode 4 with an interactive governor: the top level while the screen is touched or frames are being drawn, and for
+//      1.5 s after; at most 845 MHz otherwise (see cpufreqThread)
 // Optional `sheng-cpufreq-cap=<MHz>`: mode 3 requests the highest non-turbo level at or below it (domains and L3).
 // Register layout is the qcom-cpufreq-hw "epss" data of the pinned mainline tree (reg_enable 0x0, reg_domain_state 0x20,
 // reg_dcvs_ctrl 0xb0, reg_freq_lut 0x100 with 4-byte rows, reg_perf_state 0x320, per-core perf_state rows +4*i for the
@@ -168,9 +170,13 @@ constexpr uint32_t kThrottleCapKHz[] = {0, 2400000, 2000000, 1612800, 1305600}; 
 constexpr unsigned kThrottleSteps = sizeof(kThrottleCapKHz) / sizeof(kThrottleCapKHz[0]);
 unsigned gThermStep;
 
+// sheng-cpufreq=5: the idle cap cpufreqThread applies while nothing is touched or drawn.
+constexpr uint32_t kIdleCapKHz = 844800;   // the lowest cap every domain has a level under (A55 787, A77 826, prime 845 MHz on the sm8250 tables)
+bool gIdle;
 uint32_t effectiveCapKHz() {
     uint32_t cap = gCapKHz, t = kThrottleCapKHz[gThermStep];
     if (t && (!cap || t < cap)) cap = t;
+    if (gIdle && (!cap || kIdleCapKHz < cap)) cap = kIdleCapKHz;
     return cap;
 }
 void revoteAll() {
@@ -202,7 +208,12 @@ extern "C" void sheng_cpufreq_poll(void) {
     for (unsigned d = 0; d < 3; ++d) {
         Window &w = gDomain[d];
         bool wanted = gMode >= 3 || (gMode == 2 && d == 0);
-        if (w.va && wanted && w.voted < 0 && (rd32(w.va, kRegEnable) & 1)) voteDomain(d);
+        if (w.va && wanted && w.voted < 0 && (rd32(w.va, kRegEnable) & 1)) {
+            uint32_t saved = gCapKHz;
+            gCapKHz = effectiveCapKHz();   // a domain that comes up while idle (or throttled) gets the capped level too
+            voteDomain(d);
+            gCapKHz = saved;
+        }
     }
     refreshRow();
     readThermal();
@@ -238,14 +249,67 @@ extern "C" void sheng_cpufreq_probe(void) {
 // (sched_perfcontrol_update_recommended_cores): cores left out still take interrupts and run threads bound to them, and the scheduler's
 // own failsafe brings every core back while a realtime thread is starved. 0 (the default) leaves every core recommended.
 extern "C" void sched_perfcontrol_update_recommended_cores(uint32_t recommended_cores);
+// sheng-cpufreq=5, the interactive governor (iOS's own CLPC raises the clocks the moment a finger lands and lets them fall when
+// the screen goes still; this board pinned every domain at its top level instead, ~74 C idle). Every 25 ms the thread looks at two
+// counters: native_touch_seq (Pdx203TouchProbe, bumped on every touch report) and pdx203_swap_submits (LegacyDisplayProbe, one per
+// frame the compositor submits). A touch, or at least 4 frames in the last 200 ms (20 fps: an animation, scrolling, video), keeps
+// the top level for 1.5 s more; otherwise every domain is re-voted at most kIdleCapKHz. The thermal cap still applies on top.
+extern "C" {
+extern volatile uint32_t native_touch_seq;
+extern volatile uint32_t pdx203_swap_submits __attribute__((weak));
+}
 namespace {
+constexpr uint64_t kTickMs = 25, kHoldMs = 1500;
+constexpr unsigned kFrameWindow = 8, kFrameBoost = 4;  // 8 ticks = 200 ms
+struct Interactive {
+    uint32_t touchSeq, swaps, frames[kFrameWindow];
+    unsigned slot;
+    uint64_t boostUntilMs, nowMs, boostedTicks, ticks, boosts;
+};
+// Returns true when the idle state changed (the caller re-votes).
+bool interactiveTick(Interactive &s) {
+    s.nowMs += kTickMs;
+    uint32_t seq = native_touch_seq, swaps = &pdx203_swap_submits ? pdx203_swap_submits : 0;
+    s.frames[s.slot] = swaps - s.swaps;
+    s.slot = (s.slot + 1) % kFrameWindow;
+    s.swaps = swaps;
+    unsigned frames = 0;
+    for (unsigned i = 0; i < kFrameWindow; ++i) frames += s.frames[i];
+    if (seq != s.touchSeq || frames >= kFrameBoost) s.boostUntilMs = s.nowMs + kHoldMs;
+    s.touchSeq = seq;
+    bool idle = s.nowMs >= s.boostUntilMs;
+    ++s.ticks;
+    if (!idle) ++s.boostedTicks;
+    if (idle == gIdle) return false;
+    if (!idle) ++s.boosts;
+    gIdle = idle;
+    return true;
+}
 void cpufreqThread(void *, wait_result_t)
 {
     char last[sizeof(native_cpufreq_row)] = {};
     uint32_t cores = gMode >= 4 ? 0xf0 : 0;
     PE_parse_boot_argn("pdx203-cores", &cores, sizeof(cores));
     bool coresApplied = cores == 0;
+    Interactive inter = {};
+    inter.boostUntilMs = 60000;   // the first minute (boot, first unlock) at the top level
     for (unsigned round = 0;; ++round) {
+        if (gMode >= 5 && round >= 60) {
+            // Between the governor's rounds: 25 ms ticks for the next 5 s.
+            for (unsigned t = 0; t < 5000 / kTickMs; ++t) {
+                if (interactiveTick(inter)) {
+                    IOLockLock(gLock);
+                    revoteAll();
+                    IOLockUnlock(gLock);
+                }
+                IOSleep(kTickMs);
+            }
+            printf("PDX203 CPUBOOST %s, boosted %llu%% of %llus, %llu boosts\n", gIdle ? "idle" : "boosted",
+                   inter.ticks ? inter.boostedTicks * 100 / inter.ticks : 0, inter.ticks * kTickMs / 1000, inter.boosts);
+            inter.ticks = inter.boostedTicks = inter.boosts = 0;
+        } else if (gMode >= 5) {
+            inter.nowMs = (uint64_t)round * 1000;
+        }
         sheng_cpufreq_poll();
         if (!coresApplied && (round >= 60 || (gDomain[0].voted >= 0 && gDomain[1].voted >= 0 && gDomain[2].voted >= 0))) {
             coresApplied = true;
@@ -261,7 +325,7 @@ void cpufreqThread(void *, wait_result_t)
         printf("PDX203 %s\n", native_thermal_row);
         // 1 s for the first minute (warmup + fast initial throttle response), then every 5 s so the governor still reacts to load
         // within a few seconds rather than the old 30 s.
-        IOSleep(round < 60 ? 1000 : 5000);
+        if (gMode < 5 || round < 60) IOSleep(round < 60 ? 1000 : 5000);
     }
 }
 }

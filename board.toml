@@ -191,7 +191,9 @@ kernel_args = [
   # windows). "PDX203 CPUFREQ" rows on the usb log. 3 votes only; 4 also calls sched_perfcontrol_update_recommended_cores(0xf0) to keep
   # the frame threads on the A77 P-cluster (cpus 4-7). TestUFO ran at 30 fps with 3 (WebKit/render/compositor threads landing on the
   # 1.8 GHz A55 E-cluster missed every other refresh); 4 is the fork's 60 fps lever ("PDX203 CORES recommended 0xf0" on the usb log).
-  "sheng-cpufreq=4",
+  # 5 is 4 with the interactive governor: the top level while touched or drawing frames (and 1.5 s after), capped otherwise
+  # ("PDX203 CPUBOOST" rows every 5 s); 845 MHz idle cap
+  "sheng-cpufreq=5",
   # activate the Edge (AMP) scheduler's cluster placement: ArmCpu gates ml_cpu_init_completed() behind this, which installs the
   # real A77<->A55 migration matrix and sets the default preferred cluster to the A77 P-cluster for the UI/render/frame buckets
   # (A55 E-cluster only for utility/background). Without it the Edge scheduler is compiled in (two psets from dts cluster-type
