@@ -33,6 +33,7 @@ char native_cpufreq_row[120];
 char native_thermal_row[120];
 volatile uint32_t native_cpufreq_stage;
 volatile int native_thermal_max_mc = -100000;   // hottest sensor, milliCelsius; the future throttle governor reads this
+volatile uint32_t pdx203_ui_boosted = 1;       // 1 while the interactive boost holds (GpuProbe's DCVS follows it)
 }
 
 namespace {
@@ -265,6 +266,7 @@ struct Interactive {
     uint32_t touchSeq, swaps, frames[kFrameWindow];
     unsigned slot;
     uint64_t boostUntilMs, nowMs, boostedTicks, ticks, boosts;
+    uint32_t touchTicks, frameTicks, windowSwaps;   // what renewed the hold this window, and the frames swapped
 };
 // Returns true when the idle state changed (the caller re-votes).
 bool interactiveTick(Interactive &s) {
@@ -275,6 +277,9 @@ bool interactiveTick(Interactive &s) {
     s.swaps = swaps;
     unsigned frames = 0;
     for (unsigned i = 0; i < kFrameWindow; ++i) frames += s.frames[i];
+    s.windowSwaps += s.frames[(s.slot + kFrameWindow - 1) % kFrameWindow];
+    if (seq != s.touchSeq) ++s.touchTicks;
+    else if (frames >= kFrameBoost) ++s.frameTicks;
     if (seq != s.touchSeq || frames >= kFrameBoost) s.boostUntilMs = s.nowMs + kHoldMs;
     s.touchSeq = seq;
     bool idle = s.nowMs >= s.boostUntilMs;
@@ -283,6 +288,7 @@ bool interactiveTick(Interactive &s) {
     if (idle == gIdle) return false;
     if (!idle) ++s.boosts;
     gIdle = idle;
+    pdx203_ui_boosted = idle ? 0 : 1;
     return true;
 }
 void cpufreqThread(void *, wait_result_t)
@@ -304,9 +310,11 @@ void cpufreqThread(void *, wait_result_t)
                 }
                 IOSleep(kTickMs);
             }
-            printf("PDX203 CPUBOOST %s, boosted %llu%% of %llus, %llu boosts\n", gIdle ? "idle" : "boosted",
-                   inter.ticks ? inter.boostedTicks * 100 / inter.ticks : 0, inter.ticks * kTickMs / 1000, inter.boosts);
+            printf("PDX203 CPUBOOST %s, boosted %llu%% of %llus, %llu boosts | touch %u frame %u ticks, %u swaps\n",
+                   gIdle ? "idle" : "boosted", inter.ticks ? inter.boostedTicks * 100 / inter.ticks : 0, inter.ticks * kTickMs / 1000,
+                   inter.boosts, inter.touchTicks, inter.frameTicks, inter.windowSwaps);
             inter.ticks = inter.boostedTicks = inter.boosts = 0;
+            inter.touchTicks = inter.frameTicks = inter.windowSwaps = 0;
         } else if (gMode >= 5) {
             inter.nowMs = (uint64_t)round * 1000;
         }

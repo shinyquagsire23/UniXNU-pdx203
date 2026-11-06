@@ -86,6 +86,8 @@ typedef struct {
 /* Nonzero: the bandwidth table gets a top DDR level and GX power votes it (A650Gmu.c). Set before A650GmuBuildStartup. */
 extern unsigned A650GmuDdrVote;
 A650GmuStatus A650GmuPowerGx(A650GmuDevice *, unsigned perf_index, A650GmuGxResult *);
+/* After A650GmuPowerGx: change the GPU level at runtime (Linux's a6xx_hfi_set_freq for a650). One caller at a time. */
+A650GmuStatus A650GmuSetPerf(A650GmuDevice *, unsigned perf_index, unsigned bw, uint32_t *vote_error);
 /* The HFI tables for pipa: the GPU levels of the DTS gpu-opp-table_v2 (305 to 670 MHz, RPMh levels 64 to 320) and the GMU's
  * 200 MHz at MIN_SVS (48), each with an off entry, voted from the command DB's gfx/mx and cx/mx level lists (16-bit words);
  * the bandwidth table is a650_build_bw_table's single "off" level, with the BCM addresses from the command DB instead of

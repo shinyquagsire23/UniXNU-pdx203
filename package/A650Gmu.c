@@ -359,6 +359,23 @@ A650GmuStatus A650GmuPowerGx(A650GmuDevice *d, unsigned perf_index, A650GmuGxRes
     return status;
 }
 
+/* Runtime DCVS, as Linux's a6xx_gmu_set_freq does for a GMU that is not legacy (a650): only a6xx_hfi_set_freq's GX_BW_PERF_VOTE
+ * {ack_type 1, perf_index, bandwidth}, no OOB, while GX stays on. bw 1 asks for A650GmuBuildStartup's DDR level and is sent as 0 unless
+ * A650GmuDdrVote built one. A timeout or firmware error poisons the HFI (AdrenoHfiExchange), so later calls return A650GmuPoisoned. */
+A650GmuStatus A650GmuSetPerf(A650GmuDevice *d, unsigned perf_index, unsigned bw, uint32_t *vote_error)
+{
+    if (vote_error) *vote_error = 0;
+    if (!d || perf_index < 1 || perf_index > 7) return A650GmuArgument;
+    if (d->poisoned || d->hfi.poisoned) return A650GmuPoisoned;
+    if (!d->startup.completed) return A650GmuStateMismatch;
+    const uint32_t vote[3] = {1, perf_index, bw && A650GmuDdrVote ? 1u : 0u};
+    uint32_t out[16], error = 0; size_t count = 0;
+    const AdrenoHfiStatus status = AdrenoHfiExchange(&d->hfi, 30, vote, 3, 1000, hfi_wait, out, 16, &count, &error);
+    if (vote_error) *vote_error = error;
+    if (status == AdrenoHfiSuccess) return A650GmuSuccess;
+    return status == AdrenoHfiFirmwareError ? A650GmuProtocolError : A650GmuTimeout;
+}
+
 AdrenoHfiStartupStatus A650GmuBuildStartup(const uint8_t *gfx, size_t gfx_bytes, const uint8_t *mx, size_t mx_bytes,
     const uint8_t *cx, size_t cx_bytes, uint32_t mc0, uint32_t sh0, uint32_t acv, uint32_t cn0, AdrenoHfiStartupConfig *out)
 {

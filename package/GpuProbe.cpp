@@ -1669,6 +1669,112 @@ void memBench() {
     }
 }
 
+// GPU and DDR frequency governor (pdx203, 2026-11-05). Until now the GPU sat at perf 7 (670 MHz, GX at RPMh level 320) and the DDR at
+// its top level (rpmhVoteDdr) for good, idle or not: most of the idle heat. Every 50 ms this reads the GMU's busy counter (19.2 MHz
+// ticks while the GPU works, as the heartbeat does), turns it into the MHz of work done and picks the lowest level that would run it
+// at most 70 % busy: up at once, down only after 300 ms of wanting less. While CpuFreqProbe's interactive boost holds (a touch or an
+// animation, pdx203_ui_boosted) the floor is perf 4 (490 MHz) and the DDR goes to its top level; otherwise the floor is perf 1
+// (305 MHz) and the DDR vote drops to kDdrIdleVote. Above 85 C the GPU stays at perf 5 or below. The level changes go through the GMU
+// (A650GmuSetPerf, Linux's runtime GX_BW_PERF_VOTE); the DDR votes through AdspProbe's locked RSC sender (pdx203_rpmh_send), the same
+// BCM commands rpmhVoteDdr sends at boot. pipa-gpu-dcvs=0 keeps the old fixed levels.
+// "PDX203 GPUDCVS" every 10 s: 50 ms ticks at each level, changes, failures, DDR high share, mean busy.
+extern "C" {
+extern volatile uint32_t pdx203_ui_boosted __attribute__((weak));
+extern volatile int native_thermal_max_mc __attribute__((weak));
+int pdx203_rpmh_send(const uint32_t *addresses, const uint32_t *values, unsigned count) __attribute__((weak_import));
+volatile uint32_t pdx203_gpu_dcvs_stats[6];   // level, changes, GMU failures, DDR failures, DDR high, last busy permille
+}
+constexpr uint32_t kGpuMHz[8] = {0, 305, 400, 441, 490, 525, 587, 670};
+// BCM vote units: MC0's cmd-db unit 2700000 and width 16 make vote = peak kB/s / 2700, so about 5.9 per MHz of DDR clock (top
+// 0x3fff = 2736 MHz). 0x11ca asks for ~768 MHz; the BCM takes the lowest level at or above it (or what other voters keep).
+uint32_t gDdrIdleVote = 0x11ca;
+int ddrVote(bool high) {
+    if (!pdx203_rpmh_send) return -1;
+    const uint32_t mc0 = gDbFound[5].address, sh0 = gDbFound[4].address, acv = gDbFound[6].address;
+    if (!mc0 || !sh0 || !acv) return -2;
+    const uint32_t level = high ? 0x3fffu : gDdrIdleVote & 0x3fffu;
+    const uint32_t bw = (1u << 30) | (1u << 29) | (level << 14) | level, acvOn = (1u << 30) | (1u << 29) | 0x8u;
+    const uint32_t addrs[3] = {mc0, sh0, acv}, datas[3] = {bw, bw, acvOn};
+    return pdx203_rpmh_send(addrs, datas, 3);
+}
+void dcvsThread(void *, wait_result_t) {
+    thread_set_thread_name(current_thread(), "pdx203-gpudcvs");
+    constexpr unsigned kTickMs = 50, kDownTicks = 6, kReportTicks = 200;
+    unsigned perf = 7;
+    PE_parse_boot_argn("pipa-gpu-perf", &perf, sizeof perf);
+    if (perf < 1 || perf > 7) perf = 7;
+    bool ddrHigh = true, dead = false;
+    unsigned down = 0, downWant = 0, ticks[8] = {}, changes = 0, gmuFail = 0, ddrFail = 0, ddrTicks = 0;
+    uint64_t busySum = 0, lastBusy = 0, lastNs = 0;
+    for (unsigned t = 1;; ++t) {
+        IOSleep(kTickMs);
+        uint32_t lo = 0, hi = 0, hi2 = 0;
+        gmuRead(nullptr, A650GmuCore, 0x5045 * 4, &hi);
+        gmuRead(nullptr, A650GmuCore, 0x5044 * 4, &lo);
+        gmuRead(nullptr, A650GmuCore, 0x5045 * 4, &hi2);
+        if (hi2 != hi) gmuRead(nullptr, A650GmuCore, 0x5044 * 4, &lo);
+        const uint64_t busy = uint64_t(hi2) << 32 | lo;
+        uint64_t ns = 0;
+        absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+        uint32_t permille = lastNs && ns > lastNs && busy >= lastBusy
+            ? uint32_t((busy - lastBusy) * 1000000000ull / 19200000ull * 1000 / (ns - lastNs)) : 0;
+        if (permille > 1000) permille = 1000;
+        lastBusy = busy; lastNs = ns;
+        const bool boosted = &pdx203_ui_boosted ? pdx203_ui_boosted != 0 : true;
+        const int hot = &native_thermal_max_mc ? native_thermal_max_mc : 0;
+        // MHz of work this tick, and the level that does it at <= 70 % busy.
+        const uint32_t needMHz = kGpuMHz[perf] * permille / 700;
+        unsigned want = 1;
+        while (want < 7 && kGpuMHz[want] < needMHz) ++want;
+        if (boosted && want < 4) want = 4;
+        if (hot > 85000 && want > 5) want = 5;
+        unsigned next = perf;
+        if (want > perf) {next = want; down = 0;}
+        else if (want < perf) {
+            downWant = down ? (want > downWant ? want : downWant) : want;
+            if (++down >= kDownTicks) {next = downWant; down = 0;}
+        } else down = 0;
+        if (hot > 85000 && next > 5) next = 5;
+        if (next != perf && !dead) {
+            uint32_t error = 0;
+            const A650GmuStatus st = A650GmuSetPerf(&gDevice, next, 0, &error);
+            if (st == A650GmuSuccess) {perf = next; ++changes;}
+            else {
+                ++gmuFail;
+                printf("PDX203 GPUDCVS vote perf %u failed: status %u error %x\n", next, st, error);
+                if (st == A650GmuPoisoned || st == A650GmuTimeout) dead = true;
+            }
+        }
+        const bool wantDdr = boosted || perf >= 6;
+        if (wantDdr != ddrHigh) {
+            const int rc = ddrVote(wantDdr);
+            if (rc >= 0) ddrHigh = wantDdr;
+            if (rc != 0) ++ddrFail;
+        }
+        ++ticks[perf];
+        if (ddrHigh) ++ddrTicks;
+        busySum += permille;
+        pdx203_gpu_dcvs_stats[0] = perf; pdx203_gpu_dcvs_stats[5] = permille;
+        if (t % kReportTicks == 0) {
+            pdx203_gpu_dcvs_stats[1] = changes; pdx203_gpu_dcvs_stats[2] = gmuFail; pdx203_gpu_dcvs_stats[3] = ddrFail;
+            pdx203_gpu_dcvs_stats[4] = ddrTicks;
+            printf("PDX203 GPUDCVS perf %u (%u MHz) | ticks 1:%u 2:%u 3:%u 4:%u 5:%u 6:%u 7:%u | changes %u fail %u ddr high %u%% fail %u | "
+                   "busy %llu.%llu%%%s\n", perf, kGpuMHz[perf], ticks[1], ticks[2], ticks[3], ticks[4], ticks[5], ticks[6], ticks[7],
+                   changes, gmuFail, ddrTicks * 100 / kReportTicks, ddrFail, busySum / kReportTicks / 10, busySum / kReportTicks % 10,
+                   dead ? " DEAD" : "");
+            for (unsigned i = 0; i < 8; ++i) ticks[i] = 0;
+            changes = gmuFail = ddrFail = ddrTicks = 0; busySum = 0;
+        }
+    }
+}
+void startDcvs() {
+    unsigned on = 1;
+    PE_parse_boot_argn("pipa-gpu-dcvs", &on, sizeof on);
+    if (!on || !native_gpu_gx.gx_on) return;
+    thread_t thread = nullptr;
+    if (kernel_thread_start(dcvsThread, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
+}
+
 void gpuThread(void *, wait_result_t) {
     IOSleep(5000);
     memBench();
@@ -1707,6 +1813,7 @@ void gpuThread(void *, wait_result_t) {
     if (gMode >= 11 && irq && publish()) {
         if (selfTest() && gMode >= 12) metal();
         native_gpu_step = 99;
+        startDcvs();
         heartbeat();
     }
     native_gpu_step = 99;
