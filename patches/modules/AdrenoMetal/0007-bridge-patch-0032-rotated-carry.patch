@@ -1,0 +1,163 @@
+From: pdx203 <noreply@anthropic.com>
+Subject: bridge: metal2vulkan patch 0032, landscape frames without a copy in and turn each
+
+Carries bridge/patches/0032-rotated-framebuffer-carry-and-one-copy-back.patch, applied after 0031: a rotated (framebuffer-only) texture's image
+carries across command buffers while no other encoder ended with it, so a landscape frame no longer copies the whole
+plane in and turns it; and its copy back is one copy of the staged span (the rows' padding included) instead of one
+region per row (2560 blits on Turnip). Landscape frames cost ~30 ms of GPU against ~3 ms in portrait.
+
+diff --git a/bridge/patches/0032-rotated-framebuffer-carry-and-one-copy-back.patch b/bridge/patches/0032-rotated-framebuffer-carry-and-one-copy-back.patch
+new file mode 100644
+--- /dev/null
++++ b/bridge/patches/0032-rotated-framebuffer-carry-and-one-copy-back.patch
+@@ -0,0 +1,150 @@
++diff --git a/crates/metal2vulkan-runtime/src/rotated.rs b/crates/metal2vulkan-runtime/src/rotated.rs
++--- a/crates/metal2vulkan-runtime/src/rotated.rs
+++++ b/crates/metal2vulkan-runtime/src/rotated.rs
++@@ -45,7 +45,7 @@
++ use super::error::{internal, Error, RuntimeGap};
++ use super::owned_kernel::{OwnedKernel, OwnedModule, OwnedSets};
++ use super::row_copies::RowCopies;
++-use super::shadow::{self, ShadowStaging};
+++use super::shadow::ShadowStaging;
++ use super::tracker::Barrier;
++ use super::values::{CpuCacheMode, HazardTrackingMode, ResourceOptions, StorageMode};
++ use super::Device;
++@@ -124,6 +124,20 @@
++     pub(super) span: u64,
++ }
++ 
+++/// Where a rotated texture's image last stood holding the truth at an encoder's end, carried
+++/// across command buffers (pdx203): the shadow's [`touched`](super::shadow::ShadowCopies::touched)
+++/// after that end, and the rectangles the encoder left held and stale. A rotated texture is
+++/// framebuffer-only, so neither the CPU nor a blit writes its plane through Metal; the display's
+++/// framebuffers are written by their own passes alone. So a later command buffer's first use takes
+++/// the image as it stood instead of copying the plane in again (QuartzCore's landscape frames: a
+++/// full copy in and turn every frame, ~30 ms of GPU per frame on an Adreno 650).
+++#[derive(Clone, Copy)]
+++pub(super) struct LastStanding {
+++    pub(super) touched: u64,
+++    pub(super) held: Option<[u32; 4]>,
+++    pub(super) stale: Option<[u32; 4]>,
+++}
+++
++ /// One direction of the kernel's moves: its shape, where it lies in the shape buffer, and the
++ /// dispatch's workgroups.
++ struct Move {
++@@ -154,6 +168,9 @@
++     apart: bool,
++     kernel: OwnedKernel,
++     sets: OwnedSets,
+++    /// The image's last standing at an encoder's end, carried across command buffers
+++    /// ([`LastStanding`]); `None` where the last encoder that used it did not end holding it.
+++    pub(super) lasting: std::sync::Mutex<Option<LastStanding>>,
++ }
++ 
++ impl RotatedCopies {
++@@ -287,6 +304,7 @@
++             apart: loads_apart(rotation, [width, height]),
++             kernel,
++             sets,
+++            lasting: std::sync::Mutex::new(None),
++         })
++     }
++ 
++@@ -362,7 +380,18 @@
++                     &self.regions,
++                 );
++             } else {
++-                shadow::record_back(device, command_buffer, (staging, bytes), back);
+++                // pdx203: the staged plane goes back as one copy of its whole span, the bytes
+++                // between rows included, instead of a copy of each row (`back`, 2560 regions
+++                // for a landscape framebuffer, each its own blit on Turnip). Those bytes are the
+++                // rows' padding, which a framebuffer-only texture's plane gives no other meaning:
+++                // the staging buffer holds them as the copy in read them, or as the kernel wrote.
+++                let _ = back;
+++                let whole = vk::BufferCopy {
+++                    src_offset: staging.into.dst_offset,
+++                    dst_offset: staging.into.src_offset,
+++                    size: staging.into.size,
+++                };
+++                device.cmd_copy_buffer(command_buffer, staging.raw(), bytes, &[whole]);
++             }
++         }
++     }
++diff --git a/crates/metal2vulkan-runtime/src/shadow.rs b/crates/metal2vulkan-runtime/src/shadow.rs
++--- a/crates/metal2vulkan-runtime/src/shadow.rs
+++++ b/crates/metal2vulkan-runtime/src/shadow.rs
++@@ -188,7 +188,7 @@
++ use super::dirty_pages::{CopyInGate, ShadowLog};
++ use super::error::{Error, RuntimeGap};
++ use super::resource::ResourceKey;
++-use super::rotated::{RotatedCopies, Turn};
+++use super::rotated::{LastStanding, RotatedCopies, Turn};
++ use super::row_copies::RowCopies;
++ use super::shadow_copy_back::{CopyBack, WordView};
++ use super::shadow_merge::{ScratchSpares, ShadowMerge, UnormView};
++@@ -707,6 +707,14 @@
++     }
++ 
++     /// The shadow of a buffer's bytes, or `None` for an image's and for converted texels'.
+++    /// A rotated texture's copies, where this is its turned image's shadow (`rotated.rs`).
+++    pub(super) fn rotated(&self) -> Option<&RotatedCopies> {
+++        match self.target() {
+++            Some(ShadowTarget::Rotated { turn, .. }) => Some(turn),
+++            _ => None,
+++        }
+++    }
+++
++     pub(super) fn target(&self) -> Option<&ShadowTarget> {
++         match &self.source {
++             ShadowSource::Bytes { target, .. } => Some(target),
++@@ -2493,6 +2501,18 @@
++         carry.entries.append(&mut self.carry.entries);
++         for entry in &self.entries {
++             let touched = entry.copies.touched.fetch_add(1, Ordering::Relaxed);
+++            // pdx203: a rotated texture's image carries across command buffers while no other
+++            // encoder ended with it in between ([`LastStanding`]).
+++            if let Some(turn) = entry.copies.rotated() {
+++                let mut lasting = turn.lasting.lock().unwrap_or_else(|e| e.into_inner());
+++                *lasting = (entry.standing == Standing::Current && touched == entry.met).then_some(
+++                    LastStanding {
+++                        touched: touched + 1,
+++                        held: entry.held,
+++                        stale: entry.stale,
+++                    },
+++                );
+++            }
++             if entry.standing != Standing::Current {
++                 continue;
++             }
++@@ -2660,10 +2680,20 @@
++                     .position(|carried| carried.copies.shadow_key == copies.shadow_key)
++                     .map(|at| self.carry.entries.swap_remove(at))
++                     .filter(|carried| carried.touched == met);
++-                let (standing, held, stale) = match &carried {
++-                    Some(carried) => (Standing::Current, carried.held, carried.stale),
++-                    None => (Standing::Unread, None, None),
+++                // pdx203: else a rotated texture's image as it last stood at an encoder's end, in
+++                // an earlier command buffer, where no encoder ended with it since.
+++                let lasting = match &carried {
+++                    Some(_) => None,
+++                    None => copies.rotated().and_then(|turn| {
+++                        let lasting = turn.lasting.lock().unwrap_or_else(|e| e.into_inner());
+++                        lasting.filter(|last| last.touched == met)
+++                    }),
++                 };
+++                let (standing, held, stale) = match (&carried, lasting) {
+++                    (Some(carried), _) => (Standing::Current, carried.held, carried.stale),
+++                    (None, Some(last)) => (Standing::Current, last.held, last.stale),
+++                    (None, None) => (Standing::Unread, None, None),
+++                };
++                 self.entries.push(Entry {
++                     copies: Arc::clone(copies),
++                     standing,
++@@ -2675,7 +2705,7 @@
++                     scratch: None,
++                     stale,
++                     met,
++-                    carried: carried.is_some(),
+++                    carried: carried.is_some() || lasting.is_some(),
++                 });
++                 self.entries.len() - 1
++             }
