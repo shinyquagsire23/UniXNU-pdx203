@@ -1,0 +1,85 @@
+From: pdx203 <noreply@anthropic.com>
+Subject: gpu: 8 GiB aperture, sixteen client windows
+
+The GPU context's aperture is 8 GiB (33 input bits; the SMMU context takes the least input size that holds its range),
+the phone's RAM: a window is only a ceiling, the physical pool stays the limit. Sixteen windows instead of eleven: the
+render server's 1984 MiB (1216), six large ones of 768 MiB (three of 640) and nine small ones of 160 MiB (seven of 128).
+The level-1 tables are 4105 pages (16 MiB, 2053 for 4 GiB). The board publishes 33 input bits and va_size to 8 GiB.
+
+diff --git a/NativeAdrenoGpuContext.h b/NativeAdrenoGpuContext.h
+--- a/NativeAdrenoGpuContext.h
++++ b/NativeAdrenoGpuContext.h
+@@ -19,8 +19,9 @@
+ enum : uint64_t {
+     GpuSqeIova=0x2000000, GpuRingIova=0x2100000, GpuMemptrsIova=0x2200000, GpuPwrupIova=0x2201000,
+     GpuScratchIova=0x2202000,
+-    /* pdx203 sa54: 4 GiB (2 GiB before): the WebKit GPU process filled a 256 MiB window with surface imports (sa53). */
+-    GpuApertureBytes=0x100000000ull
++    /* pdx203 sa54: 4 GiB (2 GiB before): the WebKit GPU process filled a 256 MiB window with surface imports (sa53).
++     * 2026-11-06: 8 GiB (33 input bits), the phone's RAM: sixteen client windows, six of them 768 MiB (NativeAdrenoPublish.cpp). */
++    GpuApertureBytes=0x200000000ull
+ };
+ enum : size_t {GpuSqeBytes=0x13000, GpuRingBytes=0x8000, GpuPageBytes=0x1000, GpuBufferCount=5};
+ struct NativeAdrenoGpuBuffer {uint64_t physical,bytes,iova;};
+@@ -34,7 +35,7 @@
+     bool ready_=false,used_=false;
+ public:
+     enum Step : uint32_t {Allocate=1,Prepare,Program,Attach,VmAttach,Map,Ready};
+-    enum : size_t {TablePages=2053};   /* 4 GiB of 4 KiB pages from level 1: 1 + 4 + 2048 tables (2 GiB: 1027) */
++    enum : size_t {TablePages=4105};   /* 8 GiB of 4 KiB pages from level 1: 1 + 8 + 4096 tables (4 GiB: 2053, 2 GiB: 1027) */
+     NativeAdrenoGpuContext()=default;
+     NativeAdrenoGpuContext(const NativeAdrenoGpuContext &)=delete;
+     NativeAdrenoGpuContext &operator=(const NativeAdrenoGpuContext &)=delete;
+diff --git a/NativeAdrenoPublish.cpp b/NativeAdrenoPublish.cpp
+--- a/NativeAdrenoPublish.cpp
++++ b/NativeAdrenoPublish.cpp
+@@ -154,12 +154,17 @@
+ /* sa56: every process may run the Metal plugin (a deny list replaces the allow list of four), so eleven windows: the render server's 1216 MiB,
+  * three large ones of 640 MiB (slots 1-3; WebKit's GPU process takes these first: it needed more than 256 MiB) and seven small ones of 128 MiB
+  * (slots 4-10; every other process takes these first, then a large one). A process that finds none free gets no device and draws on the CPU. */
+-enum : unsigned {NativeAdrenoMaxClients=11,NativeAdrenoFirstSmallSlot=4};
++/* 2026-11-06: the aperture is 8 GiB (the phone's RAM; the physical pool stays the real limit, a window is only a ceiling): sixteen windows,
++ * the render server's 1984 MiB, six large ones of 768 MiB (slots 1-6: WebKit and installed apps first; Dusk used 557 MiB of a 640 MiB
++ * one) and nine small ones of 160 MiB (slots 7-15). */
++enum : unsigned {NativeAdrenoMaxClients=16,NativeAdrenoFirstSmallSlot=7};
+ static const struct {uint64_t start,bytes;} kClientWindows[NativeAdrenoMaxClients]={
+-    {0x04000000ull,0x4C000000ull},
+-    {0x50000000ull,0x28000000ull},{0x78000000ull,0x28000000ull},{0xA0000000ull,0x28000000ull},
+-    {0xC8000000ull,0x08000000ull},{0xD0000000ull,0x08000000ull},{0xD8000000ull,0x08000000ull},{0xE0000000ull,0x08000000ull},
+-    {0xE8000000ull,0x08000000ull},{0xF0000000ull,0x08000000ull},{0xF8000000ull,0x08000000ull}};
++    {0x004000000ull,0x07C000000ull},
++    {0x080000000ull,0x030000000ull},{0x0B0000000ull,0x030000000ull},{0x0E0000000ull,0x030000000ull},
++    {0x110000000ull,0x030000000ull},{0x140000000ull,0x030000000ull},{0x170000000ull,0x030000000ull},
++    {0x1A0000000ull,0x00A000000ull},{0x1AA000000ull,0x00A000000ull},{0x1B4000000ull,0x00A000000ull},{0x1BE000000ull,0x00A000000ull},
++    {0x1C8000000ull,0x00A000000ull},{0x1D2000000ull,0x00A000000ull},{0x1DC000000ull,0x00A000000ull},{0x1E6000000ull,0x00A000000ull},
++    {0x1F0000000ull,0x00A000000ull}};
+ 
+ /* pdx203 0005: native_adreno_note_property_read's log of other processes' reads. */
+ extern "C" {char native_adreno_property_log[16][48];uint32_t native_adreno_property_log_repeat[16];volatile uint32_t native_adreno_property_log_count;}
+diff --git a/NativeAdrenoSmmuContext.cpp b/NativeAdrenoSmmuContext.cpp
+--- a/NativeAdrenoSmmuContext.cpp
++++ b/NativeAdrenoSmmuContext.cpp
+@@ -12,7 +12,10 @@
+     if(!tables || upper>1 || !bytes || (iova&4095) || !leaf_budget || leaf_budget>MaxLeaves ||
+         bank>63 || asid>0xffff || !poll_budget || poll_budget>4096)
+         return kIOReturnBadArgument;
+-    const IOReturn prepared=NativeAdrenoPrepareSmmuMemory(tables,32,output_bits,iova,bytes,upper,leaf_budget,
++    /* The least input size (32 at least) whose range holds [iova, iova+bytes): 33 bits for the GPU's 8 GiB aperture. */
++    unsigned input_bits=32;
++    while(input_bits<48 && iova+bytes>(UINT64_C(1)<<input_bits))++input_bits;
++    const IOReturn prepared=NativeAdrenoPrepareSmmuMemory(tables,input_bits,output_bits,iova,bytes,upper,leaf_budget,
+         &arena_,&state_,&visibility_);
+     if(prepared!=kIOReturnSuccess)return prepared==kIOReturnNoResources?prepared:kIOReturnBadArgument;
+     config_=(ArmSmmu4KContextConfig){.lower=upper?nullptr:&arena_.config,.upper=upper?&arena_.config:nullptr,
+diff --git a/NativeAdrenoSmmuContext.h b/NativeAdrenoSmmuContext.h
+--- a/NativeAdrenoSmmuContext.h
++++ b/NativeAdrenoSmmuContext.h
+@@ -31,7 +31,7 @@
+     NativeAdrenoSmmuContext(const NativeAdrenoSmmuContext &)=delete;
+     NativeAdrenoSmmuContext &operator=(const NativeAdrenoSmmuContext &)=delete;
+     /* A 2 GiB lower aperture, the GMU's, is 524288 leaves. */
+-    enum : size_t {MaxLeaves=size_t(1)<<20};   /* the GPU's 4 GiB (pdx203 sa54); the GMU's 2 GiB passes 1<<19 itself */
++    enum : size_t {MaxLeaves=size_t(1)<<21};   /* the GPU's 8 GiB (pdx203, 4 GiB in sa54); the GMU's 2 GiB passes 1<<19 itself */
+     /* iova/bytes describe the aperture in the chosen region; the pool must be contiguous. */
+     /* output_bits: the context's output size, at most the SMMU's ID2.OAS (Linux uses OAS for stage 1). */
+     IOReturn prepare(NativeAdrenoMemory *tables,unsigned upper,uint64_t iova,size_t bytes,

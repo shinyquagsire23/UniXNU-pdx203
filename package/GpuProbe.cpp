@@ -1155,7 +1155,7 @@ bool gpuInterrupt() {
 // below the 2 GiB aperture, and the UBWC facts hw_init programs (highest bank bit 16; swizzle levels 2 and 3, as Linux's default
 // for every A6XX but the A610; eight-channel macrotiles: RBBM_NC_MODE_CNTL reads 1 at reset here (2026-10-24), and Linux's
 // ubwc_config for the SM8250 has macrotile_mode set; UBWC 4.0 of the SM8250).
-NativeAdrenoAbiDeviceInfo kDeviceInfo = {0x06050002u, 0x120000u, 0, 0x1fffffffff000ull, 0x04000000ull, 0xFC000000ull,
+NativeAdrenoAbiDeviceInfo kDeviceInfo = {0x06050002u, 0x120000u, 0, 0x1fffffffff000ull, 0x04000000ull, 0x1FC000000ull,
                                          16, 6, 1, 4, NativeAdrenoDeviceClientIova, 0};
 NativeAdrenoSubmit *gSubmit;
 NativeAdrenoTimer *gTimer;
@@ -1182,8 +1182,9 @@ bool publish() {
     kDeviceInfo.gmem_base = gUcheGmem16M ? 0x1000000 : 0;
     p[0] = uint32_t(gSubmit->attach(vm, gRing));
     p[1] = uint32_t(gTimer->attach(&gTimerIo, NativeAdrenoTimeCp));
-    // 32 input bits: the GPU context's 4 GiB aperture (NativeAdreno 0007, pdx203 sa54); with 31 every window above 2 GiB was refused.
-    p[2] = uint32_t(native_adreno_publish(vm, gSubmit, gRing, &gClock, p[1] ? nullptr : gTimer, &kDeviceInfo, 32,
+    // 33 input bits: the GPU context's 8 GiB aperture (2026-11-06; 32 for 4 GiB in sa54, NativeAdreno 0007): with fewer every window above
+    // the limit is refused (31 refused all above 2 GiB). kDeviceInfo's va_size runs to the same 8 GiB.
+    p[2] = uint32_t(native_adreno_publish(vm, gSubmit, gRing, &gClock, p[1] ? nullptr : gTimer, &kDeviceInfo, 33,
                                           native_gpu_context.output_bits));
     publishRow(p[0] || p[2] ? "failed" : "ok");
     return !p[0] && !p[2];
