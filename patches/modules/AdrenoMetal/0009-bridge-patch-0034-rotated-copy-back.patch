@@ -1,0 +1,439 @@
+From: pdx203 <noreply@anthropic.com>
+Subject: bridge: metal2vulkan patch 0034, landscape copy back as one dispatch
+
+Carries bridge/patches/0034-rotated-copy-back-one-dispatch.patch: a rotated texture's twin takes an R32_UINT view, and its copy back is one
+dispatch of a new owned kernel (RotatedCopyBack, GLSL in owned_kernel.rs) that fetches the twin at each stored texel's turned
+position and stores the plane's words in order, instead of copy to the tight buffer, the gather kernel and the staged copy.
+Measured before it (bridge 0033 timing switch): a landscape frame 17.2 ms of GPU with the copy back, 1.7 ms without.
+
+diff --git a/bridge/patches/0034-rotated-copy-back-one-dispatch.patch b/bridge/patches/0034-rotated-copy-back-one-dispatch.patch
+new file mode 100644
+--- /dev/null
++++ b/bridge/patches/0034-rotated-copy-back-one-dispatch.patch
+@@ -0,0 +1,426 @@
++diff --git a/crates/metal2vulkan-runtime/src/owned_kernel.rs b/crates/metal2vulkan-runtime/src/owned_kernel.rs
++--- a/crates/metal2vulkan-runtime/src/owned_kernel.rs
+++++ b/crates/metal2vulkan-runtime/src/owned_kernel.rs
++@@ -93,6 +93,10 @@
++     /// `bind::rows_copy_module`: many equal rows of words copied from one buffer into another by
++     /// a dispatch, in place of a copy's region per row (`row_copies.rs`).
++     RowsCopy,
+++    /// pdx203 (bridge 0034): a rotated texture's frame image turned straight into its plane's bytes
+++    /// by one dispatch ([`ROTATED_COPY_BACK_SPIRV`], `rotated.rs`): the frame's `R32_UINT` view is
+++    /// its sampled image, the plane's bytes its storage buffer.
+++    RotatedCopyBack,
++     /// `bind::shadow_merge_image_module` of one read of a texel (`ShadowMergeRead`): a shadowed
++     /// texture's writes merged into its buffer's bytes, reading its shadow's texels through its
++     /// unsigned-integer view or its own 8-bit unsigned normalized view, its sampled image
++@@ -196,7 +200,9 @@
++     fn images(self) -> u32 {
++         match self {
++             OwnedModule::MipmapFilter(kernel) => u32::from(kernel.fetches()),
++-            OwnedModule::ShadowCopyBack(_) | OwnedModule::ShadowMergeImage(..) => 1,
+++            OwnedModule::ShadowCopyBack(_)
+++            | OwnedModule::ShadowMergeImage(..)
+++            | OwnedModule::RotatedCopyBack => 1,
++             OwnedModule::ShadowMergeKeptImage(..) => 2,
++             // The combined image sampler of the planes' (or pairs') image.
++             OwnedModule::YCbCrSample(..) | OwnedModule::ChromaSample(_) => 1,
++@@ -212,6 +218,7 @@
++         matches!(
++             self,
++             OwnedModule::RowsCopy
+++                | OwnedModule::RotatedCopyBack
++                 | OwnedModule::ShadowCopyBack(_)
++                 | OwnedModule::ShadowCopyIn(_)
++                 | OwnedModule::ShadowMerge(_)
++@@ -325,6 +332,7 @@
++                 let push_bytes = metal2vulkan::bind::ShadowCopyBackModule::PUSH_BYTES;
++                 Ok((module.spirv.to_vec(), 1, push_bytes))
++             }
+++            OwnedModule::RotatedCopyBack => Ok((ROTATED_COPY_BACK_SPIRV.to_vec(), 1, ROTATED_COPY_BACK_PUSH_BYTES)),
++             OwnedModule::RowsCopy => {
++                 let module = metal2vulkan::bind::rows_copy_module(device.compile_device())
++                     .map_err(Error::Compile)?;
++@@ -558,6 +566,7 @@
++     index_rewrite_runs: HashMap<RewriteProgram, OwnedKernel>,
++     rotate_texels: Option<OwnedKernel>,
++     rows_copy: Option<OwnedKernel>,
+++    rotated_copy_back: Option<OwnedKernel>,
++     ycbcr_refresh: Option<OwnedKernel>,
++     ycbcr_converts: HashMap<(YCbCrConversion, bool), OwnedKernel>,
++     ycbcr_samples: HashMap<(YCbCrSampler, YCbCrCodes), OwnedKernel>,
++@@ -604,6 +613,7 @@
++             self.plane_copy,
++             self.rotate_texels,
++             self.rows_copy,
+++            self.rotated_copy_back,
++             self.ycbcr_refresh,
++             self.two_plane_texels,
++             self.plane_bytes_copy,
++@@ -786,6 +796,7 @@
++             OwnedModule::PlaneCopy => &mut self.plane_copy,
++             OwnedModule::RotateTexels => &mut self.rotate_texels,
++             OwnedModule::RowsCopy => &mut self.rows_copy,
+++            OwnedModule::RotatedCopyBack => &mut self.rotated_copy_back,
++             OwnedModule::YCbCrRefresh => &mut self.ycbcr_refresh,
++ 
++             OwnedModule::TwoPlaneTexels => &mut self.two_plane_texels,
++@@ -1265,3 +1276,102 @@
++         }
++     }
++ }
+++
+++/// pdx203 (bridge 0034): the push bytes of [`OwnedModule::RotatedCopyBack`]: the map `m00, m01, m02,
+++/// m10, m11, m12` (`i32`, `rotated::source_map` of `Turn::Store`), then the stored `width`, `height`,
+++/// the plane's `row_words` and its first texel's `first_word` in the storage binding (`u32`).
+++pub(super) const ROTATED_COPY_BACK_PUSH_BYTES: u32 = 40;
+++
+++/// pdx203 (bridge 0034): [`OwnedModule::RotatedCopyBack`]'s SPIR-V, `glslc --target-env=vulkan1.1 -O`
+++/// of this GLSL (local size 64 x 1 x 1; invocation `(x, y)` of the stored extent):
+++///
+++/// ```glsl
+++/// #version 450
+++/// #extension GL_EXT_samplerless_texture_functions : require
+++/// layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+++/// layout(set = 0, binding = 0) uniform utexture2D frame;
+++/// layout(set = 0, binding = 1, std430) writeonly buffer Bytes { uint words[]; } bytes;
+++/// layout(push_constant, std430) uniform Shape {
+++///     int m00; int m01; int m02; int m10; int m11; int m12;
+++///     uint width; uint height; uint row_words; uint first_word;
+++/// } shape;
+++/// void main() {
+++///     uint x = gl_GlobalInvocationID.x, y = gl_GlobalInvocationID.y;
+++///     if (x >= shape.width || y >= shape.height) return;
+++///     ivec2 p = ivec2(int(x), int(y));
+++///     ivec2 source = ivec2(shape.m00 * p.x + shape.m01 * p.y + shape.m02,
+++///                          shape.m10 * p.x + shape.m11 * p.y + shape.m12);
+++///     bytes.words[shape.first_word + y * shape.row_words + x] = texelFetch(frame, source, 0).r;
+++/// }
+++/// ```
+++pub(super) const ROTATED_COPY_BACK_SPIRV: &[u32] = &[
+++    0x07230203, 0x00010300, 0x000d000b, 0x00000076, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
+++    0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
+++    0x0006000f, 0x00000005, 0x00000004, 0x6e69616d, 0x00000000, 0x0000000b, 0x00060010, 0x00000004,
+++    0x00000011, 0x00000040, 0x00000001, 0x00000001, 0x00040047, 0x0000000b, 0x0000000b, 0x0000001c,
+++    0x00050048, 0x00000017, 0x00000000, 0x00000023, 0x00000000, 0x00050048, 0x00000017, 0x00000001,
+++    0x00000023, 0x00000004, 0x00050048, 0x00000017, 0x00000002, 0x00000023, 0x00000008, 0x00050048,
+++    0x00000017, 0x00000003, 0x00000023, 0x0000000c, 0x00050048, 0x00000017, 0x00000004, 0x00000023,
+++    0x00000010, 0x00050048, 0x00000017, 0x00000005, 0x00000023, 0x00000014, 0x00050048, 0x00000017,
+++    0x00000006, 0x00000023, 0x00000018, 0x00050048, 0x00000017, 0x00000007, 0x00000023, 0x0000001c,
+++    0x00050048, 0x00000017, 0x00000008, 0x00000023, 0x00000020, 0x00050048, 0x00000017, 0x00000009,
+++    0x00000023, 0x00000024, 0x00030047, 0x00000017, 0x00000002, 0x00040047, 0x00000059, 0x00000006,
+++    0x00000004, 0x00040048, 0x0000005a, 0x00000000, 0x00000019, 0x00050048, 0x0000005a, 0x00000000,
+++    0x00000023, 0x00000000, 0x00030047, 0x0000005a, 0x00000002, 0x00040047, 0x0000005c, 0x00000022,
+++    0x00000000, 0x00040047, 0x0000005c, 0x00000021, 0x00000001, 0x00040047, 0x0000006a, 0x00000022,
+++    0x00000000, 0x00040047, 0x0000006a, 0x00000021, 0x00000000, 0x00040047, 0x00000073, 0x0000000b,
+++    0x00000019, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00040015, 0x00000006,
+++    0x00000020, 0x00000000, 0x00040017, 0x00000009, 0x00000006, 0x00000003, 0x00040020, 0x0000000a,
+++    0x00000001, 0x00000009, 0x0004003b, 0x0000000a, 0x0000000b, 0x00000001, 0x0004002b, 0x00000006,
+++    0x0000000c, 0x00000000, 0x00040020, 0x0000000d, 0x00000001, 0x00000006, 0x0004002b, 0x00000006,
+++    0x00000011, 0x00000001, 0x00020014, 0x00000014, 0x00040015, 0x00000016, 0x00000020, 0x00000001,
+++    0x000c001e, 0x00000017, 0x00000016, 0x00000016, 0x00000016, 0x00000016, 0x00000016, 0x00000016,
+++    0x00000006, 0x00000006, 0x00000006, 0x00000006, 0x00040020, 0x00000018, 0x00000009, 0x00000017,
+++    0x0004003b, 0x00000018, 0x00000019, 0x00000009, 0x0004002b, 0x00000016, 0x0000001a, 0x00000006,
+++    0x00040020, 0x0000001b, 0x00000009, 0x00000006, 0x0004002b, 0x00000016, 0x00000023, 0x00000007,
+++    0x00040017, 0x0000002b, 0x00000016, 0x00000002, 0x0004002b, 0x00000016, 0x00000034, 0x00000000,
+++    0x00040020, 0x00000035, 0x00000009, 0x00000016, 0x0004002b, 0x00000016, 0x0000003c, 0x00000001,
+++    0x0004002b, 0x00000016, 0x00000043, 0x00000002, 0x0004002b, 0x00000016, 0x00000047, 0x00000003,
+++    0x0004002b, 0x00000016, 0x0000004d, 0x00000004, 0x0004002b, 0x00000016, 0x00000054, 0x00000005,
+++    0x0003001d, 0x00000059, 0x00000006, 0x0003001e, 0x0000005a, 0x00000059, 0x00040020, 0x0000005b,
+++    0x0000000c, 0x0000005a, 0x0004003b, 0x0000005b, 0x0000005c, 0x0000000c, 0x0004002b, 0x00000016,
+++    0x0000005d, 0x00000009, 0x0004002b, 0x00000016, 0x00000061, 0x00000008, 0x00090019, 0x00000068,
+++    0x00000006, 0x00000001, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x00000000, 0x00040020,
+++    0x00000069, 0x00000000, 0x00000068, 0x0004003b, 0x00000069, 0x0000006a, 0x00000000, 0x00040017,
+++    0x0000006d, 0x00000006, 0x00000004, 0x00040020, 0x00000070, 0x0000000c, 0x00000006, 0x0004002b,
+++    0x00000006, 0x00000072, 0x00000040, 0x0006002c, 0x00000009, 0x00000073, 0x00000072, 0x00000011,
+++    0x00000011, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005,
+++    0x000300f7, 0x00000074, 0x00000000, 0x000300fb, 0x0000000c, 0x00000075, 0x000200f8, 0x00000075,
+++    0x00050041, 0x0000000d, 0x0000000e, 0x0000000b, 0x0000000c, 0x0004003d, 0x00000006, 0x0000000f,
+++    0x0000000e, 0x00050041, 0x0000000d, 0x00000012, 0x0000000b, 0x00000011, 0x0004003d, 0x00000006,
+++    0x00000013, 0x00000012, 0x00050041, 0x0000001b, 0x0000001c, 0x00000019, 0x0000001a, 0x0004003d,
+++    0x00000006, 0x0000001d, 0x0000001c, 0x000500ae, 0x00000014, 0x0000001e, 0x0000000f, 0x0000001d,
+++    0x000400a8, 0x00000014, 0x0000001f, 0x0000001e, 0x000300f7, 0x00000021, 0x00000000, 0x000400fa,
+++    0x0000001f, 0x00000020, 0x00000021, 0x000200f8, 0x00000020, 0x00050041, 0x0000001b, 0x00000024,
+++    0x00000019, 0x00000023, 0x0004003d, 0x00000006, 0x00000025, 0x00000024, 0x000500ae, 0x00000014,
+++    0x00000026, 0x00000013, 0x00000025, 0x000200f9, 0x00000021, 0x000200f8, 0x00000021, 0x000700f5,
+++    0x00000014, 0x00000027, 0x0000001e, 0x00000075, 0x00000026, 0x00000020, 0x000300f7, 0x00000029,
+++    0x00000000, 0x000400fa, 0x00000027, 0x00000028, 0x00000029, 0x000200f8, 0x00000028, 0x000200f9,
+++    0x00000074, 0x000200f8, 0x00000029, 0x0004007c, 0x00000016, 0x0000002f, 0x0000000f, 0x0004007c,
+++    0x00000016, 0x00000031, 0x00000013, 0x00050041, 0x00000035, 0x00000036, 0x00000019, 0x00000034,
+++    0x0004003d, 0x00000016, 0x00000037, 0x00000036, 0x00050084, 0x00000016, 0x0000003b, 0x00000037,
+++    0x0000002f, 0x00050041, 0x00000035, 0x0000003d, 0x00000019, 0x0000003c, 0x0004003d, 0x00000016,
+++    0x0000003e, 0x0000003d, 0x00050084, 0x00000016, 0x00000041, 0x0000003e, 0x00000031, 0x00050080,
+++    0x00000016, 0x00000042, 0x0000003b, 0x00000041, 0x00050041, 0x00000035, 0x00000044, 0x00000019,
+++    0x00000043, 0x0004003d, 0x00000016, 0x00000045, 0x00000044, 0x00050080, 0x00000016, 0x00000046,
+++    0x00000042, 0x00000045, 0x00050041, 0x00000035, 0x00000048, 0x00000019, 0x00000047, 0x0004003d,
+++    0x00000016, 0x00000049, 0x00000048, 0x00050084, 0x00000016, 0x0000004c, 0x00000049, 0x0000002f,
+++    0x00050041, 0x00000035, 0x0000004e, 0x00000019, 0x0000004d, 0x0004003d, 0x00000016, 0x0000004f,
+++    0x0000004e, 0x00050084, 0x00000016, 0x00000052, 0x0000004f, 0x00000031, 0x00050080, 0x00000016,
+++    0x00000053, 0x0000004c, 0x00000052, 0x00050041, 0x00000035, 0x00000055, 0x00000019, 0x00000054,
+++    0x0004003d, 0x00000016, 0x00000056, 0x00000055, 0x00050080, 0x00000016, 0x00000057, 0x00000053,
+++    0x00000056, 0x00050050, 0x0000002b, 0x00000058, 0x00000046, 0x00000057, 0x00050041, 0x0000001b,
+++    0x0000005e, 0x00000019, 0x0000005d, 0x0004003d, 0x00000006, 0x0000005f, 0x0000005e, 0x00050041,
+++    0x0000001b, 0x00000062, 0x00000019, 0x00000061, 0x0004003d, 0x00000006, 0x00000063, 0x00000062,
+++    0x00050084, 0x00000006, 0x00000064, 0x00000013, 0x00000063, 0x00050080, 0x00000006, 0x00000065,
+++    0x0000005f, 0x00000064, 0x00050080, 0x00000006, 0x00000067, 0x00000065, 0x0000000f, 0x0004003d,
+++    0x00000068, 0x0000006b, 0x0000006a, 0x0007005f, 0x0000006d, 0x0000006e, 0x0000006b, 0x00000058,
+++    0x00000002, 0x00000034, 0x00050051, 0x00000006, 0x0000006f, 0x0000006e, 0x00000000, 0x00060041,
+++    0x00000070, 0x00000071, 0x0000005c, 0x00000034, 0x00000067, 0x0003003e, 0x00000071, 0x0000006f,
+++    0x000200f9, 0x00000074, 0x000200f8, 0x00000074, 0x000100fd, 0x00010038,
+++];
++diff --git a/crates/metal2vulkan-runtime/src/rotated.rs b/crates/metal2vulkan-runtime/src/rotated.rs
++--- a/crates/metal2vulkan-runtime/src/rotated.rs
+++++ b/crates/metal2vulkan-runtime/src/rotated.rs
++@@ -43,7 +43,9 @@
++ 
++ use super::buffer::Buffer;
++ use super::error::{internal, Error, RuntimeGap};
++-use super::owned_kernel::{OwnedKernel, OwnedModule, OwnedSets};
+++use super::owned_kernel::{
+++    OwnedBinds, OwnedKernel, OwnedModule, OwnedSet, OwnedSets, ROTATED_COPY_BACK_PUSH_BYTES,
+++};
++ use super::row_copies::RowCopies;
++ use super::shadow::ShadowStaging;
++ use super::tracker::Barrier;
++@@ -166,6 +168,81 @@
++         let on = |name: &str| std::path::Path::new("/private/var/ngpu/debug").join(name).exists();
++         [on("rot-skip-in"), on("rot-skip-back")]
++     })
+++}
+++
+++/// pdx203 (bridge 0034): a copy back as one dispatch of `OwnedModule::RotatedCopyBack`: the frame
+++/// image's `R32_UINT` view fetched at the turned position of each texel of the stored frame and
+++/// stored straight into the plane's bytes, in order, instead of the image copied into the tight
+++/// buffer, turned by the gather kernel into the staging buffer, and that copied into the plane
+++/// (~15 ms of an Adreno 650's frame in landscape, against ~1.5 ms for the frame's own passes). Its
+++/// set binds the plane's `VkBuffer` as it lay when the texture was made; a copy back whose
+++/// `VkBuffer` is another (a rebind moved the plane's pages) takes the copies as before. It writes
+++/// the plane's texels and no other byte.
+++struct FastBack {
+++    kernel: OwnedKernel,
+++    binds: OwnedBinds,
+++    bytes: vk::Buffer,
+++    shape: [u8; ROTATED_COPY_BACK_PUSH_BYTES as usize],
+++    groups: [u32; 2],
+++}
+++
+++impl FastBack {
+++    /// The dispatch for `frame` turned into the plane whose first texel lies at byte `first` of
+++    /// `bytes`, reading the frame image through `view`; `None` where it does not fit (a texel of
+++    /// another width, a range past `maxStorageBufferRange`, a dispatch past the group counts) or
+++    /// the device makes no kernel or binds, which leaves the copies.
+++    fn new(device: &Device, frame: &Frame, (view, bytes): (vk::ImageView, vk::Buffer), first: u64) -> Option<FastBack> {
+++        if frame.texel_bytes != 4 || bytes == vk::Buffer::null() || !first.is_multiple_of(4) {
+++            return None;
+++        }
+++        let limits = &device.properties().description.limits;
+++        let [width, height] = frame.extent;
+++        let [stored_width, stored_height] = stored_extent(frame.rotation, [width, height]);
+++        let align = limits.min_storage_buffer_offset_alignment.max(4);
+++        let offset = first - first % align;
+++        let range = (first - offset) + frame.span.next_multiple_of(4);
+++        let groups = [stored_width.div_ceil(64), stored_height];
+++        if range > u64::from(limits.max_storage_buffer_range)
+++            || groups[0] > limits.max_compute_work_group_count[0]
+++            || groups[1] > limits.max_compute_work_group_count[1]
+++            || !frame.row_pitch.is_multiple_of(4)
+++        {
+++            return None;
+++        }
+++        let row_words = u32::try_from(frame.row_pitch / 4).ok()?;
+++        let first_word = u32::try_from((first - offset) / 4).ok()?;
+++        let map = source_map(frame.rotation, [width, height], Turn::Store);
+++        let mut shape = [0u8; ROTATED_COPY_BACK_PUSH_BYTES as usize];
+++        let words: [u32; 10] = [
+++            map[0] as u32,
+++            map[1] as u32,
+++            map[2] as u32,
+++            map[3] as u32,
+++            map[4] as u32,
+++            map[5] as u32,
+++            stored_width,
+++            stored_height,
+++            row_words,
+++            first_word,
+++        ];
+++        for (i, word) in words.iter().enumerate() {
+++            shape[4 * i..4 * i + 4].copy_from_slice(&word.to_le_bytes());
+++        }
+++        let kernel = device.owned_kernel(OwnedModule::RotatedCopyBack).ok()?;
+++        let set = OwnedSet {
+++            images: vec![view],
+++            storage_images: Vec::new(),
+++            buffers: vec![(bytes, offset, range)],
+++        };
+++        let binds = OwnedBinds::new(device, &kernel, &[set]).ok()?;
+++        Some(FastBack {
+++            kernel,
+++            binds,
+++            bytes,
+++            shape,
+++            groups,
+++        })
+++    }
++ }
++ 
++ /// One direction of the kernel's moves: its shape, where it lies in the shape buffer, and the
++@@ -201,6 +278,8 @@
++     /// The image's last standing at an encoder's end, carried across command buffers
++     /// ([`LastStanding`]); `None` where the last encoder that used it did not end holding it.
++     pub(super) lasting: std::sync::Mutex<Option<LastStanding>>,
+++    /// The copy back as one dispatch ([`FastBack`]), where the frame image has its word view.
+++    fast_back: Option<FastBack>,
++ }
++ 
++ impl RotatedCopies {
++@@ -214,7 +293,10 @@
++         staging: &ShadowStaging,
++         frame: Frame,
++         hazard: HazardTrackingMode,
+++        words: Option<(vk::ImageView, vk::Buffer)>,
++     ) -> Result<RotatedCopies, Error> {
+++        let fast_back =
+++            words.and_then(|words| FastBack::new(device, &frame, words, staging.into.src_offset));
++         let Frame {
++             rotation,
++             extent: [width, height],
++@@ -335,6 +417,7 @@
++             kernel,
++             sets,
++             lasting: std::sync::Mutex::new(None),
+++            fast_back,
++         })
++     }
++ 
++@@ -372,6 +455,27 @@
++             TURNS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++             return;
++         }
+++        // The copy back as one dispatch, over the plane's `VkBuffer` as the texture's set binds it.
+++        if let (false, Some(fast)) = (into, self.fast_back.as_ref().filter(|fast| fast.bytes == bytes)) {
+++            // SAFETY: the caller's contract; the set binds the frame image's view (in `GENERAL`)
+++            // and the plane's bytes the stored frame's texels lie in, and the shape and the
+++            // workgroups stay inside both (`FastBack::new`).
+++            unsafe {
+++                Barrier::everything().record(device, command_buffer);
+++                device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, fast.kernel.pipeline);
+++                fast.binds.bind(device, command_buffer, &fast.kernel, 0);
+++                device.cmd_push_constants(
+++                    command_buffer,
+++                    fast.kernel.layout,
+++                    vk::ShaderStageFlags::COMPUTE,
+++                    0,
+++                    &fast.shape,
+++                );
+++                device.cmd_dispatch(command_buffer, fast.groups[0], fast.groups[1], 1);
+++                Barrier::everything().record(device, command_buffer);
+++            }
+++            return;
+++        }
++         let (step, shape, set) = match turn {
++             Turn::Load => (&self.moves[0], &self.moves[0].shape, self.sets.sets[0]),
++             Turn::Keep => (&self.moves[0], &self.keep, self.sets.sets[0]),
++diff --git a/crates/metal2vulkan-runtime/src/buffer_texture.rs b/crates/metal2vulkan-runtime/src/buffer_texture.rs
++--- a/crates/metal2vulkan-runtime/src/buffer_texture.rs
+++++ b/crates/metal2vulkan-runtime/src/buffer_texture.rs
++@@ -1103,6 +1103,7 @@
++         identity: Identity,
++         rotation: u8,
++         extent: [u32; 2],
+++        words: Option<vk::ImageView>,
++     ) -> Result<ShadowCopies, Error> {
++         let layout = &self.layout;
++         let (buffer, at) = self.buffer.at_for(layout.offset, ReadApart::Texture);
++@@ -1120,6 +1121,7 @@
++             &staging,
++             frame,
++             hazard,
+++            words.map(|view| (view, buffer)),
++         )?);
++         let (bytes, tracked) = self.buffer.tracked(layout.offset..layout.end());
++         Ok(ShadowCopies {
++diff --git a/crates/metal2vulkan-runtime/src/texture/rotation.rs b/crates/metal2vulkan-runtime/src/texture/rotation.rs
++--- a/crates/metal2vulkan-runtime/src/texture/rotation.rs
+++++ b/crates/metal2vulkan-runtime/src/texture/rotation.rs
++@@ -234,7 +234,7 @@
++             extent: [stored_width, stored_height, depth],
++             ..*layout
++         };
++-        let image = self.copied_image(call, &frame, descriptor, rows.options())?;
+++        let (image, _) = self.copied_image(call, &frame, descriptor, rows.options(), false)?;
++         let mut copies = stored.shadow_copies(
++             image.raw.get(),
++             image.identity,
++@@ -274,10 +274,15 @@
++         layout: &TextureLayout,
++         rotation: u8,
++     ) -> Result<Storage, Error> {
++-        let image = self.copied_image(call, layout, descriptor, turned.options())?;
+++        let (image, words) = self.copied_image(call, layout, descriptor, turned.options(), true)?;
++         let [width, height, _] = layout.extent;
++-        let copies =
++-            turned.rotated_copies(image.raw.get(), image.identity, rotation, [width, height])?;
+++        let copies = turned.rotated_copies(
+++            image.raw.get(),
+++            image.identity,
+++            rotation,
+++            [width, height],
+++            words,
+++        )?;
++         self.degrade(Degradation::ShadowedTexture, || {
++             let object = format!(
++                 "a {width}x{height} {:?} texture of rotation {rotation} over an IOSurface plane",
++@@ -301,14 +306,18 @@
++     /// A private image of `layout` for `descriptor`'s usage, of the hazard tracking of `options`,
++     /// that copies take texels into and out of: a rotated texture's or its twin's. Refused as
++     /// `new_texture` refuses the image, and (`NotImplemented(RotatedTexture)`) where the device
++-    /// cannot copy its format.
+++    /// cannot copy its format. With `word` (pdx203, bridge 0034: the twin), a 4-byte texel's image
+++    /// also takes its `R32_UINT` view, sampled (`shadow_copy_back::with_word_view`), through
+++    /// which its copies back turn its texels straight into the plane (`rotated.rs`); `None`
+++    /// where the device makes no such view.
++     fn copied_image(
++         &self,
++         call: &'static str,
++         layout: &TextureLayout,
++         descriptor: &TextureDescriptor,
++         options: ResourceOptions,
++-    ) -> Result<Image, Error> {
+++        word: bool,
+++    ) -> Result<(Image, Option<ash::vk::ImageView>), Error> {
++         let facts = self
++             .shared()
++             .textures
++@@ -323,11 +332,33 @@
++         {
++             return Err(Error::NotImplemented(RuntimeGap::RotatedTexture));
++         }
+++        let (plan, word) = match word {
+++            true => super::super::shadow_copy_back::with_word_view(plan, &facts, false),
+++            false => (plan, None),
+++        };
++         let hazard = options.hazard_tracking_mode()?;
++         let private = TextureDescriptor {
++             resource_options: ResourceOptions::private(),
++             ..*descriptor
++         };
++-        self.new_image(plan, layout, &private, hazard)
+++        let image = self.new_image(plan, layout, &private, hazard)?;
+++        let words = word
+++            .filter(|&(_, texel, _)| texel == metal2vulkan::bind::ShadowTexelView::R32Uint)
+++            .and_then(|(format, _, _)| {
+++                image
+++                    .own_view(&super::super::binding_view::VkView {
+++                        view_type: metal2vulkan::vk::ImageViewType::TYPE_2D,
+++                        format,
+++                        components: metal2vulkan::vk::ComponentMapping::IDENTITY,
+++                        aspect: metal2vulkan::vk::ImageAspectFlags::COLOR,
+++                        base_level: 0,
+++                        level_count: 1,
+++                        base_layer: 0,
+++                        layer_count: 1,
+++                        usage: ImageUsageFlags::SAMPLED,
+++                    })
+++                    .ok()
+++            });
+++        Ok((image, words))
++     }
++ }
