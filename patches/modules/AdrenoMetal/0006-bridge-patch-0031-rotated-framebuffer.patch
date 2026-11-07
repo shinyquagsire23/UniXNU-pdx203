@@ -1,0 +1,33 @@
+From: pdx203 <noreply@anthropic.com>
+Subject: bridge: metal2vulkan patch 0031, the rotated framebuffer over a portrait panel
+
+Carries bridge/patches/0031-rotated-framebuffer-rows-on-ios.patch, which UniXNU's build-adreno-metal-bridge.py applies after
+0030: on iOS a rotated texture skips the macOS-measured pitch rule (covers_its_row). QuartzCore draws landscape into a rotation-3
+framebuffer-only texture of the landscape extent over the portrait panel's IOSurface, whose rows hold the portrait width; the rule
+refused it ("Failed to allocate [2560 x 1096] BGRA framebuffer") and landscape froze on stale frames.
+
+diff --git a/bridge/patches/0031-rotated-framebuffer-rows-on-ios.patch b/bridge/patches/0031-rotated-framebuffer-rows-on-ios.patch
+new file mode 100644
+--- /dev/null
++++ b/bridge/patches/0031-rotated-framebuffer-rows-on-ios.patch
+@@ -0,0 +1,20 @@
++diff --git a/crates/metal2vulkan-runtime/src/buffer_texture.rs b/crates/metal2vulkan-runtime/src/buffer_texture.rs
++--- a/crates/metal2vulkan-runtime/src/buffer_texture.rs
+++++ b/crates/metal2vulkan-runtime/src/buffer_texture.rs
++@@ -758,7 +758,15 @@
++     if !measured {
++         return Err(Error::NotImplemented(RuntimeGap::RotatedTexture));
++     }
++-    covers_its_row(texture).map_err(|problem| refusal_error(call, problem.into()))?;
+++    // On iOS the pitch rule is macOS's alone: QuartzCore's landscape framebuffer on a portrait
+++    // panel is a rotation-3 framebuffer-only texture of the landscape extent over the panel's
+++    // portrait IOSurface, whose rows hold the portrait width (`CA::OGL::MetalContext::get_surface`,
+++    // every iPad in landscape). Its passes render through the stored frame's rows (`turned`,
+++    // the plane's own pitch); only its CPU access and blits, which a framebuffer-only texture has
+++    // none of, address the plane at the texture's own wider rows.
+++    if !cfg!(target_os = "ios") {
+++        covers_its_row(texture).map_err(|problem| refusal_error(call, problem.into()))?;
+++    }
++     let [width, height, depth] = texture.layout.extent;
++     let [width, height] = rotated::stored_extent(rotation, [width, height]);
++     let stored = BufferTexture {
