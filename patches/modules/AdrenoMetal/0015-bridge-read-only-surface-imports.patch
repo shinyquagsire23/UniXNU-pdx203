@@ -1,0 +1,213 @@
+From: pdx203 <noreply@anthropic.com>
+Subject: bridge: import sample-only IOSurfaces read-only (metal2vulkan patch 0038)
+
+Carries bridge/patches/0038-read-only-views-on-ios.patch. The render server and WebKit's GPU process texture new IOSurfaces at
+every frame; each writable import cost NativeAdreno a cache clean and invalidate of all its pages when mapped and another
+invalidate when let go. A surface texture whose usage is only sampled (no render target, shader write or atomics) is now imported
+with Metal's private option bit 24, which the runtime turns into a read-only view of the pages; NativeAdreno pins those for reading
+only and maps them into the GPU read-only, so letting one go invalidates nothing. A sample-only ask may share a live writable
+import, never the reverse; a refused read-only import falls back to a writable one. Blits into a read-only import are counted and
+the first logged (their writes are dropped, as Metal's are). PDX203_SURFACE_RO=0 turns it off. Landscape TestUFO: unmap
+invalidate 559 -> 259 ms in 10 s, portrait 247 -> 100.
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index fa93745..23dc43e 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -919,6 +919,9 @@ static void waitForResource(id resource);
+ @property(nonatomic) NSUInteger heapOffset;
+ // A surface import's own surface object, which the runtime buffer retains until it is freed (surfaceBuffer); nullptr otherwise.
+ @property(nonatomic) IOSurfaceRef importedSurface;
++// pdx203 (0015): the surface import is read-only (Metal's private option bit 24, bridge 0038): the GPU maps it read-only and its writes
++// are dropped, so letting it go needs no CPU cache invalidation.
++@property(nonatomic) BOOL readOnlyImport;
+ @end
+ @interface NBTexture : NBObject
+ @property(nonatomic) NmbTexture *handle;
+@@ -940,6 +943,9 @@ static const bool gCountsSurfaceUse=!strcmp(getprogname(),"backboardd");
+ // it). The owner's release (Metal's deallocator, an IOSurface's mapping) waits for that, as Metal's does: run earlier, the owner could
+ // unmap or reuse pages the GPU still reads or writes.
+ static std::atomic<uint64_t> gNoCopyAll,gNoCopyMade,gNoCopyReleased,gSurfaceImportsMade,gSurfaceImportsReleased;
++// pdx203 (0015): read-only surface imports made, read-only asks served by a live writable import, read-only imports refused (made
++// writable instead), and blits encoded into a texture over a read-only import (their writes are dropped, as Metal's are).
++static std::atomic<uint64_t> gSurfaceReadOnlyMade,gSurfaceReadOnlyShared,gSurfaceReadOnlyRefused,gReadOnlyBlitWrites;
+ static void releaseBlock(void *context,void *pointer,uint64_t length) {
+  gNoCopyReleased++;
+  DetailSpan timing(6,(uintptr_t)pointer,blockInvoke((__bridge id)context),true);
+@@ -1017,24 +1023,43 @@ static void watchImportPressure() {
+ // The entry records the surface object the import itself retains, never the caller's: a hit may come with another object for the same
+ // surface, which nothing here retains, and a later prune read its retain count after the caller freed it (backboardd died on the isa
+ // authentication inside CFGetRetainCount, called from pruneHeldImports at a command buffer's completion).
++// pdx203 (0015): a read-only import is held under its identity with bit 63 set (IOSurface IDs are 32 bits), apart from a writable one.
++static constexpr uint64_t kReadOnlyIdentity=1ull<<63;
+ static void holdImport(uint64_t identity,uint64_t address,uint64_t bytes,NBBuffer *buffer,std::vector<NBBuffer *> &gone) {
+  pruneHeldImports(false,gone);
+  gHeldImports[{identity,address,bytes}]={buffer,buffer.importedSurface};
+ }
+-static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
++// pdx203 (0015): `readOnly` where every texture asked over the import only samples it (no render target, shader write or atomic usage).
++// The render server textures each client surface it composites at every frame, and most surfaces are new ones: a writable import cost
++// a clean and invalidate of all its pages when mapped and another invalidate when let go, about 1 s of kernel time in 10 s of landscape
++// TestUFO (VMPHASE, usb-478). A read-only one is cleaned when mapped and needs nothing when let go. A read-only ask takes a live
++// writable import of the surface where there is one; a writable ask never takes a read-only one (the runtime never shares a read-only
++// import either, bridge 0038).
++static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes,bool readOnly) {
+  struct Key {uint64_t identity,address,bytes;};
+- const Key value={IOSurfaceGetID(surface),(uintptr_t)base,bytes};
++ const uint64_t surfaceID=IOSurfaceGetID(surface);
++ const Key writable={surfaceID,(uintptr_t)base,bytes},value={surfaceID|(readOnly && surfaceID?kReadOnlyIdentity:0),(uintptr_t)base,bytes};
+  NSValue *key=value.identity?[NSValue valueWithBytes:&value objCType:@encode(Key)]:nil;
+  watchImportPressure();
+  std::vector<NBBuffer *> gone;   // declared before the lock: released after it
+  std::lock_guard<std::mutex> lock(gSurfaceImportLock);
+  if(!gSurfaceImports)gSurfaceImports=[NSMapTable strongToWeakObjectsMapTable];
+  NBBuffer *buffer=key?[gSurfaceImports objectForKey:key]:nil;
+- if(buffer){if(key)holdImport(value.identity,value.address,value.bytes,buffer,gone);return buffer;}
++ if(buffer){holdImport(value.identity,value.address,value.bytes,buffer,gone);return buffer;}
++ if(readOnly && key) {
++  NSValue *other=[NSValue valueWithBytes:&writable objCType:@encode(Key)];
++  if((buffer=[gSurfaceImports objectForKey:other])){gSurfaceReadOnlyShared++;holdImport(writable.identity,writable.address,writable.bytes,buffer,gone);return buffer;}
++ }
+  // The surface keeps its CPU mapping (the imported pages) until the import is freed.
+- NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,base,bytes,MTLResourceStorageModeShared,releaseSurface,(void *)CFRetain(surface));
++ const uint64_t kPrivateBit=1ull<<24;   // Metal's private option: the GPU's writes are dropped (bridge 0038)
++ NmbBuffer *handle=readOnly?nmb_buffer_new_no_copy_releasing(gDevice,base,bytes,MTLResourceStorageModeShared|kPrivateBit,releaseSurface,(void *)CFRetain(surface)):nullptr;
++ if(readOnly && !handle){CFRelease(surface);gSurfaceReadOnlyRefused++;}
++ bool madeReadOnly=handle!=nullptr;
++ Key made=madeReadOnly?value:writable;
++ if(!handle)handle=nmb_buffer_new_no_copy_releasing(gDevice,base,bytes,MTLResourceStorageModeShared,releaseSurface,(void *)CFRetain(surface));
+  if(!handle){CFRelease(surface);NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
+- gSurfaceImportsMade++;buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;buffer.importedSurface=surface;
++ gSurfaceImportsMade++;if(madeReadOnly)gSurfaceReadOnlyMade++;
++ buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;buffer.importedSurface=surface;buffer.readOnlyImport=madeReadOnly;
+  if(key) {
+   // Associations whose import is gone are pruned whenever the table has doubled since the last pruning; a live one is never evicted.
+   if(gSurfaceImports.count>=gSurfaceImportsPruned) {
+@@ -1042,8 +1067,8 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
+     if(![gSurfaceImports objectForKey:old])[gSurfaceImports removeObjectForKey:old];
+    gSurfaceImportsPruned=MAX(gSurfaceImports.count*2,(NSUInteger)64);
+   }
+-  [gSurfaceImports setObject:buffer forKey:key];
+-  holdImport(value.identity,value.address,value.bytes,buffer,gone);
++  [gSurfaceImports setObject:buffer forKey:[NSValue valueWithBytes:&made objCType:@encode(Key)]];
++  holdImport(made.identity,made.address,made.bytes,buffer,gone);
+  }
+  return buffer;
+ }
+@@ -1290,6 +1315,16 @@ static uint64_t flushSurfaces(NSMutableSet *surfaces) {
+  }
+  return flushed;
+ }
++// pdx203 (0015): whether `t`, or the texture it views, lies over a read-only surface import: a blit into it is counted (its writes are
++// dropped) and its first few named.
++static void noteReadOnlyBlit(id<MTLTexture> t,const char *what) {
++ for(id x=t;[x isKindOfClass:[NBTexture class]];x=((NBTexture *)x).parent) {
++  if(!((NBTexture *)x).buffer.readOnlyImport)continue;
++  if(gReadOnlyBlitWrites++<8)NBLOG(@"native-metal: %s into a read-only surface import (%lux%lu fmt %lu usage %lx): the GPU's writes are dropped",
++   what,(unsigned long)t.width,(unsigned long)t.height,(unsigned long)t.pixelFormat,(unsigned long)t.usage);
++  return;
++ }
++}
+ static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUInteger offset,NSUInteger row,bool surface) {
+  NmbTextureDescriptor descriptor;if(!buffer || !textureDescriptor(d,&descriptor))return nil;
+  NmbTexture *handle=nmb_texture_new_on_buffer(buffer.handle,&descriptor,offset,row,surface);
+@@ -2636,7 +2671,7 @@ static void blitNote(int kind,uint64_t amount){gBlitOps[kind][0]++;gBlitOps[kind
+               toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO {
+  if(![self textures:NB_OBJECTS(s,d) count:2])return;
+  const std::array<uint64_t,3> a={so.x,so.y,so.z},size={z.width,z.height,z.depth},b={dO.x,dO.y,dO.z};
+- blitNote(2,(uint64_t)z.width*z.height*z.depth);
++ blitNote(2,(uint64_t)z.width*z.height*z.depth);noteReadOnlyBlit(d,"copyFromTexture:toTexture:");
+  ENCODE([self check:nmb_blit_copy_texture(self.handle,[(NBTexture *)s handle],ss,sl,a.data(),size.data(),[(NBTexture *)d handle],ds,dl,b.data())
+                 what:"copyFromTexture:toTexture:"]);
+ }
+@@ -2683,7 +2718,7 @@ static void blitNote(int kind,uint64_t amount){gBlitOps[kind][0]++;gBlitOps[kind
+   return;
+  }
+  const std::array<uint64_t,3> size={z.width,z.height,z.depth},b={dO.x,dO.y,dO.z};
+- blitNote(3,(uint64_t)z.width*z.height*z.depth);
++ blitNote(3,(uint64_t)z.width*z.height*z.depth);noteReadOnlyBlit(d,"copyFromBuffer:toTexture:");
+  ENCODE([self check:nmb_blit_buffer_to_texture(self.handle,[(NBBuffer *)s handle],o,row,image,size.data(),[(NBTexture *)d handle],slice,level,b.data())
+                 what:"copyFromBuffer:toTexture:"]);
+ }
+@@ -2722,7 +2757,7 @@ destinationBytesPerImage:(NSUInteger)image options:(MTLBlitOption)options {
+  // A refusal names the texture's pixel format, type and levels: what decides whether the runtime can filter it.
+  const std::string what=[NSString stringWithFormat:@"generateMipmapsForTexture: (pixel format %lu, type %lu, %lu levels)",
+                          (unsigned long)t.pixelFormat,(unsigned long)t.textureType,(unsigned long)t.mipmapLevelCount].UTF8String;
+- blitNote(5,(uint64_t)t.width*t.height);
++ blitNote(5,(uint64_t)t.width*t.height);noteReadOnlyBlit(t,"generateMipmapsForTexture:");
+  ENCODE([self check:nmb_blit_generate_mipmaps(self.handle,[(NBTexture *)t handle]) what:what.c_str()]);
+ }
+ - (void)synchronizeResource:(id<MTLResource>)r {(void)r;}
+@@ -4471,7 +4506,13 @@ static NSUInteger iosurfaceRowAlignment(id device) {
+  if(!row && plane<2 && b3a8Planes(surface,allocation,computed)){start=(uintptr_t)base+computed[plane*2];row=computed[plane*2+1];}
+  if(start<(uintptr_t)base || start-(uintptr_t)base>=allocation || !row){refuseSurface(3,surface,d,plane,start-(uintptr_t)base,row);return nil;}
+  const size_t bytes=(allocation+page-1)&~(page-1);
+- NBBuffer *buffer=surfaceBuffer(surface,base,bytes);if(!buffer){refuseSurface(4,surface,d,plane,start-(uintptr_t)base,row);return nil;}
++ // pdx203 (0015): a texture that only samples the surface imports it read-only (usage 0 is unknown: writable). A blit may still write
++ // it (Metal asks no usage of a blit); those writes are dropped and counted (gReadOnlyBlitWrites). PDX203_SURFACE_RO=0 imports every
++ // surface writable.
++ static const bool readOnlyImports=[]{const char *v=getenv("PDX203_SURFACE_RO");return !v || strcmp(v,"0");}();
++ const MTLTextureUsage usage=d.usage;
++ const bool readOnly=readOnlyImports && usage && !(usage&(MTLTextureUsageShaderWrite|MTLTextureUsageRenderTarget|(MTLTextureUsage)0x20 /* ShaderAtomic */));
++ NBBuffer *buffer=surfaceBuffer(surface,base,bytes,readOnly);if(!buffer){refuseSurface(4,surface,d,plane,start-(uintptr_t)base,row);return nil;}
+  NBTexture *texture=planes>=2?textureOnSurface(buffer,d,surface,plane,start-(uintptr_t)base,row):textureOnBuffer(buffer,d,start-(uintptr_t)base,row,true);
+  if(!texture){refuseSurface(5,surface,d,plane,start-(uintptr_t)base,row);return nil;}
+  if(gLogTextures)logTexture("iosurface",d,surface,plane,base,start-(uintptr_t)base,row,texture!=nil);
+@@ -5018,6 +5059,8 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
+  row("N no-copy %llu dealloc %llu/%llu surface %llu/%llu",(unsigned long long)gNoCopyAll.load(),(unsigned long long)gNoCopyReleased.load(),
+   (unsigned long long)gNoCopyMade.load(),
+   (unsigned long long)gSurfaceImportsReleased.load(),(unsigned long long)gSurfaceImportsMade.load());
++ row("N surface read-only %llu shared %llu refused %llu blit-writes %llu",(unsigned long long)gSurfaceReadOnlyMade.load(),
++  (unsigned long long)gSurfaceReadOnlyShared.load(),(unsigned long long)gSurfaceReadOnlyRefused.load(),(unsigned long long)gReadOnlyBlitWrites.load());
+  {uint64_t remaps[2]={};if(nmb_no_copy_remaps(remaps))row("N no-copy ranges checked %llu remapped %llu",(unsigned long long)remaps[0],(unsigned long long)remaps[1]);}
+  // The runtime's VkPipeline makings (the creation log, METAL2VULKAN_LOG_PIPELINES; they happen at draws, not at the state's creation) and
+  // its shader cache: where the driver's compile time goes.
+diff --git a/bridge/patches/0038-read-only-views-on-ios.patch b/bridge/patches/0038-read-only-views-on-ios.patch
+new file mode 100644
+index 0000000..c465c95
+--- /dev/null
++++ b/bridge/patches/0038-read-only-views-on-ios.patch
+@@ -0,0 +1,43 @@
++pdx203: no-copy memory of Metal's private option bit 24 imported through a read-only view on iOS too
++
++The render server textures each client IOSurface it composites at every frame, and most are new surfaces: each writable import cost
++a clean and invalidate of all its pages when the kernel mapped it and another invalidate when it let it go (landscape TestUFO: about
++1 s of kernel time in 10 s). The frontend now imports a surface that is only sampled with bit 24; through a read-only view of its
++pages (mach_vm_remap, mprotect), NativeAdreno pins it for reading only and maps it into the GPU read-only: cleaned when mapped,
++nothing when let go. The GPU's writes to it are dropped, as Metal's are, and such an import is never shared with a writable one.
++
++diff --git a/crates/metal2vulkan-runtime/src/read_only_view.rs b/crates/metal2vulkan-runtime/src/read_only_view.rs
++index 6e8a46b..b99f06d 100644
++--- a/crates/metal2vulkan-runtime/src/read_only_view.rs
+++++ b/crates/metal2vulkan-runtime/src/read_only_view.rs
++@@ -88,7 +88,11 @@ use std::ptr::NonNull;
++ 
++ /// Whether this system imports no-copy memory of bit 24 through a read-only view of its pages
++ /// (the module docs).
++-pub(super) const VIEWS_DROP_WRITES: bool = cfg!(target_os = "macos");
+++///
+++/// pdx203 (bridge 0038): iOS too. NativeAdreno's import pins memory it cannot pin for writing for
+++/// reading only and maps it into the GPU read-only, which also spares the CPU cache invalidation
+++/// a writable import costs when the GPU lets it go (a render server's per-frame IOSurface imports).
+++pub(super) const VIEWS_DROP_WRITES: bool = cfg!(any(target_os = "macos", target_os = "ios"));
++ 
++ /// A read-only view of `length` bytes of the caller's pages, mapped by the runtime and unmapped
++ /// as this goes: after the memory imported from it is freed (`memory.rs`'s `Block`).
++@@ -112,7 +116,7 @@ impl ReadOnlyView {
++     ///
++     /// `pointer` and `length` are multiples of the host page, and the bytes are mapped memory of
++     /// this process.
++-    #[cfg(target_os = "macos")]
+++    #[cfg(any(target_os = "macos", target_os = "ios"))]
++     pub(super) unsafe fn of(pointer: NonNull<u8>, length: u64) -> Option<ReadOnlyView> {
++         unsafe extern "C" {
++             /// `<mach/mach_init.h>`: the port of this process's task.
++@@ -174,7 +178,7 @@ impl ReadOnlyView {
++     /// # Safety
++     ///
++     /// None: it maps nothing.
++-    #[cfg(not(target_os = "macos"))]
+++    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
++     pub(super) unsafe fn of(_pointer: NonNull<u8>, _length: u64) -> Option<ReadOnlyView> {
++         None
++     }
