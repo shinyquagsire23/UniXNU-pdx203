@@ -114,7 +114,7 @@ volume = "PDX203ESP"
 size_mib = 91
 loader = "firmware"
 title = "pdx203"
-dram_size = "0xfcc00000"           # the upper ddr bank, as dts/pdx203.dts declares it
+dram_size = "0x180000000"          # the upper ddr run, as dts/pdx203.dts declares it
 skip_setup_tool = "scripts/seed-data-skip-setup.py"
 panic_screen = true                # the panic text stays on the panel, there is no uart on this phone
 # the minimal set of the format 1 image. each argument returns with the feature that needs it.
@@ -268,8 +268,10 @@ persistent_data = true
 # /chosen/chip-id, read as hex (0x207) as the format 1 ADT script read it: with unique-chip-id it seeds IOPlatformUUID, so the
 # value stays what this phone has booted with
 chip_id = "207"
-# 3 GiB window in the upper bank (uefi-pdx203's Pdx203BootMemoryDxe adds it)
-owned_memory_size = "0xc0000000"
+# 5 GiB window at the bottom of the upper run (uefi-pdx203's Pdx203BootMemoryDxe adds it); its top 1 GiB holds darwinboot's GPU
+# pool (770 MiB with alignment) and the loader's own allocations. 3 GiB before 2026-11-06: VM_pageout_scan spun a whole core from
+# boot and Dusklight's main thread spent most of its time in the kernel (~20 fps), then the phone reset in game.
+owned_memory_size = "0x140000000"
 root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"   # the OS volume of the 21H461 iPad7,1 image
 packed_data_ramdisk = true
 unique_chip_id = "required"        # the platform seed is not stored in any repository

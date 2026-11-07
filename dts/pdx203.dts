@@ -14,9 +14,11 @@
 
     memory@100000000 {
         device_type = "memory";
-        // The upper DDR bank, 0x1_00000000 + 0xfcc00000, verified as XNU's RAM by ios-sweet. DarwinBoot places
-        // the owned window ([payload.adt] owned_memory_size) in it; uefi-pdx203's Pdx203BootMemoryDxe adds it.
-        reg = <0x1 0x00000000 0x0 0xfcc00000>;
+        // The upper DDR run, 0x1_00000000 to 0x2_80000000 (6 GiB; 0xfcc00000 as ios-sweet first verified it): DarwinBoot's
+        // GPU pool, reserved top down, ends at 0x2_80000000 (pool at 0x2_4fe00000 + 0x30000000, 2026-11-06), and no fixed
+        // carve-out lies above 4 GiB. DarwinBoot places the owned window ([payload.adt] owned_memory_size) at its bottom;
+        // uefi-pdx203's Pdx203BootMemoryDxe adds it. XNU takes it as dram-base/dram-size (is_dram_addr).
+        reg = <0x1 0x00000000 0x1 0x80000000>;
     };
 
     soc {
