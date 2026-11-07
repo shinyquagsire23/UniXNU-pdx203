@@ -1,0 +1,40 @@
+From: pdx203 <noreply@anthropic.com>
+Subject: frontend: the buffer/texture blit copies with blit options
+
+copyFromBuffer:...toTexture:...options: and copyFromTexture:...toBuffer:...options: forward to the plain forms. Dawn's
+Metal backend (WebGPU ports such as Dusk) uploads every texture with the options form (None for colour); without it each
+upload was the missing-selector no-op and every texture stayed as made: Dusk's menu drew magenta (2026-11-06).
+A depth or stencil aspect option is noted once and copied as the plain form copies it.
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -2693,6 +2693,28 @@
+  blitNote(4,(uint64_t)z.width*z.height*z.depth);
+  ENCODE([self check:nmb_blit_texture_to_buffer(self.handle,[(NBTexture *)s handle],slice,level,a.data(),size.data(),[(NBBuffer *)d handle],o,row,image)
+                 what:"copyFromTexture:toBuffer:"]);
++}
++// The forms with blit options (Dawn's Metal backend, under WebGPU ports such as Dusk, uploads every texture with them, options None for a
++// colour texture): without them each was the missing-selector no-op and every texture stayed as it was made (Dusk's menu drew magenta,
++// 2026-11-06). A depth or stencil aspect option is noted once and the copy made as the plain form makes it.
++static void noteBlitOptions(const char *what,MTLBlitOption options) {
++ if(options==MTLBlitOptionNone)return;
++ static std::atomic<bool> told{false};
++ if(!told.exchange(true))NBLOG(@"native-metal: %s with blit options %lx copies as the plain form",what,(unsigned long)options);
++}
++- (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)o sourceBytesPerRow:(NSUInteger)row sourceBytesPerImage:(NSUInteger)image
++            sourceSize:(MTLSize)z toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level
++     destinationOrigin:(MTLOrigin)dO options:(MTLBlitOption)options {
++ noteBlitOptions("copyFromBuffer:toTexture:options:",options);
++ [self copyFromBuffer:s sourceOffset:o sourceBytesPerRow:row sourceBytesPerImage:image sourceSize:z toTexture:d destinationSlice:slice
++     destinationLevel:level destinationOrigin:dO];
++}
++- (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)slice sourceLevel:(NSUInteger)level sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
++               toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)o destinationBytesPerRow:(NSUInteger)row
++destinationBytesPerImage:(NSUInteger)image options:(MTLBlitOption)options {
++ noteBlitOptions("copyFromTexture:toBuffer:options:",options);
++ [self copyFromTexture:s sourceSlice:slice sourceLevel:level sourceOrigin:so sourceSize:z toBuffer:d destinationOffset:o
++  destinationBytesPerRow:row destinationBytesPerImage:image];
+ }
+ - (void)generateMipmapsForTexture:(id<MTLTexture>)t {
+  if(![self textures:NB_OBJECTS(t) count:1])return;
