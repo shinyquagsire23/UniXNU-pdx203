@@ -1,5 +1,5 @@
 diff --git a/NativeHidInput.cpp b/NativeHidInput.cpp
-index 0ec71df..2bbd297 100644
+index 0ec71df..398f7d6 100644
 --- a/NativeHidInput.cpp
 +++ b/NativeHidInput.cpp
 @@ -18,6 +18,9 @@
@@ -33,7 +33,7 @@ index 0ec71df..2bbd297 100644
  class NativeHidInput : public IOHIDDevice {
      OSDeclareDefaultStructors(NativeHidInput)
      IOWorkLoop *inputLoop=nullptr;
-@@ -249,6 +266,11 @@ class NativeHidInput : public IOHIDDevice {
+@@ -249,6 +266,12 @@ class NativeHidInput : public IOHIDDevice {
      // The digitizer is a separate service from the keyboard: backboardd matches digitizers by primary usage page/usage
      // (Digitizer/Touch Screen) and the Built-In flag, which a combined keyboard-first descriptor would not provide.
      bool touchOnly=false;
@@ -42,10 +42,11 @@ index 0ec71df..2bbd297 100644
 +    bool orientationSent=false;
 +    unsigned rematches=0;
 +    bool rematchPending=false;
++    unsigned noDriverTicks=0;       // ticks with no event driver at all
      bool eventDriverFound=false;
      IOReturn submitReport(IOMemoryDescriptor *report) {
  #if defined(NATIVE_HID_SOURCE_API) && NATIVE_HID_SOURCE_API
-@@ -335,7 +357,7 @@ class NativeHidInput : public IOHIDDevice {
+@@ -335,7 +358,7 @@ class NativeHidInput : public IOHIDDevice {
      }
      static IOReturn buttonsAction(OSObject *owner,void *mask,void *,void *,void *) {
          NativeHidInput *self=OSDynamicCast(NativeHidInput,owner);if(!self)return kIOReturnSuccess;
@@ -54,14 +55,17 @@ index 0ec71df..2bbd297 100644
          if(!self->hasEventDriverCached())return kIOReturnSuccess;
          unsigned char report[]={2,static_cast<unsigned char>((self->down?1:0)|self->buttons)};
          IOBufferMemoryDescriptor *buffer=IOBufferMemoryDescriptor::withBytes(report,sizeof(report),kIODirectionNone);
-@@ -368,6 +390,57 @@ class NativeHidInput : public IOHIDDevice {
+@@ -368,6 +391,60 @@ class NativeHidInput : public IOHIDDevice {
      }
      static void tick(OSObject *owner,IOTimerEventSource *source) {
          NativeHidInput *self=OSDynamicCast(NativeHidInput,owner);if(!self)return;
 +        if(self->orientationOnly) {   // until the in-kernel event driver is there; then the first orientation, and the timer stops
 +            IORegistryEntry *driver=eventDriver(self,4);
 +            if(!driver) {   // after a DriverKit service was ended: match the interface again once it is gone
-+                if(self->rematchPending) if(OSIterator *it=self->getChildIterator(gIOServicePlane)) {
++                // Also when no driver came at all: with DriverKit launches disabled (pdx203's no-dext patch, for Bluetooth keyboards) the
++                // "HID SensorEvent Driver" service fails to start and leaves the interface without any driver, so nothing ends and
++                // rematchPending never comes (2026-11-06: chord steps went nowhere, CoreMotion "usage pair {32, 138} is not ready").
++                if(self->rematchPending || ++self->noDriverTicks==3) if(OSIterator *it=self->getChildIterator(gIOServicePlane)) {
 +                    while(OSObject *o=it->getNextObject()) if(IOService *interface=OSDynamicCast(IOService,o)) if(interface->metaCast("IOHIDInterface")) {
 +                        // Matching chose the DriverKit service again on pdx203, so the in-kernel driver is attached here directly: the
 +                        // interface takes one owner, and DriverKit only comes back through matching, which this does not run.
@@ -112,7 +116,7 @@ index 0ec71df..2bbd297 100644
          native_hid_live_checkpoint(self);
          if(self->touchOnly){source->setTimeoutMS(1000);return;}
          if(!self->down && !hasEventDriver(self,4)) {
-@@ -387,15 +460,93 @@ class NativeHidInput : public IOHIDDevice {
+@@ -387,15 +464,93 @@ class NativeHidInput : public IOHIDDevice {
          if(!self->down) {self->down=true;source->setTimeoutMS(100);}
          else {self->down=false;source->setTimeoutMS(1000);}
      }
@@ -207,7 +211,7 @@ index 0ec71df..2bbd297 100644
          if(touchOnly){size=sizeof(touchDescriptor);memcpy(combined,touchDescriptor,size);}
          else{
              size=sizeof(descriptor);memcpy(combined,descriptor,size);
-@@ -417,12 +568,20 @@ public:
+@@ -417,12 +572,20 @@ public:
          // report's fingers as one digitizer collection with a child per finger. Without it a touch screen gets one event per finger,
          // and backboardd takes each as the whole touch set, so no two fingers are ever down together for UIKit (no pinch, no
          // multi-finger or system gestures).
@@ -229,7 +233,7 @@ index 0ec71df..2bbd297 100644
          if(touchOnly||touchEnabled) {
              if(&native_touch_set_sink)native_touch_set_sink(&NativeHidInput::touchNotify,this);
          }
-@@ -432,8 +591,9 @@ public:
+@@ -432,8 +595,9 @@ public:
          timer->setTimeoutMS(1000);return true;
      }
      void stop(IOService *provider) override {
@@ -241,7 +245,7 @@ index 0ec71df..2bbd297 100644
          if(timer){timer->cancelTimeout();inputLoop->removeEventSource(timer);OSSafeReleaseNULL(timer);}
          IOHIDDevice::stop(provider);
      }
-@@ -442,3 +602,6 @@ public:
+@@ -442,3 +606,6 @@ public:
  OSDefineMetaClassAndStructors(NativeHidInput,IOHIDDevice)
  extern "C" IOService *native_hid_input_allocate(void) {return new NativeHidInput;}
  extern "C" IOService *native_hid_touch_allocate(void) {NativeHidInput *device=new NativeHidInput;if(device)device->setTouchOnly();return device;}

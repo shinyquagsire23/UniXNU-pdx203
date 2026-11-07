@@ -141,10 +141,10 @@ extern "C" int native_hid_input_probe(void) {
   }
   // The orientation device (NativeHidInput setOrientationOnly): locationd's always-on-orientation path reads it on a J120 identity and
   // the UI rotates with what it reports; the volume up + down chord steps it (ButtonProbe.cpp). pdx203-orient=1 turns it on.
-  // Default off: the GOP/legacy present path copies the composited surface straight to the portrait panel with no rotation, so any
-  // non-portrait orientation presents a geometry-mismatched surface -- the panel freezes on ~3 stale frames while the UI runs blind,
-  // and only portrait recovers (2026-11-04). Re-enable once the display driver rotates the surface on present.
-  unsigned orient = 0;
+  // On by default (pdx203-orient=0 turns it off; the kernel command line is at its 1000-byte limit). Landscape froze on ~3 stale frames
+  // until 2026-11-06: QuartzCore renders it into a rotation-3 Metal texture over the portrait framebuffer IOSurface, which metal2vulkan
+  // refused (bridge patch 0031 fixes that).
+  unsigned orient = 1;
   PE_parse_boot_argn("pdx203-orient", &orient, sizeof orient);
   if (orient) {
     IOService *device2 = native_hid_orientation_allocate();
