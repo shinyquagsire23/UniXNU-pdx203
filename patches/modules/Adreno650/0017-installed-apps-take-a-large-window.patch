@@ -1,0 +1,64 @@
+From: pdx203 <noreply@anthropic.com>
+Subject: publish: installed apps take a large GPU window first
+
+An installed app (a process that is not a platform binary) tries the 640 MiB windows (slots 1-3)
+before the 128 MiB ones, as WebKit's processes do. Dusk, a game installed with TrollStore, filled a 128 MiB
+window: its Metal buffers were refused (OutOfMemory(Device)), its textures drew pink, then it aborted.
+
+diff --git a/NativeAdrenoPublish.cpp b/NativeAdrenoPublish.cpp
+--- a/NativeAdrenoPublish.cpp
++++ b/NativeAdrenoPublish.cpp
+@@ -22,6 +22,32 @@
+ 
+ extern "C" void proc_selfname(char *, int);
+ extern "C" int proc_selfpid(void);
++/* An installed app's executable path (user apps: /private/var/containers/Bundle/Application/...): the large-window preference below. */
++struct proc;struct vnode;
++extern "C" struct proc *current_proc(void);
++extern "C" struct vnode *proc_getexecutablevnode(struct proc *);
++extern "C" int vn_getpath(struct vnode *, char *, int *);
++extern "C" int vnode_put(struct vnode *);
++extern "C" int csproc_get_platform_binary(struct proc *);
++/* A process that is not a platform binary is an installed app (every system process is one; TrollStore's and the App Store's apps are
++ * not): it takes a large window first. The path is logged beside it for each open (lsc4: the path test alone answered no for Dusk). */
++static bool selfIsInstalledApp(const char *name) {
++    const int platform=csproc_get_platform_binary(current_proc());
++    int pathApp=-1,pathError=-1;char shown[64]={0};
++    if(struct vnode *vnode=proc_getexecutablevnode(current_proc())) {
++        if(char *path=static_cast<char *>(IOMalloc(1024))) {
++            int length=1024;pathError=vn_getpath(vnode,path,&length);
++            if(!pathError) {
++                pathApp=strnstr(path,"/containers/Bundle/Application/",1024)!=nullptr;
++                const size_t n=strlen(path);strlcpy(shown,n>63?path+n-63:path,sizeof shown);
++            }
++            IOFree(path,1024);
++        }
++        vnode_put(vnode);
++    }
++    IOLog("NativeAdreno: client %s platform %d path-app %d (error %d, ...%s)\n",name,platform,pathApp,pathError,shown);
++    return !platform;
++}
+ /* The plugin's telemetry table (rows of text the Metal bridge keeps), sent as markers: 0xC000|row starts a row, 0x8000|(a<<7)|b appends two characters. */
+ extern "C" {char native_adreno_metal_rows[48][96];volatile uint32_t native_adreno_metal_rows_seq;}
+ 
+@@ -254,6 +280,7 @@
+ bool AGXDeviceUserClient::mount(bool kernel)
+ {
+     proc_selfname(name_,sizeof name_);pid_=proc_selfpid();
++    const bool installedApp=!kernel && selfIsInstalledApp(name_);   /* before the lock: the path lookup may take vnode locks */
+     NativeAdrenoUserClient *core=new NativeAdrenoUserClient;
+     if(!core)return false;
+     IOLockLock(g.lock);
+@@ -263,8 +290,10 @@
+     if(kernel)slot=g.kernel_client?NativeAdrenoMaxClients:0;
+     else {
+         if(!strncmp(name_,"backboardd",sizeof name_) && !g.slots[0])slot=0;
+-        /* WebKit's processes a large window first, everyone else a small one first (sa56). */
+-        const bool large=!strncmp(name_,"com.apple.WebKit",16);
++        /* WebKit's processes a large window first, everyone else a small one first (sa56). Installed apps too (2026-11-06): Dusk, a
++         * game, filled a 128 MiB window and its Metal buffers were refused (OutOfMemory(Device), pink textures, then an abort). An installed
++         * app is a process that is not a platform binary (selfIsInstalledApp). */
++        const bool large=!strncmp(name_,"com.apple.WebKit",16) || installedApp;
+         for(unsigned pass=0;pass<2 && slot==NativeAdrenoMaxClients;++pass) {
+             const bool largeNow=(pass==0)==large;
+             const unsigned first=largeNow?1:NativeAdrenoFirstSmallSlot,last=largeNow?NativeAdrenoFirstSmallSlot:NativeAdrenoMaxClients;
