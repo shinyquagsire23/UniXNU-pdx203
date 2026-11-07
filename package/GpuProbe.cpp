@@ -585,12 +585,18 @@ int naPublish(void *, const volatile uint32_t *, size_t) {__asm__ volatile("dsb 
 int naAcquire(void *, volatile uint32_t *, size_t) {__asm__ volatile("dsb sy" ::: "memory"); return 0;}
 uint64_t naNow(void *) {uint64_t us = 0; gmuNow(nullptr, &us); return us;}
 // The fence waits' pause: with the GPU interrupt attached (mode 10) a waiter that may block sleeps until the next GPU interrupt or
-// 100 us, whichever is first; before that, or where it may not block, it spins 20 us (UniXNU-tb128fu, sheng int-143).
+// pdx203_knob_idle_us, whichever is first; before that, or where it may not block, it spins 20 us (UniXNU-tb128fu, sheng int-143).
+// The cap was 100 us: a thread waiting out a 9 ms landscape frame woke about 90 times, each a poll under the connection lock and
+// a retirement pass, so the compositor's render thread spent two thirds of its time in the kernel (usb-463: com.apple.coreanimation
+// 30% k20 in landscape, 16% k10 in portrait). Every job ends in an interrupt (irq == submissions), so the cap only bounds a missed
+// one: 2 ms, and 100 us again once the interrupt storm guard has masked the GPU interrupt.
 volatile bool gIrqAttached;
 volatile uint32_t gIrqCount, gIrqSeen, gIrqLast, gIrqRepeat, gIrqMasked;
+extern "C" {volatile int32_t pdx203_knob_idle_us = 2000;}
 int naIdle(void *) {
     if (gIrqAttached && ml_get_interrupts_enabled() && !ml_at_interrupt_context() && get_preemption_level() == 0) {
-        assert_wait_timeout(event_t(&gIrqCount), THREAD_UNINT, 100, NSEC_PER_USEC);
+        const int32_t cap = pdx203_knob_idle_us;
+        assert_wait_timeout(event_t(&gIrqCount), THREAD_UNINT, gIrqMasked || cap < 20 ? 100 : cap, NSEC_PER_USEC);
         thread_block(THREAD_CONTINUE_NULL);
         native_gpu_idle_sleeps = native_gpu_idle_sleeps + 1;
     } else {
@@ -2108,6 +2114,23 @@ void metalRows() {
                               native_adreno_method_stats[m][2]);
         printIfChanged(gMetalLine[3], sizeof gMetalLine[3], line);
     }
+    if (&native_adreno_method_stats) {
+        // Since the last row, per external method (1 query, 2 BO alloc, 3 BO map, 4 BO free, 5 submit, 6 fence wait, 13/14 CPU map/
+        // unmap, ...): calls and the us spent in the driver's core for them (under the connection lock; a fence wait's pauses outside it
+        // are not counted). Shows which GPU calls a process's kernel time is made of.
+        static uint32_t lastCalls[20], lastUs[20];
+        int n = snprintf(line, sizeof line, "MTIME");
+        bool any = false;
+        for (unsigned m = 1; m < 20 && n > 0 && size_t(n) < sizeof line; ++m) {
+            const uint32_t calls = native_adreno_method_stats[m][0], us = native_adreno_method_stats[m][3];
+            if (calls != lastCalls[m]) {
+                n += snprintf(line + n, sizeof line - n, " m%u %u/%uus", m, calls - lastCalls[m], us - lastUs[m]);
+                any = true;
+            }
+            lastCalls[m] = calls; lastUs[m] = us;
+        }
+        if (any) printf("%s\n", line);
+    }
     if (&native_adreno_window_overflow && &native_adreno_client_stats && &native_adreno_import_diag) {
         static char last[200];
         snprintf(line, sizeof line, "METALMEM overflow %u/%u/%u/%u | refused %u:%x:%u %u:%x:%u %u:%x:%u %u:%x:%u k%u:%x | import fail %llu %llx st%llu",
@@ -2232,9 +2255,11 @@ void displayRow() {
     static uint32_t lastTimeouts = ~0u;
     if (&native_adreno_fence_wait && native_adreno_fence_wait[1] != lastTimeouts) {
         lastTimeouts = native_adreno_fence_wait[1];
-        printf("FENCE waits %u timeouts %u | last timed-out %u gpu %u | newest %u completed %u | nojob %u refused %u\n",
+        // The waiters' sleeps between GPU interrupts (naIdle) and spins, since boot, and the sleep cap.
+        printf("FENCE waits %u timeouts %u | last timed-out %u gpu %u | newest %u completed %u | nojob %u refused %u | sleeps %llu spins %llu cap %d\n",
                native_adreno_fence_wait[0], native_adreno_fence_wait[1], native_adreno_fence_wait[2], native_adreno_fence_wait[3],
-               native_adreno_fence_wait[4], native_adreno_fence_wait[5], native_adreno_fence_wait[6], native_adreno_fence_wait[7]);
+               native_adreno_fence_wait[4], native_adreno_fence_wait[5], native_adreno_fence_wait[6], native_adreno_fence_wait[7],
+               (unsigned long long)native_gpu_idle_sleeps, (unsigned long long)native_gpu_idle_spins, (int)pdx203_knob_idle_us);
         if (&native_adreno_fence_pending)
             printf("FENCEPEND <1 %u <2 %u <4 %u <8 %u <16 %u <32 %u <64 %u 64+ %u\n",
                    native_adreno_fence_pending[0], native_adreno_fence_pending[1], native_adreno_fence_pending[2], native_adreno_fence_pending[3],
