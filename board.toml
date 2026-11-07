@@ -245,6 +245,12 @@ text_fixups = [
   # skipped instead of crashing. 2026-11-04.
   "dyld_shared_cache_arm64.03,27f8964,80040035,80010035",
   "dyld_shared_cache_arm64.03,27f896c,400400b4,400100b4",
+  # QuartzCore CA::OGL::MetalContext::is_viable_texture_from_iosurface (0x1894c7bb8): the IOSurface row-alignment test always passes.
+  # Since the device answers iosurfaceReadOnlyTextureAlignmentBytes 64 (AdrenoMetal 0003, the home-screen speedup), the kernel's
+  # default framebuffer surface over the GOP (4384-byte rows, the firmware's pitch) was refused: "Failed to allocate MTLTexture from
+  # IOSurface 0x4. Row bytes (4384) not 64 aligned." and every portrait screenshot came back empty (white preview, no file).
+  # The runtime takes 16-byte rows (as a shadowed texture); QuartzCore's own surfaces stay 64-aligned and fast. 2026-11-06.
+  "dyld_shared_cache_arm64.03,271bbb8,40010054,0a000014",
   # BlueTool runCommandForCurrentConfig (0x100016bf8, the boot/init/deepsleep scripts bluetoothd asks for over XPC) answers 0 at once:
   # its scripts are Broadcom's (hcd download, baud and sleep vendor commands) and the QCA6390 is brought up by the kernel
   # (Pdx203Bluetooth.cpp). Its override scripts would need MobileGestalt ReleaseType Vendor/Internal. 2026-11-05.
