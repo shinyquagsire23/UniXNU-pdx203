@@ -1,0 +1,574 @@
+From: pdx203 <noreply@anthropic.com>
+Subject: bridge: metal2vulkan patch 0037, elide a landscape copy back a later one supersedes
+
+Carries bridge/patches/0037-rotated-copy-back-elided.patch. QuartzCore draws two full-frame passes into its landscape framebuffer
+per frame, in one command buffer; each copied back the whole rotated frame, and only the second reached the display. A copy back
+is now an indirect dispatch from a slot of the texture's, and the later one zeroes the earlier's workgroups before submission where
+no command read or wrote the plane in between (encoders that may be encoded again, fence updates and signals elide nothing).
+
+diff --git a/bridge/patches/0037-rotated-copy-back-elided.patch b/bridge/patches/0037-rotated-copy-back-elided.patch
+new file mode 100644
+index 0000000..7cd683b
+--- /dev/null
++++ b/bridge/patches/0037-rotated-copy-back-elided.patch
+@@ -0,0 +1,560 @@
++diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++index 324e841..c66ff5d 100644
++--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++@@ -1325,6 +1325,14 @@ impl State {
++         }
++     }
++ 
+++    /// pdx203 (bridge 0037): elide no rotated texture's copy back recorded so far: the command
+++    /// buffer signals, and work ordered after the signal may read the planes.
+++    pub(super) fn shadows_not_superseding(&mut self) {
+++        if let Some(carry) = &mut self.shadow_carry {
+++            carry.not_superseding();
+++        }
+++    }
+++
++     /// Metal's GPU faults ended encoder `encoder`, failing the command buffer with `error` from
++     /// it on (`faulted`, `Failure::with_faults`); where nothing failed it from an earlier encoder
++     /// and no earlier encoder faulted, the work before the encoder signals the fault's hold and
++@@ -2209,6 +2217,8 @@ impl CommandBuffer {
++         self.event_command("encode_signal_event", event, |batches, event| {
++             batches.signal(event, value);
++         })
+++        // pdx203 (bridge 0037): work the signal orders after may read the planes.
+++        .inspect(|()| self.state().shadows_not_superseding())
++     }
++ 
++     /// `encodeSignalEventScheduled:value:`, private: once the command buffer is scheduled, the
++@@ -2316,6 +2326,8 @@ impl CommandBuffer {
++         self.binary_command("encode_signal_vk_semaphore", semaphore, |batches| {
++             batches.binary_signal(semaphore);
++         })
+++        // pdx203 (bridge 0037): work the signal orders after may read the planes.
+++        .inspect(|()| self.state().shadows_not_superseding())
++     }
++ 
++     /// Add a binary semaphore wait or signal to the batches, after the runtime's checks.
++diff --git a/crates/metal2vulkan-runtime/src/encoder.rs b/crates/metal2vulkan-runtime/src/encoder.rs
++index 3fb1e61..a75583f 100644
++--- a/crates/metal2vulkan-runtime/src/encoder.rs
+++++ b/crates/metal2vulkan-runtime/src/encoder.rs
++@@ -1538,6 +1538,13 @@ impl EncoderCore {
++         self.shadows.not_carried();
++     }
++ 
+++    /// pdx203 (bridge 0037): note a fence update: work it orders after the encoder may read the
+++    /// planes of its rotated textures, so no copy back recorded so far is elided
+++    /// (`shadow::ShadowSync::published`).
+++    pub(super) fn published(&mut self) {
+++        self.shadows.published();
+++    }
+++
++     /// Whether the encoder used a shadowed texture so far: where it did not, a command that uses
++     /// none takes no copy and notes no use ([`plan_shadows`](Self::plan_shadows),
++     /// [`shadows_used`](Self::shadows_used)).
++@@ -2082,7 +2089,13 @@ impl EncoderCore {
++         if sharing > 0 {
++             self.device().shared().counts.shadows_sharing_truth(sharing);
++         }
++-        let copies = self.shadows.finish();
+++        // pdx203 (bridge 0037): an encoder never encoded again may elide the copy back of a rotated
+++        // texture an earlier encoder of the command buffer recorded at its end (one encoded again
+++        // starts from no shadow standing and would copy that plane in).
+++        let copies = match self.taken.encodes_again() {
+++            true => self.shadows.finish(),
+++            false => self.shadows.finish_superseding(),
+++        };
++         let copies = self.sample_moves(copies);
++         self.count_shadow_copies(&copies);
++         self.shadow_copies(&copies);
++diff --git a/crates/metal2vulkan-runtime/src/fence.rs b/crates/metal2vulkan-runtime/src/fence.rs
++index b041a8a..e1936ea 100644
++--- a/crates/metal2vulkan-runtime/src/fence.rs
+++++ b/crates/metal2vulkan-runtime/src/fence.rs
++@@ -150,6 +150,8 @@ impl EncoderCore {
++     ) -> Result<(), Error> {
++         self.check_device(call, fence.device())?;
++         self.uses().update_fence(fence.0.key, draws);
+++        // pdx203 (bridge 0037): work the fence orders after this encoder may read its planes.
+++        self.published();
++         Ok(())
++     }
++ 
++diff --git a/crates/metal2vulkan-runtime/src/rotated.rs b/crates/metal2vulkan-runtime/src/rotated.rs
++index 133d4d2..5e801d0 100644
++--- a/crates/metal2vulkan-runtime/src/rotated.rs
+++++ b/crates/metal2vulkan-runtime/src/rotated.rs
++@@ -141,7 +141,8 @@ pub(super) struct LastStanding {
++ }
++ 
++ /// pdx203 diagnostics (bridge 0033): the rotated textures' turns recorded, by kind (into by
++-/// Metal's load, into by the inverse of the store, back, skipped by a switch below), and the
+++/// Metal's load, into by the inverse of the store, back, skipped by a switch below or, bridge
+++/// 0037, copies back elided by a later one, [`RotatedCopies::elide`]), and the
++ /// first uses that took the image's lasting standing ([`LastStanding`]) instead of a copy in.
++ /// The frontend reads them through [`metal2vulkan_rotated_turns`] (its PDX203ROT row).
++ pub(super) static TURNS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
++@@ -190,6 +191,50 @@ struct FastBack {
++     bytes: vk::Buffer,
++     shape: [u8; ROTATED_COPY_BACK_PUSH_BYTES as usize],
++     groups: [u32; 2],
+++    /// The dispatch's workgroup counts, one slot per copy back recorded ([`BackArgs`]); `None`
+++    /// where the device gave no mapped buffer, and then the copy back is a direct dispatch.
+++    args: Option<BackArgs>,
+++}
+++
+++/// pdx203 (bridge 0037): how many copies back of a texture may be in flight with their own
+++/// indirect dispatch's slot, recorded and not yet run (a slot is taken again `BACK_SLOTS`
+++/// copies later, seconds of frames).
+++const BACK_SLOTS: u64 = 256;
+++
+++/// pdx203 (bridge 0037): the copies back's indirect dispatch arguments, `BACK_SLOTS` slots of 16
+++/// bytes in a `Shared` (host-visible and coherent) buffer of the texture's. Each copy back
+++/// records `vkCmdDispatchIndirect` from its own slot, which holds its workgroup counts, and a
+++/// later copy back of the same command buffer that stores the same image after it, with nothing
+++/// reading or writing the plane in between, writes zero workgroups into it before the command
+++/// buffer is submitted ([`RotatedCopies::elide`]): QuartzCore's landscape frame draws two
+++/// full-frame passes into its framebuffer in one command buffer, and only the second's copy back
+++/// reaches the display.
+++struct BackArgs {
+++    _buffer: Buffer,
+++    raw: vk::Buffer,
+++    at: u64,
+++    /// The mapping's first byte, as an address (the buffer is held with it).
+++    words: usize,
+++}
+++
+++impl BackArgs {
+++    fn new(device: &Device) -> Option<BackArgs> {
+++        let buffer = device.write_combined_buffer(BACK_SLOTS * 16).ok()?;
+++        let words = buffer.contents()?.as_ptr() as usize;
+++        let (raw, at) = buffer.at(0);
+++        Some(BackArgs { _buffer: buffer, raw, at, words })
+++    }
+++
+++    /// Write `groups` (x, y; z 1, or all zero) into the slot of copy back `seq`.
+++    fn set(&self, seq: u64, groups: [u32; 3]) {
+++        let slot = (self.words + (seq % BACK_SLOTS) as usize * 16) as *mut u32;
+++        for (i, count) in groups.iter().enumerate() {
+++            // SAFETY: the slot lies inside the mapping, which the buffer held here keeps; no
+++            // command reading it was submitted yet (a recording copy back, or one of the same
+++            // command buffer, not committed).
+++            unsafe { std::ptr::write_volatile(slot.add(i), *count) };
+++        }
+++    }
++ }
++ 
++ impl FastBack {
++@@ -248,6 +293,7 @@ impl FastBack {
++             bytes,
++             shape,
++             groups,
+++            args: BackArgs::new(device),
++         })
++     }
++ }
++@@ -287,6 +333,11 @@ pub(super) struct RotatedCopies {
++     pub(super) lasting: std::sync::Mutex<Option<LastStanding>>,
++     /// The copy back as one dispatch ([`FastBack`]), where the frame image has its word view.
++     fast_back: Option<FastBack>,
+++    /// pdx203 (bridge 0037): the copies back recorded, each numbered by the count before it.
+++    stores: std::sync::atomic::AtomicU64,
+++    /// One more than the number of the last copy back recorded as an indirect dispatch from its
+++    /// own slot ([`BackArgs`]), 0 for none.
+++    last_indirect: std::sync::atomic::AtomicU64,
++ }
++ 
++ impl RotatedCopies {
++@@ -425,6 +476,8 @@ impl RotatedCopies {
++             sets,
++             lasting: std::sync::Mutex::new(None),
++             fast_back,
+++            stores: std::sync::atomic::AtomicU64::new(0),
+++            last_indirect: std::sync::atomic::AtomicU64::new(0),
++         })
++     }
++ 
++@@ -434,6 +487,32 @@ impl RotatedCopies {
++         self.apart
++     }
++ 
+++    /// pdx203 (bridge 0037): how many copies back were recorded: the number the next one takes.
+++    pub(super) fn stores(&self) -> u64 {
+++        self.stores.load(std::sync::atomic::Ordering::Relaxed)
+++    }
+++
+++    /// pdx203 (bridge 0037): the number of the last copy back recorded as an indirect dispatch
+++    /// from its own slot, which a later one may elide ([`elide`](Self::elide)).
+++    pub(super) fn last_indirect(&self) -> Option<u64> {
+++        self.last_indirect.load(std::sync::atomic::Ordering::Relaxed).checked_sub(1)
+++    }
+++
+++    /// pdx203 (bridge 0037): make copy back `seq` (an indirect dispatch from its own slot, of a
+++    /// command buffer not yet submitted) dispatch no workgroup: a later copy back of the same
+++    /// command buffer stores the same image over it, and no command between read or wrote the
+++    /// plane (`shadow::ShadowSync`'s supersession). One whose slot was taken again since is left.
+++    fn elide(&self, seq: u64) {
+++        let Some(args) = self.fast_back.as_ref().and_then(|fast| fast.args.as_ref()) else {
+++            return;
+++        };
+++        if self.stores().saturating_sub(seq) >= BACK_SLOTS / 2 {
+++            return;
+++        }
+++        args.set(seq, [0, 0, 0]);
+++        TURNS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+++    }
+++
++     /// Record the `turn` of the frame's `image` from `bytes` (the plane's `VkBuffer`) through
++     /// `staging`, into the frame or back, its rows back by `back` (`shadow::record_back`).
++     ///
++@@ -450,6 +529,7 @@ impl RotatedCopies {
++         (bytes, staging): (vk::Buffer, &ShadowStaging),
++         turn: Turn,
++         back: Option<&RowCopies>,
+++        supersedes: Option<u64>,
++     ) {
++         let into = turn != Turn::Store;
++         let kind = match turn {
++@@ -462,6 +542,15 @@ impl RotatedCopies {
++             TURNS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++             return;
++         }
+++        // pdx203 (bridge 0037): a copy back's number, and the earlier copy back of the command
+++        // buffer this one stores the image over, elided.
+++        let seq = match into {
+++            true => 0,
+++            false => self.stores.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+++        };
+++        if let (false, Some(earlier)) = (into, supersedes) {
+++            self.elide(earlier);
+++        }
++         // The copy back as one dispatch, over the plane's `VkBuffer` as the texture's set binds it.
++         if let (false, Some(fast)) = (into, self.fast_back.as_ref().filter(|fast| fast.bytes == bytes)) {
++             // SAFETY: the caller's contract; the set binds the frame image's view (in `GENERAL`)
++@@ -478,7 +567,14 @@ impl RotatedCopies {
++                     0,
++                     &fast.shape,
++                 );
++-                device.cmd_dispatch(command_buffer, fast.groups[0], fast.groups[1], 1);
+++                match &fast.args {
+++                    Some(args) => {
+++                        args.set(seq, [fast.groups[0], fast.groups[1], 1]);
+++                        device.cmd_dispatch_indirect(command_buffer, args.raw, args.at + (seq % BACK_SLOTS) * 16);
+++                        self.last_indirect.store(seq + 1, std::sync::atomic::Ordering::Relaxed);
+++                    }
+++                    None => device.cmd_dispatch(command_buffer, fast.groups[0], fast.groups[1], 1),
+++                }
++                 Barrier::everything().record(device, command_buffer);
++             }
++             return;
++diff --git a/crates/metal2vulkan-runtime/src/shadow.rs b/crates/metal2vulkan-runtime/src/shadow.rs
++index e285dd8..2812855 100644
++--- a/crates/metal2vulkan-runtime/src/shadow.rs
+++++ b/crates/metal2vulkan-runtime/src/shadow.rs
++@@ -1105,6 +1105,11 @@ pub(super) struct ShadowCopy<M = Arc<ShadowMerge>> {
++     /// takes, planned as the encoder takes the copy (`EncoderCore::sample_moves`); `None` for
++     /// every other texture, and where none could be planned (failing the command buffer).
++     pub(super) moves: Option<Arc<SampleMoves>>,
+++    /// pdx203 (bridge 0037): a rotated texture's copy back at its encoder's end that stores the
+++    /// image over copy back `n` of an earlier encoder of the command buffer, no command having
+++    /// read or written the plane since: that one is elided as this one is recorded
+++    /// (`rotated::RotatedCopies::elide`). `None` for every other copy.
+++    pub(super) supersedes: Option<u64>,
++ }
++ 
++ /// Why a copy in is made, as `WorkCounts` counts its texels.
++@@ -1809,6 +1814,7 @@ impl ShadowCopy {
++                         (buffer, staging),
++                         turned,
++                         back,
+++                        self.supersedes,
++                     );
++                 }
++                 return;
++@@ -2276,6 +2282,13 @@ struct Entry<M> {
++     /// reads only inside a rectangle and writes none, the rest left here. `None` where none
++     /// changed.
++     stale: Option<[u32; 4]>,
+++    /// pdx203 (bridge 0037): a rotated texture's copy back an earlier encoder of the command
+++    /// buffer recorded at its end, by number, that no command read or wrote the plane after
+++    /// since: a copy back at this encoder's end stores the image over it, and elides it.
+++    pending: Option<u64>,
+++    /// pdx203 (bridge 0037): the texture's copies back recorded before this encoder's end
+++    /// copied it back ([`rotated::RotatedCopies::stores`]): the end's copy back is the next.
+++    stores_before: Option<u64>,
++ }
++ 
++ impl<M> Entry<M> {
++@@ -2292,6 +2305,7 @@ impl<M> Entry<M> {
++     /// Note a change of the truth for `lost`: the image no longer holds it. One not copied in
++     /// yet stays so, and one that lost it already keeps the first reason.
++     fn lose(&mut self, lost: Lost) {
+++        self.pending = None;
++         if self.standing == Standing::Current {
++             self.standing = Standing::Lost(lost);
++         }
++@@ -2301,6 +2315,7 @@ impl<M> Entry<M> {
++     /// anywhere where `area` is `None`, for `lost`: the image is stale there, or no longer
++     /// current.
++     fn changed(&mut self, texels: &ShadowCopies, area: Option<[u32; 4]>, lost: Lost) {
+++        self.pending = None;
++         match area.filter(|_| self.stale_within(texels)) {
++             Some(area) => {
++                 self.stale = Some(match self.stale {
++@@ -2420,6 +2435,9 @@ pub(super) struct ShadowSync<M = Arc<ShadowMerge>> {
++     /// How the encoder's first copies in so far stood against their images' last standing, which
++     /// [`tally`](Self::tally) hands to the counters.
++     tally: CarryTally,
+++    /// pdx203 (bridge 0037): the encoder updated a fence, which another command buffer's work may
+++    /// wait for and read the plane after: no copy back of it or before it is elided.
+++    published: bool,
++ }
++ 
++ impl<M> Default for ShadowSync<M> {
++@@ -2429,6 +2447,7 @@ impl<M> Default for ShadowSync<M> {
++             entries: Vec::new(),
++             carry: ShadowCarry::default(),
++             tally: CarryTally::default(),
+++            published: false,
++         }
++     }
++ }
++@@ -2442,6 +2461,7 @@ impl<M> ShadowSync<M> {
++             entries: Vec::new(),
++             carry,
++             tally: CarryTally::default(),
+++            published: false,
++         }
++     }
++ 
++@@ -2486,6 +2506,22 @@ impl<M> ShadowSync<M> {
++             (uses.iter()).any(|used| !used.write.is_empty() && carried.copies.meets(used))
++         };
++         self.carry.entries.retain(|carried| !writes(carried));
+++        // pdx203 (bridge 0037): a read of the plane sees the copy back recorded before it.
+++        for carried in &mut self.carry.entries {
+++            if carried.pending.is_some() && uses.iter().any(|used| carried.copies.meets(used)) {
+++                carried.pending = None;
+++            }
+++        }
+++    }
+++
+++    /// pdx203 (bridge 0037): the encoder updated a fence: work another command buffer orders after
+++    /// it may read the plane, so no copy back recorded so far is elided.
+++    pub(super) fn published(&mut self) {
+++        self.published = true;
+++        self.carry.not_superseding();
+++        for entry in &mut self.entries {
+++            entry.pending = None;
+++        }
++     }
++ 
++     /// What the encoder leaves its command buffer's later encoders: every texture whose image
++@@ -2522,11 +2558,23 @@ impl<M> ShadowSync<M> {
++             if touched != entry.met {
++                 continue;
++             }
+++            // pdx203 (bridge 0037): the copy back the encoder's end recorded, where it was the
+++            // texture's next and an indirect dispatch of its own, or the one it carried on
+++            // unread, for a later encoder of the command buffer to elide.
+++            let pending = match (entry.stores_before, entry.copies.rotated()) {
+++                _ if self.published => None,
+++                (Some(before), Some(turn)) => {
+++                    (turn.stores() == before + 1 && turn.last_indirect() == Some(before)).then_some(before)
+++                }
+++                (Some(_), None) => None,
+++                (None, _) => entry.pending,
+++            };
++             carry.entries.push(Carried {
++                 copies: Arc::clone(&entry.copies),
++                 touched: touched + 1,
++                 held: entry.held,
++                 stale: entry.stale,
+++                pending,
++             });
++         }
++         self.entries.clear();
++@@ -2609,6 +2657,8 @@ struct Carried {
++     /// [`Entry::held`] and [`Entry::stale`] as it left them.
++     held: Option<[u32; 4]>,
++     stale: Option<[u32; 4]>,
+++    /// [`Entry::pending`] as it left it.
+++    pending: Option<u64>,
++ }
++ 
++ impl ShadowCarry {
++@@ -2618,6 +2668,14 @@ impl ShadowCarry {
++         self.entries.clear();
++     }
++ 
+++    /// pdx203 (bridge 0037): elide no copy back recorded so far: the command buffer signals an
+++    /// event or a semaphore, after which other work may read the planes.
+++    pub(super) fn not_superseding(&mut self) {
+++        for carried in &mut self.entries {
+++            carried.pending = None;
+++        }
+++    }
+++
++     /// The shadowed textures whose images it carries holding every texel of the truth, none
++     /// stale (`dirty_pages.rs`: what a command buffer's end leaves a later one's copy in).
++     pub(super) fn held_whole(&self) -> Vec<Arc<ShadowCopies>> {
++@@ -2706,6 +2764,8 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
++                     stale,
++                     met,
++                     carried: carried.is_some() || lasting.is_some(),
+++                    pending: carried.as_ref().and_then(|carried| carried.pending),
+++                    stores_before: None,
++                 });
++                 if lasting.is_some() {
++                     super::rotated::TURNS[4].fetch_add(1, Ordering::Relaxed);
++@@ -2727,7 +2787,7 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
++     /// area the commands wrote in, where they bound it: the image's other texels are what the last
++     /// copy in left, which the buffer still holds (a write of its bytes another way leaves the
++     /// image stale, and copies in again before the next use).
++-    fn copy_back(&mut self, i: usize, copies: &mut Vec<ShadowCopy<M>>) {
+++    fn copy_back(&mut self, i: usize, copies: &mut Vec<ShadowCopy<M>>, superseding: bool) {
++         let entry = &mut self.entries[i];
++         let two_ways = entry.two_ways;
++         let step = match &entry.merge {
++@@ -2753,6 +2813,16 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
++         };
++         entry.dirty = false;
++         entry.area = None;
+++        // pdx203 (bridge 0037): a rotated texture's copy back at the encoder's end stores the
+++        // image over the earlier encoder's it carried on unread (`ShadowCopy::supersedes`); any
+++        // other copy back leaves that one, which a command after this one may read the plane of.
+++        let supersedes = match (&step, superseding) {
+++            (Step::Back, true) => entry.pending.take(),
+++            _ => entry.pending.take().and(None),
+++        };
+++        if let (true, Some(turn)) = (superseding, entry.copies.rotated()) {
+++            entry.stores_before = Some(turn.stores());
+++        }
++         let written = Arc::clone(&entry.copies);
++         copies.push(ShadowCopy {
++             copies: Arc::clone(&written),
++@@ -2761,6 +2831,7 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
++             area,
++             cause: None,
++             moves: None,
+++            supersedes,
++         });
++         for (j, other) in self.entries.iter_mut().enumerate() {
++             if j != i && other.copies.shares_truth(&written) {
++@@ -2878,7 +2949,7 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
++             let unkept = entry.merge.is_none()
++                 && (merged_kept.iter()).any(|kept| kept.shadow_key == entry.copies.shadow_key);
++             if touched || regrows || unkept || (entry.merge.is_some() && entry.two_ways) {
++-                self.copy_back(i, &mut copies);
+++                self.copy_back(i, &mut copies, false);
++             }
++         }
++         for shadow in shadows {
++@@ -2910,7 +2981,7 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
++             // the encoder wrote through it goes back first, then the copy in below moves what
++             // this command needs.
++             if beyond_held && entry.dirty {
++-                self.copy_back(i, &mut copies);
+++                self.copy_back(i, &mut copies, false);
++             }
++             let entry = &mut self.entries[i];
++             let cause = match entry.standing {
++@@ -2939,6 +3010,7 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
++                         area: needs,
++                         cause: Some(cause),
++                         moves: None,
+++                        supersedes: None,
++                     });
++                 }
++                 entry.standing = Standing::Current;
++@@ -2968,6 +3040,7 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
++                         area: Some(area),
++                         cause: Some(CopyCause::Bounded),
++                         moves: None,
+++                        supersedes: None,
++                     });
++                 }
++             }
++@@ -2985,6 +3058,7 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
++                     area: needs,
++                     cause: Some(CopyCause::First),
++                     moves: None,
+++                    supersedes: None,
++                 };
++                 copy.texels_copied_in()
++             });
++@@ -3023,6 +3097,7 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
++                 area: None,
++                 cause: None,
++                 moves: None,
+++                supersedes: None,
++             });
++         }
++         for (shadow, merge) in kept {
++@@ -3036,8 +3111,26 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
++                 area: None,
++                 cause: None,
++                 moves: None,
+++                supersedes: None,
++             });
++         }
+++        // pdx203 (bridge 0037): a command that reads or writes a texture's plane, or another
+++        // texture over it, sees the copy back recorded before it, as does any copy of the texture
+++        // itself: that one is no longer elided.
+++        for entry in &mut self.entries {
+++            if entry.pending.is_none() {
+++                continue;
+++            }
+++            let key = entry.copies.shadow_key;
+++            let met = uses.iter().any(|used| entry.copies.meets(used))
+++                || shadows.iter().any(|shadow| {
+++                    shadow.copies.shadow_key != key && shadow.copies.shares_truth(&entry.copies)
+++                })
+++                || copies.iter().any(|copy| copy.copies.shadow_key == key);
+++            if met {
+++                entry.pending = None;
+++            }
+++        }
++         Ok(copies)
++     }
++ 
++@@ -3107,10 +3200,25 @@ impl<M: Clone + KeptArea> ShadowSync<M> {
++     /// The copies back at the end of the encoder: every texture written through since its last
++     /// (merged where kept).
++     pub(super) fn finish(&mut self) -> Vec<ShadowCopy<M>> {
+++        self.finish_with(false)
+++    }
+++
+++    /// pdx203 (bridge 0037): [`finish`](Self::finish) at the end of an encoder that is never
+++    /// encoded again: a rotated texture's copy back stores the image over the copy back an
+++    /// earlier encoder of the command buffer recorded at its end, where no command read or wrote
+++    /// the plane since, which is then elided (`ShadowCopy::supersedes`), and the encoder's end
+++    /// carries its own on for a later encoder's (`ShadowSync::ended`).
+++    pub(super) fn finish_superseding(&mut self) -> Vec<ShadowCopy<M>> {
+++        self.finish_with(true)
+++    }
+++
+++    fn finish_with(&mut self, superseding: bool) -> Vec<ShadowCopy<M>> {
++         let mut copies = Vec::new();
++         for i in 0..self.entries.len() {
++             if self.entries[i].dirty {
++-                self.copy_back(i, &mut copies);
+++                self.copy_back(i, &mut copies, superseding);
+++            } else if !superseding {
+++                self.entries[i].pending = None;
++             }
++         }
++         copies
++diff --git a/crates/metal2vulkan-runtime/src/tests/shadow.rs b/crates/metal2vulkan-runtime/src/tests/shadow.rs
++index 3b723a8..f81cee8 100644
++--- a/crates/metal2vulkan-runtime/src/tests/shadow.rs
+++++ b/crates/metal2vulkan-runtime/src/tests/shadow.rs
++@@ -445,6 +445,7 @@ fn a_copy_in_covers_only_where_the_command_reads_and_writes() {
++         area: Some(a),
++         cause: Some(CopyCause::First),
++         moves: None,
+++        supersedes: None,
++     };
++     assert_eq!((copy.texels_in(), copy.texels_back()), (32 * 16, 0));
++     assert_eq!(copy.texels_copied_in(), 32 * 16);
