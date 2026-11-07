@@ -1,0 +1,36 @@
+pdx203: launchd's foreground user endpoints from the addon (mount9)
+
+The pdx203 fork's mount9 (zzy-zpreboot-cryptex-mount) for format-2: /private/var/ngpu/xpc unioned over /System/Library/xpc, so the
+addon's foreground_user_endpoints.plist lets system-session callers reach per-user services (com.apple.containermanagerd for
+TrollStore's root helper, lsd, installcoordinationd).
+
+--- a/bsd/kern/kern_exec.c	2026-11-06 14:25:21
++++ b/bsd/kern/kern_exec.c	2026-11-06 14:25:21
+@@ -7247,6 +7247,13 @@
+  * the jailbreak switch (patches/xnu/zzzzzzzzzj-unixnu-jailbreak.patch, amfi=0x80's get-out-of-my-way bit). */
+ volatile int native_gpu_addon10_stage = 0;
+ volatile int native_gpu_addon10_status = -1;
++/* mount9: /private/var/ngpu/xpc unioned over /System/Library/xpc, with a foreground_user_endpoints.plist that also names the per-user
++ * services root callers need. launchd runs the UserName=mobile jobs (containermanagerd's user instance, lsd, installcoordinationd) in the
++ * user session, and a system-session process reaches only the user services this list names: TrollStore's root helper creates app
++ * containers through com.apple.containermanagerd and registers apps through lsd. The plist has no signature; launchd reads it after this
++ * mount. */
++volatile int native_gpu_addon9_stage = 0;
++volatile int native_gpu_addon9_status = -1;
+ static void
+ native_gpu_addon_mount(proc_t p, user_addr_t scratch, user_addr_t offset, const char *source, size_t source_size,
+     const char *point, size_t point_size, const char *visible, const char *own, volatile int *stage, volatile int *status)
+@@ -7729,6 +7736,13 @@
+ 	    "/System/Library/Audio/Plug-Ins/HAL/BuiltinAudioPlugin.driver", "/System/Library/Audio/Plug-Ins/HAL/ShengAudio.driver/Info.plist",
+ 	    &native_gpu_addon5_stage, &native_gpu_addon5_status);
+ 	printf("GPUADDON mount5 (audio HAL) %d/%d\n", native_gpu_addon5_stage, native_gpu_addon5_status);
++	/* launchd's user-session endpoints (mount9). Scratch slot 0xec0 (type 0xec0, path 0xee0, data 0xfc0): mount5's arguments were
++	 * consumed by its mount() call before this one starts. */
++	static const char xpc_source[] = "/private/var/ngpu/xpc", xpc_point[] = "/System/Library/xpc";
++	native_gpu_addon_mount(p, scratch, 0xec0, xpc_source, sizeof(xpc_source), xpc_point, sizeof(xpc_point),
++	    "/System/Library/xpc/launchd.plist", "/System/Library/xpc/foreground_user_endpoints.plist", &native_gpu_addon9_stage,
++	    &native_gpu_addon9_status);
++	printf("GPUADDON mount9 (user endpoints) %d/%d\n", native_gpu_addon9_stage, native_gpu_addon9_status);
+ 	native_cryptex_os_view(p, scratch);
+ 	native_gestalt_cache_drop(p, scratch);
+ 	native_ls_store_drop(p, scratch);

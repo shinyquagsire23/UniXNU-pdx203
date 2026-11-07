@@ -35,6 +35,9 @@ entitlements.write_bytes(plistlib.dumps({'com.apple.private.security.no-containe
                                          # SystemAppMigrator run in-process (installStagedSystemApps): com.apple.datamigrator's install grants
                                          'com.apple.private.InstallCoordination.allowed': True,
                                          'com.apple.private.MobileContainerManager.allowed': True,
+                                         # provisionTrollStoreBundle: create TrollStore's MCMAppContainer bundle container (DroidVM ipatool needs these for class-1 create)
+                                         'com.apple.private.security.storage.AppBundles': True,
+                                         'com.apple.private.security.storage.AppDataContainers': True,
                                          'com.apple.private.amfi.can-check-trust-cache': True,
                                          # overlayApps: bindfs our app bundles over installed ones
                                          'com.apple.private.bindfs-allow': True, 'com.apple.appstored.private': True,

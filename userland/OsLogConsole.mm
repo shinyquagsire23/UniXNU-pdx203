@@ -479,6 +479,50 @@ void overlayApps() {
         emit(line);
     }
 }
+
+// TrollStore installs its downloaded ldid, and every app it installs, under its own MCMAppContainer bundle container
+// (trollStorePath() = MCMAppContainer com.opa334.TrollStore; trollStoreAppPath() = that + /TrollStore.app). On this port
+// TrollStore is only an overlay over Tips.app and never had a bundle container, so its helper's create=0 lookup returned
+// CONTAINER_NOT_FOUND (21) and it crashed on the nil path (install error 173). This provisions that bundle container once (the
+// container create needs the forwarder's cdhash in the owner trust cache so containermanagerd does not refuse it as NOT_CODESIGNED,
+// trust/trollstorehelper.json et al) and copies TrollStore.app into it, so the helper finds its own app and can write ldid there.
+// Idempotent: a populated bundle (the user's installed ldid lives in it, on the Data volume) is left as is.
+void provisionTrollStoreBundle() {
+    char line[600];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *src = @"/private/var/ngpu/apps/TrollStore.app";
+    if (![fm fileExistsAtPath:src]) return;
+    dlopen("/System/Library/PrivateFrameworks/MobileContainerManager.framework/MobileContainerManager", RTLD_NOW);
+    Class cls = objc_getClass("MCMAppContainer");
+    SEL sel = @selector(containerWithIdentifier:createIfNecessary:existed:error:);
+    if (!cls || ![cls respondsToSelector:sel]) {
+        emit("OSLOG trollstore: MCMAppContainer unavailable\n");
+        return;
+    }
+    NSError *err = nil;
+    id container = ((id (*)(Class, SEL, id, BOOL, void *, NSError **))objc_msgSend)(cls, sel, @"com.opa334.TrollStore", (BOOL)YES, nullptr, &err);
+    if (!container) {
+        snprintf(line, sizeof line, "OSLOG trollstore: bundle container create failed: %s [%s %ld]\n",
+                 err ? err.localizedDescription.UTF8String : "nil", err ? err.domain.UTF8String : "-", err ? (long)err.code : 0L);
+        emit(line);
+        return;
+    }
+    id url = ((id (*)(id, SEL))objc_msgSend)(container, @selector(url));
+    NSString *root = url ? ((id (*)(id, SEL))objc_msgSend)(url, @selector(path)) : nil;
+    if (!root) { emit("OSLOG trollstore: bundle container has no path\n"); return; }
+    NSString *dest = [root stringByAppendingPathComponent:@"TrollStore.app"];
+    if ([fm fileExistsAtPath:dest]) {
+        BOOL ldid = [fm fileExistsAtPath:[dest stringByAppendingPathComponent:@"ldid"]];
+        snprintf(line, sizeof line, "OSLOG trollstore: bundle ready at %s (ldid %s)\n", dest.UTF8String, ldid ? "present" : "not yet");
+        emit(line);
+        return;
+    }
+    err = nil;
+    BOOL ok = [fm copyItemAtPath:src toPath:dest error:&err];
+    snprintf(line, sizeof line, "OSLOG trollstore: provisioned bundle %s: %s\n", dest.UTF8String,
+             ok ? "ok (now tap Install ldid in TrollStore)" : (err ? err.localizedDescription.UTF8String : "copy failed"));
+    emit(line);
+}
 }  // namespace
 
 // The deletable system apps (Maps, Music, Stocks, ...): a restore leaves them as placeholders ("Waiting...") that the first-boot data
@@ -1458,6 +1502,7 @@ int main() {
         resetDisplayZoom();
         launchServicesDatabase();
         overlayApps();
+        provisionTrollStoreBundle();
         // The staged-app registration needs containermanagerd and lsd up; at this point in boot they may not be. Try once now,
         // then keep retrying on the 5 s crash-dump loop (up to ~2 min) until every app registers, so a daemon that comes up late
         // still gets the icons placed (f2s: container=n + refused for both apps on the single startup attempt).
