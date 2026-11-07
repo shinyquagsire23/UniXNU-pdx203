@@ -1,0 +1,39 @@
+From: pdx203 <noreply@anthropic.com>
+Subject: gpu: big-BO log
+
+BOs of 16 MiB or more are logged with their process and the count of failed contiguous-first attempts.
+
+--- a/NativeAdrenoUserClient.cpp
++++ b/NativeAdrenoUserClient.cpp
+@@ -48,6 +48,10 @@
+ #include <IOKit/IOLib.h>
+ #include <string.h>
+ extern "C" {volatile uint32_t native_adreno_window_overflow[4][3];}   /* {count, last size KiB, last end MiB} per client window */
++/* 0019: [3] contiguous-first attempts that failed (the others unused). A backoff that skipped them after a failure made every 64 MiB block
++ * scattered, 16384 spans each, and the shared table's 131072 ran out: BoMap refused 2632 times (gm1, Dusklight's imports failed). */
++extern "C" {volatile uint64_t native_adreno_contig_fail[4];}
++extern "C" void proc_selfname(char *,int);
+ NativeAdrenoUserClient::Entry *NativeAdrenoUserClient::find(uint64_t handle)
+ {
+     const uint32_t index=entries_?index_.find(handle):UINT32_MAX;
+@@ -212,6 +216,12 @@
+ {
+     const IOReturn status=allocBoInner(request,reply);
+     if(!status && request)noteHist(queue_base_,window_bytes_,request->bytes,false,1);
++    /* 0019: what the render server's landscape BOs of more than 16 MiB are (seven of them, ~50 MiB each, held after rotating back). */
++    if(request && request->bytes>=(16u<<20)) {
++        char name[17]={};proc_selfname(name,sizeof name);
++        IOLog("NativeAdreno: big BO %s %llu KiB align %u contig %u -> %x, contiguous failures %llu\n",name,(unsigned long long)(request->bytes>>10),
++            (unsigned)request->align_log2,(unsigned)request->contiguous,status,(unsigned long long)native_adreno_contig_fail[3]);
++    }
+     if(status && request) {
+         volatile uint32_t *stats=clientStats(queue_base_,window_bytes_);
+         stats[2]=stats[2]+1;stats[3]=(uint32_t)status;stats[4]=(uint32_t)request->bytes;
+@@ -237,6 +247,7 @@
+     const bool prefer_contiguous=request->contiguous==0 && request->bytes>=NativeAdrenoClientContiguousFirstBytes;
+     if(prefer_contiguous) {
+         status=entry->memory.allocate((size_t)request->bytes,output_bits_,true,(size_t)request->bytes,true);
++        if(status)native_adreno_contig_fail[3]=native_adreno_contig_fail[3]+1;
+         if(status && !entry->memory.quarantined() && entry->memory.release()==kIOReturnSuccess)status=kIOReturnUnsupported;
+     }
+     if(status)

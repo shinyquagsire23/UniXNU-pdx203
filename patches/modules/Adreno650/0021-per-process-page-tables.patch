@@ -1,0 +1,650 @@
+From: pdx203 <noreply@anthropic.com>
+Subject: gpu: per-process page tables
+
+Every user client gets its own TTBR0 table and VM (NativeAdrenoGpuContext client spaces): a table in the live one's format
+over [0, 4 GiB) with the five kernel buffers mapped at their addresses, the client's BOs in [64 MiB, 4 GiB). The submit
+object switches the CP to the client's table with CP_SMMU_TABLE_UPDATE (a6xx_set_pagetable's sequence) when the next job runs
+on another table, and a closing client's table goes only after the CP was switched back to the live one. The live and client
+contexts accept a TTBR0 the device switched (ArmSmmu4KContextConfig.device_switched_ttbr0). Jobs remember their VM. A VM's
+range table grows on demand (gm1: scattered 64 MiB blocks filled 131072 ranges). The board turns it on after its probe.
+
+--- a/NativeAdrenoSmmuContext.h
++++ b/NativeAdrenoSmmuContext.h
+@@ -34,8 +34,11 @@
+     enum : size_t {MaxLeaves=size_t(1)<<21};   /* the GPU's 8 GiB (pdx203, 4 GiB in sa54); the GMU's 2 GiB passes 1<<19 itself */
+     /* iova/bytes describe the aperture in the chosen region; the pool must be contiguous. */
+     /* output_bits: the context's output size, at most the SMMU's ID2.OAS (Linux uses OAS for stage 1). */
++    /* min_input_bits: a client table of a smaller range in a context whose TCR covers more (per-process tables share the bank's TCR). */
+     IOReturn prepare(NativeAdrenoMemory *tables,unsigned upper,uint64_t iova,size_t bytes,
+-        size_t leaf_budget,unsigned bank,unsigned asid,unsigned poll_budget,unsigned output_bits=40);
++        size_t leaf_budget,unsigned bank,unsigned asid,unsigned poll_budget,unsigned output_bits=40,unsigned min_input_bits=32);
++    /* The device switches TTBR0 itself from now on (ArmSmmu4KContextConfig.device_switched_ttbr0). Only after prepare. */
++    void setDeviceSwitched() {config_.device_switched_ttbr0=1;}
+     /* Reads actual IDs, programs and enables exactly this bank. */
+     IOReturn program(const ArmSmmu4KIo *);
+     /* Attach the caller's exact stream routes to the programmed bank. */
+--- a/NativeAdrenoSmmuContext.cpp
++++ b/NativeAdrenoSmmuContext.cpp
+@@ -6,14 +6,14 @@
+  * either way, so outer non-cacheable walks see each update. */
+ extern "C" {volatile uint32_t native_adreno_smmu_coherent_walk=1;}
+ IOReturn NativeAdrenoSmmuContext::prepare(NativeAdrenoMemory *tables,unsigned upper,uint64_t iova,
+-    size_t bytes,size_t leaf_budget,unsigned bank,unsigned asid,unsigned poll_budget,unsigned output_bits)
++    size_t bytes,size_t leaf_budget,unsigned bank,unsigned asid,unsigned poll_budget,unsigned output_bits,unsigned min_input_bits)
+ {
+     if(prepared_ || poisoned_)return kIOReturnBusy;
+     if(!tables || upper>1 || !bytes || (iova&4095) || !leaf_budget || leaf_budget>MaxLeaves ||
+         bank>63 || asid>0xffff || !poll_budget || poll_budget>4096)
+         return kIOReturnBadArgument;
+     /* The least input size (32 at least) whose range holds [iova, iova+bytes): 33 bits for the GPU's 8 GiB aperture. */
+-    unsigned input_bits=32;
++    unsigned input_bits=min_input_bits>32 && min_input_bits<=48?min_input_bits:32;
+     while(input_bits<48 && iova+bytes>(UINT64_C(1)<<input_bits))++input_bits;
+     const IOReturn prepared=NativeAdrenoPrepareSmmuMemory(tables,input_bits,output_bits,iova,bytes,upper,leaf_budget,
+         &arena_,&state_,&visibility_);
+--- a/NativeAdrenoVm.h
++++ b/NativeAdrenoVm.h
+@@ -31,6 +31,9 @@
+  * kIOReturnNoResources at objects=1024, Turnip wrote through a NULL command stream and backboardd crashed), and 4096 after a few app
+  * switches (i567: both backboardd crashes came at objects=4096, after it held about 4000 for minutes). */
+ enum : size_t {NativeAdrenoVmMaxObjects=16384};
++/* pdx203 0021: the range table grows instead of refusing (gm1: Dusklight's scattered 64 MiB blocks, 16384 ranges each, filled the
++ * shared table's 131072 and BoMap refused 2632 times). 1<<20 ranges are 4 GiB of single pages, 40 MiB of table. */
++enum : size_t {NativeAdrenoVmMaxRanges=size_t(1)<<20};
+ /* Board hook for sampleWord(): reads one aligned word of physical memory through a fresh uncached mapping; 0 on success. */
+ extern "C" int (*native_adreno_dram_read32)(uint64_t physical,uint32_t *value);
+ /* The board's reader through the kernel's cacheable physical aperture (null on the host: the BO's own mapping is read). */
+@@ -81,6 +84,8 @@
+     void erase(size_t,size_t,unsigned);
+     IOReturn preflight(const NativeAdrenoMemory *,unsigned,uint64_t,unsigned,unsigned,unsigned,bool exclusive) const;
+     bool exclusivePages(const NativeAdrenoMemory *,unsigned cls) const;
++    /* Room for `more` ranges past the mapped ones (plus their staging copy): ranges_ doubles up to NativeAdrenoVmMaxRanges. */
++    bool reserveRanges(size_t more);
+ public:
+     NativeAdrenoVm()=default;
+     ~NativeAdrenoVm()=default;
+@@ -140,6 +145,8 @@
+      * A timeout, interrupt bit alone or CPU-written timestamp is insufficient. */
+     IOReturn retireJobAfterCompletion(uint64_t handle);
+     bool poisoned() const {return poisoned_;}
++    /* 0021: the full observation (routes, context image, both table graphs) without failing on a mismatch: the kit's status. */
++    ArmSmmu4KStatus verifyContext() const {return attached_?observe():ArmSmmu4KArgument;}
+     size_t objectCount() const {return objects_;}
+     size_t spanCount() const {return lower_count_+upper_count_;}
+     NativeAdrenoVmResult lastResult() const {return result_;}
+--- a/NativeAdrenoVm.cpp
++++ b/NativeAdrenoVm.cpp
+@@ -114,6 +114,11 @@
+ }
+ IOReturn NativeAdrenoVm::fail(ArmSmmu4KStatus status)
+ {
++    /* 0021: a client VM's failure faults the shared streams too; say so before it happens. */
++    IOLog("NativeAdrenoVm %p: FAIL status %d (objects %zu spans %zu): faulting the GPU streams\n",this,(int)status,objects_,spanCount());
++#ifdef KERNEL
++    IOSleep(50);
++#endif
+     poisoned_=true;result_.operation=status;result_.complete=false;
+     for(size_t i=0;mappings_ && i<high_;++i)if(mappings_[i].memory)mappings_[i].memory->quarantine();
+     for(auto &r:regions_)if(r.arena) {r.tables->quarantine();r.state->poisoned=1;}
+@@ -308,6 +313,21 @@
+     memmove(ranges_+at,ranges_+at+n,(count-at-n)*sizeof(*ranges_));
+     if(upper)upper_count_-=n;else lower_count_-=n;
+ }
++bool NativeAdrenoVm::reserveRanges(size_t more)
++{
++    /* map() stages a mapping's ranges in the free tail and insert() may copy them once more past it. */
++    const size_t need=spanCount()+2*more;
++    if(need<=capacity_)return true;
++    if(need>NativeAdrenoVmMaxRanges)return false;
++    size_t capacity=capacity_;while(capacity<need)capacity*=2;
++    if(capacity>NativeAdrenoVmMaxRanges)capacity=NativeAdrenoVmMaxRanges;
++    ArmSmmu4KRange *grown=IONewData(ArmSmmu4KRange,capacity);
++    if(!grown)return false;
++    memcpy(grown,ranges_,spanCount()*sizeof(*ranges_));
++    IODeleteData(ranges_,ArmSmmu4KRange,capacity_);
++    ranges_=grown;capacity_=capacity;
++    return true;
++}
+ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t iova,
+     unsigned permissions,unsigned writeback,unsigned shareability,uint64_t *handle)
+ {
+@@ -317,6 +337,7 @@
+     PhaseClock clock;
+     const unsigned cls=aliasClass(permissions,writeback,shareability)&15;
+     const bool exclusive=exclusivePages(memory,cls);
++    if(memory && !reserveRanges(memory->spanCount()))return kIOReturnNoResources;
+     IOReturn checked=preflight(memory,upper,iova,permissions,writeback,shareability,exclusive);if(checked)return checked;
+     if(next_handle_==UINT64_MAX)return kIOReturnNoResources;
+     clock.lap(0,5); /* Previously omitted preflight; map slot 5 was unused. */
+--- a/NativeAdrenoGpuContext.h
++++ b/NativeAdrenoGpuContext.h
+@@ -26,6 +26,12 @@
+ enum : size_t {GpuSqeBytes=0x13000, GpuRingBytes=0x8000, GpuPageBytes=0x1000, GpuBufferCount=5};
+ struct NativeAdrenoGpuBuffer {uint64_t physical,bytes,iova;};
+ struct NativeAdrenoGpuTableProbe;
++/* Per-process page tables (pdx203 0021): one client's own TTBR0 table and VM, the kernel buffers mapped in it at their addresses (so the
++ * ring, its memory pointers and the SQE stay reachable whichever table the CP runs on), its BOs in [ClientVaStart, ClientApertureBytes).
++ * The CP switches to root (CP_SMMU_TABLE_UPDATE, NativeAdrenoSubmit) before the client's work. */
++enum : uint64_t {ClientVaStart=0x4000000ull,ClientApertureBytes=0x100000000ull};
++struct NativeAdrenoClientSpace;
++struct NativeAdrenoClientSpaceInfo {NativeAdrenoVm *vm;uint64_t root,va_start,va_bytes;};
+ class NativeAdrenoGpuContext final {
+     NativeAdrenoMemory tables_,buffers_[GpuBufferCount];
+     uint64_t handles_[GpuBufferCount]{};
+@@ -35,6 +41,8 @@
+     uint32_t alias_scratch_[NativeAdrenoSmmuContext::MaxLeaves/2];
+     bool ready_=false,used_=false;
+     NativeAdrenoMemory probe_;   /* the table probe's tables and page (tableProbe) */
++    bool spaces_=false;
++    unsigned bank_=0,asid_=0;
+     unsigned output_bits_=0;
+ public:
+     enum Step : uint32_t {Allocate=1,Prepare,Program,Attach,VmAttach,Map,Ready};
+@@ -48,6 +56,13 @@
+         void (*progress)(uint32_t step),NativeAdrenoGmuContextReport *report);
+     bool ready() const {return ready_;}
+     IOReturn tableProbe(NativeAdrenoGpuTableProbe *out);
++    /* Client spaces: only once enableClientSpaces() ran (the board's table probe switched the CP). Callers serialize. */
++    void enableClientSpaces();
++    bool clientSpaces() const {return spaces_;}
++    IOReturn createSpace(size_t range_capacity,NativeAdrenoClientSpace **out,NativeAdrenoClientSpaceInfo *info);
++    /* Only with no BO of the client mapped, no job of it outstanding and the CP on another table. */
++    IOReturn destroySpace(NativeAdrenoClientSpace *);
++    uint64_t liveRoot() {return smmu_.stateHandle()->tables.root_physical;}
+     const NativeAdrenoMemory &buffer(unsigned index) const {return buffers_[index];}
+     NativeAdrenoVm *vm() {return ready_?&vm_:nullptr;}
+ };
+@@ -74,6 +89,14 @@
+     uint64_t ring_leaf,live_ring_leaf;   /* the level-3 descriptor of GpuRingIova in each table (format check; 0: not found) */
+ };
+ extern "C" IOReturn NativeAdrenoGpuContextTableProbe(NativeAdrenoGpuTableProbe *out);
++/* Per-process page tables on (after a passed probe); the creation and teardown of a client's space; the live (kernel) table's root. */
++extern "C" void NativeAdrenoGpuContextEnableClientSpaces(void);
++extern "C" bool NativeAdrenoGpuContextClientSpaces(void);
++extern "C" IOReturn NativeAdrenoGpuContextCreateSpace(size_t range_capacity,NativeAdrenoClientSpace **out,NativeAdrenoClientSpaceInfo *info);
++extern "C" IOReturn NativeAdrenoGpuContextDestroySpace(NativeAdrenoClientSpace *);
++extern "C" uint64_t NativeAdrenoGpuContextLiveRoot(void);
++/* {spaces made, destroyed, live now, creation failures, last failure status, table MiB live, contiguous-from-pool spaces, peak live} */
++extern "C" volatile uint32_t native_adreno_space_stats[8];
+ /* The live VM of the ready GPU context (null before Ready), for the user-client core. */
+ extern "C" NativeAdrenoVm *NativeAdrenoGpuContextVm();
+ #endif
+--- a/NativeAdrenoGpuContext.cpp
++++ b/NativeAdrenoGpuContext.cpp
+@@ -19,7 +19,7 @@
+         if(routes[i].slot>127)return kIOReturnBadArgument;
+         for(size_t j=0;j<i;++j)if(routes[i].slot==routes[j].slot)return kIOReturnBadArgument;
+     }
+-    used_=true;
++    used_=true;bank_=bank;asid_=asid;
+     IOReturn status=kIOReturnSuccess;
+     auto step=[&](Step s) {report->step=s;if(progress)progress(s);};
+     step(Allocate);
+@@ -145,7 +145,102 @@
+     out->scratch=static_cast<volatile uint32_t *>(buffers_[GpuBufferCount-1].mapping());
+     return kIOReturnSuccess;
+ }
++struct NativeAdrenoClientSpace {
++    NativeAdrenoMemory tables;
++    NativeAdrenoSmmuContext smmu;
++    NativeAdrenoVm vm;
++    uint64_t handles[GpuBufferCount]{};
++    bool attached=false;
++};
++extern "C" {volatile uint32_t native_adreno_space_stats[8];}
++void NativeAdrenoGpuContext::enableClientSpaces()
++{
++    if(!ready_)return;
++    /* The live context's own checks then accept a TTBR0 the CP switched (any root, this ASID). */
++    smmu_.setDeviceSwitched();
++    spaces_=true;
++}
++IOReturn NativeAdrenoGpuContext::createSpace(size_t range_capacity,NativeAdrenoClientSpace **out,NativeAdrenoClientSpaceInfo *info)
++{
++    if(!out || !info)return kIOReturnBadArgument;
++    *out=nullptr;*info={};
++    if(!ready_ || !spaces_)return kIOReturnNotReady;
++    volatile uint32_t *st=native_adreno_space_stats;
++    unsigned step=0;
++    auto failed=[&](IOReturn status,NativeAdrenoClientSpace *space)->IOReturn {
++        st[3]=st[3]+1;st[4]=(uint32_t)status;
++        IOLog("NativeAdrenoSpace: creation failed at step %u: %x\n",step,status);IOSleep(30);
++        if(space)(void)destroySpace(space);
++        return status;
++    };
++    NativeAdrenoClientSpace *space=new NativeAdrenoClientSpace;
++    if(!space)return failed(kIOReturnNoMemory,nullptr);
++    /* The live table's format (its input bits, so the bank's TCR fits) over [0, ClientApertureBytes): a level-1 root, one level-2 table a
++     * GiB and one level-3 table per 2 MiB. Cacheable contiguous memory first (pool pages are write-combined, and table updates through such a
++     * mapping were 2.6x slower, int-153), then the BO pool. */
++    const unsigned input_bits=smmu_.arena()->config.input_bits;
++    const size_t pages=1+size_t((ClientApertureBytes+(UINT64_C(1)<<30)-1)>>30)+size_t((ClientApertureBytes+(UINT64_C(1)<<21)-1)>>21);
++    step=1;IOReturn status=space->tables.allocate(pages*0x1000,output_bits_,true,pages*0x1000);
++    if(status) {
++        status=space->tables.allocate(pages*0x1000,output_bits_,true,pages*0x1000,true);
++        if(!status)st[6]=st[6]+1;
++    }
++    if(status)return failed(status,space);
++    step=2;status=space->smmu.prepare(&space->tables,0,0,ClientApertureBytes,size_t(ClientApertureBytes>>12),bank_,asid_,1000,output_bits_,input_bits);
++    if(status)return failed(status,space);
++    space->smmu.setDeviceSwitched();
++    space->smmu.setAliasScratch(alias_scratch_,sizeof alias_scratch_/sizeof *alias_scratch_);
++    NativeAdrenoVmRegion lower={&space->tables,space->smmu.arenaHandle(),space->smmu.stateHandle()};
++    /* The live context's io and stream routes: one bank, one set of streams, the tables alone are the client's. */
++    step=3;IOLog("NativeAdrenoSpace: tables %zu pages at %llx, attaching\n",pages,(unsigned long long)space->tables.spans()[0].physical);IOSleep(30);
++    status=space->vm.attach(smmu_.ioHandle(),space->smmu.configHandle(),smmu_.streamsHandle(),&lower,nullptr,range_capacity,262144);
++    if(status)return failed(status,space);
++    space->attached=true;step=4;
++    for(unsigned i=0;!status && i<GpuBufferCount;++i)
++        status=space->vm.map(&buffers_[i],0,kIovas[i],i?3u:5u,0,2,&space->handles[i]);
++    if(status)return failed(status,space);
++    *out=space;
++    *info={&space->vm,space->smmu.stateHandle()->tables.root_physical,ClientVaStart,ClientApertureBytes-ClientVaStart};
++    st[0]=st[0]+1;st[2]=st[2]+1;if(st[2]>st[7])st[7]=st[2];st[5]=st[5]+(uint32_t)((pages*0x1000)>>20);
++    return kIOReturnSuccess;
++}
++IOReturn NativeAdrenoGpuContext::destroySpace(NativeAdrenoClientSpace *space)
++{
++    if(!space)return kIOReturnBadArgument;
++    volatile uint32_t *st=native_adreno_space_stats;
++    const bool counted=space->handles[GpuBufferCount-1]!=0;
++    if(space->attached) {
++        for(unsigned i=0;i<GpuBufferCount;++i)if(space->handles[i]) {
++            const IOReturn unmapped=space->vm.unmap(space->handles[i]);
++            if(unmapped)return unmapped;   /* kept: its tables may still be in use */
++            space->handles[i]=0;
++        }
++        const IOReturn detached=space->vm.detach();
++        if(detached)return detached;
++        space->attached=false;
++    }
++    if(space->tables.backed()) {
++        const size_t bytes=space->tables.bytes();
++        if(space->tables.deviceReferences()) {
++            const IOReturn retired=space->tables.retireAfterQuiescence();
++            if(retired)return retired;
++        }
++        const IOReturn released=space->tables.release();
++        if(released)return released;
++        if(counted)st[5]=st[5]-(uint32_t)(bytes>>20);
++    }
++    if(counted) {st[1]=st[1]+1;st[2]=st[2]-1;}
++    delete space;
++    return kIOReturnSuccess;
++}
+ static NativeAdrenoGpuContext *board_gpu_context;
++extern "C" void NativeAdrenoGpuContextEnableClientSpaces(void) {if(board_gpu_context)board_gpu_context->enableClientSpaces();}
++extern "C" bool NativeAdrenoGpuContextClientSpaces(void) {return board_gpu_context && board_gpu_context->clientSpaces();}
++extern "C" IOReturn NativeAdrenoGpuContextCreateSpace(size_t range_capacity,NativeAdrenoClientSpace **out,NativeAdrenoClientSpaceInfo *info)
++{return board_gpu_context?board_gpu_context->createSpace(range_capacity,out,info):kIOReturnNotReady;}
++extern "C" IOReturn NativeAdrenoGpuContextDestroySpace(NativeAdrenoClientSpace *space)
++{return board_gpu_context?board_gpu_context->destroySpace(space):kIOReturnNotReady;}
++extern "C" uint64_t NativeAdrenoGpuContextLiveRoot(void) {return board_gpu_context?board_gpu_context->liveRoot():0;}
+ extern "C" IOReturn NativeAdrenoGpuContextTableProbe(NativeAdrenoGpuTableProbe *out)
+ {
+     if(!out)return kIOReturnBadArgument;
+--- a/NativeAdrenoSubmit.h
++++ b/NativeAdrenoSubmit.h
+@@ -39,7 +39,14 @@
+         uint32_t queue=0;
+         bool active=false;
+         uint64_t vm_next=0;   /* NativeAdrenoVm::nextHandle() at submission: a mapping with a handle from it on came later */
++        NativeAdrenoVm *vm=nullptr;   /* the VM the job's handles belong to (a client's own with per-process tables) */
+     } jobs_[8];
++    /* Per-process page tables (0021): the TTBR0 root the CP runs on after the last submission written to the ring (0: unknown), the live
++     * TTBR0's low bits and ASID every switch keeps, and whether switching is on. */
++    uint64_t current_root_=0,live_root_=0;
++    uint32_t ttbr_low_=0,asid_=0;
++    bool tables_=false;
++    size_t emitSwitch(uint32_t *words,uint64_t root) const;
+     NativeAdrenoVm *vm_=nullptr;
+     NativeAdrenoRing *ring_=nullptr;
+     NativeAdrenoSubmitStats stats_{};
+@@ -48,7 +55,7 @@
+     uint32_t audit_tick_=0;   /* submissions since attach; every eighth one audits its IB lines */
+     /* submit()'s distinct buffers and ring words: too large for the kernel stack at 128 IBs (callers serialize every method) */
+     uint64_t scratch_handles_[NativeAdrenoSubmitMaxBuffers]{};
+-    uint32_t scratch_words_[NativeAdrenoSubmitMaxBuffers*4]{};
++    uint32_t scratch_words_[NativeAdrenoSubmitMaxBuffers*4+32]{};   /* +32: a table switch ahead of the IBs */
+     Job *find(uint32_t fence);
+     Job *free();
+     IOReturn release(Job &);
+@@ -65,7 +72,14 @@
+     /* queue is bookkeeping for one shared ring; it never reorders or isolates
+      * submissions and is validated by the caller's open queue set. */
+     IOReturn submit(const NativeAdrenoSubmitBuffer *,size_t,uint32_t queue,
+-        uint32_t *fence);
++        uint32_t *fence,NativeAdrenoVm *vm=nullptr,uint64_t root=0);
++    /* Switching on: the CP runs on live_root now (the attached VM's table); ttbr_low and asid are the live TTBR0's. */
++    void enableTables(uint64_t live_root,uint32_t ttbr_low,uint32_t asid)
++    {live_root_=current_root_=live_root;ttbr_low_=ttbr_low;asid_=asid;tables_=true;}
++    bool tablesEnabled() const {return tables_;}
++    uint64_t currentRoot() const {return current_root_;}
++    /* Before a client's table goes: when the CP may still run on root, a kernel submission switches it to the live table and is waited for. */
++    IOReturn leaveTable(uint64_t root,const NativeAdrenoRingClock *,uint32_t timeout_us);
+     bool queueOutstanding(uint32_t queue) const;
+     /* Queues [first, first+count): whether any of their jobs is outstanding, and a wait for every one of them (oldest first) that
+      * leaves other queues' jobs alone. Each client of the shared ring owns one such range. */
+--- a/NativeAdrenoSubmit.cpp
++++ b/NativeAdrenoSubmit.cpp
+@@ -60,6 +60,8 @@
+ extern "C" {volatile uint32_t native_adreno_unstick[15];}
+ /* The IBs of the last submissions: [slot] fence, iova low/high, bytes, then the first 28 dwords of the first IB (read as the kernel maps it). */
+ extern "C" {volatile uint32_t native_adreno_ib_log[4][4+28];volatile uint32_t native_adreno_ib_log_count;}
++/* 0021: the TTBR0 root each logged submission ran on (its client's table, or the live one). */
++extern "C" {volatile uint64_t native_adreno_ib_log_root[4];}
+ /* Where a submission's time goes, in mach_absolute_time ticks summed over the successful ones (pipa 2026-10-25: Turnip's Submit call took
+  * about 1 to 1.4 ms on the render thread): [0] the buffers' validation, [1] the sweep of completed jobs and the job references, [2] the
+  * write-combine re-assertion and audit, [3] the BO publication (cache maintenance), [4] the coherence sample after it (the TLB
+@@ -90,12 +92,13 @@
+ IOReturn NativeAdrenoSubmit::release(Job &job)
+ {
+     IOReturn status=kIOReturnSuccess;
++    NativeAdrenoVm *vm=job.vm?job.vm:vm_;
+     for(size_t i=0;i<job.count;++i) {
+-        IOReturn retired=vm_->retireJobAfterCompletion(job.handles[i]);
++        IOReturn retired=vm->retireJobAfterCompletion(job.handles[i]);
+         if(retired)status=retired;else ++stats_.references_retired;
+     }
+     if(status)return poison();
+-    if(vm_->acquireImported())return poison();
++    if(vm->acquireImported())return poison();
+     job={};return kIOReturnSuccess;
+ }
+ IOReturn NativeAdrenoSubmit::detach()
+@@ -117,11 +120,49 @@
+ {
+     size_t count=0;for(const auto &job:jobs_)if(job.active)++count;return count;
+ }
++/* a6xx_set_pagetable for a non-A7XX GPU (the sequence the board's table probe proved, GpuProbe.cpp tableProbe): protected mode off,
++ * RBBM_PERFCTR_SRAM_INIT_CMD, CP_SMMU_TABLE_UPDATE (TTBR0 low with the live low bits, high 16 bits with the ASID, CONTEXTIDR 0, bank 0),
++ * CACHE_INVALIDATE, the SRAM init wait, protected mode on: 20 words. */
++extern "C" {volatile uint32_t native_adreno_table_switches[4];}   /* {switches emitted, leaveTable switches, leaveTable failures, 0} */
++size_t NativeAdrenoSubmit::emitSwitch(uint32_t *w,uint64_t root) const
++{
++    size_t n=0;
++    auto t7=[&](uint32_t op,uint32_t count){return AdrenoPM4Type7(op,count,&w[n++])==AdrenoPM4Success;};
++    auto t4=[&](uint32_t reg,uint32_t count){return AdrenoPM4Type4(reg,count,&w[n++])==AdrenoPM4Success;};
++    if(!t7(0x5f,1))return 0;w[n++]=0;
++    if(!t4(0x050e,1))return 0;w[n++]=1;
++    if(!t7(0x53,4))return 0;
++    w[n++]=(uint32_t)root|(ttbr_low_&0xfff);w[n++]=(uint32_t)(root>>32&0xffff)|asid_<<16;w[n++]=0;w[n++]=0;
++    if(!t7(0x46,1))return 0;w[n++]=0x31;
++    if(!t7(0x3c,6))return 0;w[n++]=3;w[n++]=0x050f;w[n++]=0;w[n++]=1;w[n++]=1;w[n++]=0;
++    if(!t7(0x5f,1))return 0;w[n++]=1;
++    return n;
++}
++IOReturn NativeAdrenoSubmit::leaveTable(uint64_t root,const NativeAdrenoRingClock *clock,uint32_t timeout_us)
++{
++    if(!attached_ || poisoned_)return kIOReturnNotReady;
++    if(!tables_ || (current_root_ && current_root_!=root) || root==live_root_)return kIOReturnSuccess;
++    uint32_t words[32];
++    const size_t n=emitSwitch(words,live_root_);
++    if(!n)return kIOReturnInternalError;
++    uint32_t fence=0,observed=0;
++    IOReturn status=ring_->submit(words,n,&fence);
++    if(!status) {
++        current_root_=live_root_;
++        const NativeAdrenoRingFence done=ring_->observeFence(fence,clock,timeout_us,&observed);
++        status=done==NativeAdrenoRingFenceComplete?kIOReturnSuccess:done==NativeAdrenoRingFenceTimeout?kIOReturnTimeout:kIOReturnIOError;
++    }
++    native_adreno_table_switches[status?2:1]=native_adreno_table_switches[status?2:1]+1;
++    return status;
++}
+ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size_t count,
+-    uint32_t queue,uint32_t *fence)
++    uint32_t queue,uint32_t *fence,NativeAdrenoVm *client_vm,uint64_t root)
+ {
+     if(!fence)return kIOReturnBadArgument;*fence=0;
+     if(!attached_ || poisoned_)return kIOReturnNotReady;
++    /* The client's own VM with per-process tables; the attached (shared) one otherwise. */
++    NativeAdrenoVm *const vm=client_vm?client_vm:vm_;
++    if(!root || !tables_)root=live_root_;
+     if(!buffers || !count || count>SubmitMaxBuffers) {native_adreno_submit_core_reject[0]=1;return kIOReturnBadArgument;}
+     uint64_t phase[7];phase[0]=mach_absolute_time();
+     native_adreno_submit_ibs[0]=native_adreno_submit_ibs[0]+1;native_adreno_submit_ibs[1]=native_adreno_submit_ibs[1]+(uint32_t)count;
+@@ -130,6 +171,19 @@
+     /* Every buffer is validated against the live VM before any reference. */
+     uint64_t *handles=scratch_handles_;size_t handle_count=0;
+     uint32_t *words=scratch_words_;size_t word_count=0;
++    /* A switch to the client's table first when the CP runs on another one. */
++    const bool switching=tables_ && root!=current_root_;
++    if(switching) {
++        word_count=emitSwitch(words,root);
++        if(!word_count)return poison();
++        if(native_adreno_table_switches[0]<6) {
++            IOLog("NativeAdrenoSpace: switch %u to %llx from %llx (queue %u, %zu IBs)\n",native_adreno_table_switches[0],
++                (unsigned long long)root,(unsigned long long)current_root_,queue,count);
++#ifdef KERNEL
++            IOSleep(30);
++#endif
++        }
++    }
+     static_assert(sizeof(scratch_words_)/sizeof(scratch_words_[0])>=SubmitMaxBuffers*(1+SubmitIbWords),"ring words");
+     for(size_t i=0;i<count;++i) {
+         const NativeAdrenoSubmitBuffer &buffer=buffers[i];
+@@ -138,7 +192,7 @@
+             cr[0]=2;cr[1]=(uint32_t)i;cr[2]=(uint32_t)buffer.iova;cr[3]=(uint32_t)buffer.bytes;return kIOReturnBadArgument;
+         }
+         uint64_t iova=0;size_t bytes=0;unsigned permissions=0;
+-        IOReturn status=vm_->describe(buffer.handle,&iova,&bytes,&permissions);
++        IOReturn status=vm->describe(buffer.handle,&iova,&bytes,&permissions);
+         if(status) {cr[0]=4;cr[1]=(uint32_t)i;cr[2]=(uint32_t)buffer.iova;cr[3]=(uint32_t)buffer.bytes;return status;}
+         if(!(permissions&ArmSmmu4KRead) || buffer.iova<iova ||
+             buffer.iova-iova>bytes || buffer.bytes>bytes-(buffer.iova-iova)) {
+@@ -162,9 +216,9 @@
+     Job *job=free();
+     if(!job)return kIOReturnBusy;
+     for(size_t i=0;i<handle_count;++i) {
+-        IOReturn status=vm_->holdJob(handles[i]);
++        IOReturn status=vm->holdJob(handles[i]);
+         if(status) {
+-            while(i) {vm_->retireJobAfterCompletion(handles[--i]);++stats_.references_retired;}
++            while(i) {vm->retireJobAfterCompletion(handles[--i]);++stats_.references_retired;}
+             return status;
+         }
+         ++stats_.references_held;
+@@ -180,11 +234,11 @@
+      * IB sat in a CPU cache. While write-combined BOs are trusted, every line of this submission's IBs is compared as a CPU cache and
+      * DRAM hold it (bounded). A dirty line means a client view still caches its BOs: maintain every BO from now on, this submission
+      * included (the audit already wrote the IB lines back; the rest of the BOs may hold more). */
+-    if(vm_->writeCombinedTrusted()) {
++    if(vm->writeCombinedTrusted()) {
+         /* int-100: the dirty IB page was back at XNU's default (cacheable) attribute. Write-combine every such page again first; the
+          * pmap writes its lines back on the way, so the audit below should then find none. */
+         uint32_t reset=0;
+-        IOReturn audited=vm_->reassertWriteCombined(&reset);
++        IOReturn audited=vm->reassertWriteCombined(&reset);
+         native_adreno_wc_audit[5]=native_adreno_wc_audit[5]+reset;
+         uint32_t lines=0,dirty=0,stale=0;size_t budget=SubmitAuditBytes;
+         /* The re-assertion above is the correction and runs every time; the audit only detects. It found no dirty line in int-141's
+@@ -195,7 +249,7 @@
+         if(!audit_now)budget=0;
+         for(size_t i=0;i<count && budget && !audited;++i) {   /* a failed re-assertion skips the audit and ends the trust */
+             const size_t bytes=buffers[i].bytes<budget?(size_t)buffers[i].bytes:budget;
+-            audited=vm_->auditRange(buffers[i].iova,bytes,&lines,&dirty,&stale);budget-=bytes;
++            audited=vm->auditRange(buffers[i].iova,bytes,&lines,&dirty,&stale);budget-=bytes;
+         }
+         if(audit_now && audited!=kIOReturnUnsupported) {   /* no board hook (host): nothing to compare */
+             native_adreno_wc_audit[0]=native_adreno_wc_audit[0]+1;
+@@ -205,7 +259,7 @@
+             if(audited)native_adreno_wc_audit[4]=audited;
+         }
+         if(dirty || (audited && audited!=kIOReturnUnsupported)) {
+-            vm_->distrustWriteCombined();
++            vm->distrustWriteCombined();
+             native_adreno_wc_distrusted=native_adreno_coherence[0]+1;
+         }
+     }
+@@ -214,11 +268,11 @@
+      * submission only (two such mappings per submission were CPU time on every frame). */
+     static uint32_t coherence_turn;
+     const bool sample=!(coherence_turn++&63);
+-    if(sample)(void)vm_->sampleWord(buffers[0].iova,&cached,&before);
+-    IOReturn status=vm_->publishMapped();
++    if(sample)(void)vm->sampleWord(buffers[0].iova,&cached,&before);
++    IOReturn status=vm->publishMapped();
+     phase[4]=mach_absolute_time();
+     if(!status && sample) {
+-        (void)vm_->sampleWord(buffers[0].iova,&ignored,&after);
++        (void)vm->sampleWord(buffers[0].iova,&ignored,&after);
+         native_adreno_coherence[0]=native_adreno_coherence[0]+1;
+         native_adreno_coherence[1]=cached;native_adreno_coherence[2]=before;native_adreno_coherence[3]=after;
+         if(cached!=before || before!=after) {
+@@ -233,12 +287,13 @@
+      * submission (10944 in i568), so each frame began with page walks. A stalled fence still invalidates (below). */
+     phase[5]=mach_absolute_time();
+     if(status) {
+-        for(size_t i=0;i<handle_count;++i) {vm_->retireJobAfterCompletion(handles[i]);++stats_.references_retired;}
++        for(size_t i=0;i<handle_count;++i) {vm->retireJobAfterCompletion(handles[i]);++stats_.references_retired;}
+         return status;
+     }
+     {
+         const uint32_t slot=native_adreno_ib_log_count&3;uint32_t head[28];
+-        (void)vm_->peekWords(buffers[0].iova,head,28);
++        (void)vm->peekWords(buffers[0].iova,head,28);
++        native_adreno_ib_log_root[slot]=root;
+         native_adreno_ib_log[slot][0]=ring_->lastSubmitted()+1;native_adreno_ib_log[slot][1]=(uint32_t)buffers[0].iova;
+         native_adreno_ib_log[slot][2]=(uint32_t)(buffers[0].iova>>32);native_adreno_ib_log[slot][3]=(uint32_t)buffers[0].bytes;
+         for(unsigned i=0;i<28;++i)native_adreno_ib_log[slot][4+i]=head[i];
+@@ -251,14 +306,16 @@
+         if(ring_->poisoned()) {
+             *job=Job{};++stats_.poisoned_jobs;
+             for(size_t i=0;i<handle_count;++i)job->handles[i]=handles[i];
+-            job->count=handle_count;job->queue=queue;job->active=true;job->vm_next=vm_->nextHandle();
++            job->count=handle_count;job->queue=queue;job->active=true;job->vm_next=vm->nextHandle();job->vm=vm;
++            current_root_=0;
+             return poison();
+         }
+-        while(handle_count) {vm_->retireJobAfterCompletion(handles[--handle_count]);++stats_.references_retired;}
++        while(handle_count) {vm->retireJobAfterCompletion(handles[--handle_count]);++stats_.references_retired;}
+         return status;
+     }
+     for(size_t i=0;i<handle_count;++i)job->handles[i]=handles[i];
+-    job->count=handle_count;job->fence=value;job->queue=queue;job->active=true;job->vm_next=vm_->nextHandle();
++    job->count=handle_count;job->fence=value;job->queue=queue;job->active=true;job->vm_next=vm->nextHandle();job->vm=vm;
++    if(switching) {current_root_=root;native_adreno_table_switches[0]=native_adreno_table_switches[0]+1;}
+     ++stats_.submissions;
+     phase[6]=mach_absolute_time();
+     for(unsigned i=0;i<6;++i)native_adreno_submit_phase[i]=native_adreno_submit_phase[i]+(phase[i+1]-phase[i]);
+--- a/NativeAdrenoUserClient.h
++++ b/NativeAdrenoUserClient.h
+@@ -56,6 +56,7 @@
+     NativeAdrenoSubmitBuffer submit_buffers_[NativeAdrenoAbiMaxBuffers]{};   /* submit()'s list: too large for the kernel stack */
+     NativeAdrenoAbiSubmit submit_request_{};   /* the submit request as copied in, for the same reason */
+     uint64_t window_start_=0,window_bytes_=0,window_peak_=0;
++    uint64_t table_root_=0;   /* this client's own TTBR0 root with per-process tables (0021), 0: the shared table */
+     uint64_t next_handle_=1;
+     bool open_=false;
+     Entry *find(uint64_t);
+@@ -74,6 +75,9 @@
+     /* One client of several on the same VM, submit object and ring: its queue range (queue_base a multiple of NativeAdrenoAbiMaxQueues) and
+      * GPU address window (4 KiB aligned, inside the input range; bytes 0 = unrestricted). Only while open with no live object or job. */
+     IOReturn setScope(uint32_t queue_base,uint64_t window_start,uint64_t window_bytes);
++    /* Per-process tables (0021): the root of the table vm_ maps into, which the CP switches to before this client's submissions. */
++    void setTable(uint64_t root) {table_root_=root;}
++    uint64_t tableRoot() const {return table_root_;}
+     /* Highest end address (exclusive) any mapping of this client has reached, 0 before the first. */
+     uint64_t windowPeak() const {return window_peak_;}
+     /* Whether any job is unobserved in the range this client owns (never, while it owns none). */
+--- a/NativeAdrenoUserClient.cpp
++++ b/NativeAdrenoUserClient.cpp
+@@ -421,7 +421,7 @@
+     used_=true;
+     ring_->useContext(context_);
+     const IOReturn status=submit_->submit(buffers,request->buffer_count,
+-        queue_base_+static_cast<uint32_t>(request->queue),&fence);
++        queue_base_+static_cast<uint32_t>(request->queue),&fence,vm_,table_root_);
+     if(status && status!=kIOReturnBusy)return noteSubmitReject(8,0,request->buffer_count,0,0,0,status);
+     if(status)return status;
+     reply->fence=fence;
+--- a/NativeAdrenoPublish.cpp
++++ b/NativeAdrenoPublish.cpp
+@@ -19,6 +19,7 @@
+ #include <string.h>
+ #include <kern/thread.h>
+ #include "NativeAdrenoUserClient.h"
++#include "NativeAdrenoGpuContext.h"
+ 
+ extern "C" void proc_selfname(char *, int);
+ extern "C" int proc_selfpid(void);
+@@ -166,6 +167,9 @@
+     {0x1C8000000ull,0x00A000000ull},{0x1D2000000ull,0x00A000000ull},{0x1DC000000ull,0x00A000000ull},{0x1E6000000ull,0x00A000000ull},
+     {0x1F0000000ull,0x00A000000ull}};
+ 
++/* 0021: which user clients get their own page table: 0 none, 1 installed apps (the default while it is new), 2 every user client. Rig knob
++ * "spaces" (LegacyDisplayProbe.cpp). */
++extern "C" {volatile int32_t native_adreno_space_policy=1;}
+ /* pdx203 0005: native_adreno_note_property_read's log of other processes' reads. */
+ extern "C" {char native_adreno_property_log[16][48];uint32_t native_adreno_property_log_repeat[16];volatile uint32_t native_adreno_property_log_count;}
+ namespace {
+@@ -206,6 +210,9 @@
+     bool kernel_=false;
+     NativeAdrenoUserClient *core_=nullptr;   /* own core; deleted in free(), so a call that raced the close sees live_ false, never freed memory */
+     unsigned slot_=NativeAdrenoMaxClients;
++    /* Per-process page tables (0021): this client's own table and VM, null on the shared VM (the kernel client, or no client spaces). */
++    NativeAdrenoClientSpace *space_=nullptr;
++    uint64_t space_root_=0;
+     char name_[20]{};
+     int pid_=-1;
+     /* One user-view descriptor per BO token, reused by every clientMemoryForType call. IOConnectUnmapMemory64 asks clientMemoryForType for
+@@ -305,15 +312,30 @@
+             for(unsigned i=first;slot==NativeAdrenoMaxClients && i<last;++i)if(!g.slots[i])slot=i;
+         }
+     }
+-    const IOReturn opened=slot<NativeAdrenoMaxClients?core->open(NativeAdrenoAbiVersion,g.vm,g.submit,g.ring,g.input_bits,g.output_bits):kIOReturnNoSpace;
++    /* With per-process page tables a user client gets its own table and VM over the whole client range instead of its slot's window; the
++     * slot still numbers its queues. A space that cannot be made leaves the client on the shared VM and its window. */
++    NativeAdrenoClientSpace *space=nullptr;NativeAdrenoClientSpaceInfo spaceInfo{};
++    const int32_t policy=native_adreno_space_policy;
++    if(!kernel && slot<NativeAdrenoMaxClients && NativeAdrenoGpuContextClientSpaces() && (policy>=2 || (policy==1 && installedApp))) {
++        const size_t ranges=!strncmp(name_,"backboardd",sizeof name_)?131072:32768;
++        IOLog("NativeAdrenoSpace: %s[%d] slot %u: creating\n",name_,pid_,slot);IOSleep(30);
++        const IOReturn made=NativeAdrenoGpuContextCreateSpace(ranges,&space,&spaceInfo);
++        IOLog("NativeAdrenoSpace: %s[%d] -> %x root %llx va %llx+%llx\n",name_,pid_,made,(unsigned long long)spaceInfo.root,
++            (unsigned long long)spaceInfo.va_start,(unsigned long long)spaceInfo.va_bytes);IOSleep(30);
++        if(made!=kIOReturnSuccess)space=nullptr;
++    }
++    const IOReturn opened=slot<NativeAdrenoMaxClients?core->open(NativeAdrenoAbiVersion,space?spaceInfo.vm:g.vm,g.submit,g.ring,g.input_bits,g.output_bits):kIOReturnNoSpace;
+     if(opened!=kIOReturnSuccess) {native_adreno_mount_fail[0]=slot<NativeAdrenoMaxClients?2:1;native_adreno_mount_fail[1]=uint32_t(opened);native_adreno_mount_fail[2]=slot;native_adreno_mount_fail[3]=native_adreno_mount_fail[3]+1;}
+     if(opened==kIOReturnSuccess) {
+         if(g.timer)core->attachTimer(g.timer);
+         if(g.info)core->attachDeviceInfo(g.info);
+         /* Queue ranges: the kernel client keeps range 0 alone (no user slot is live while the board's self-test runs); users get their slot's. */
+-        const IOReturn scoped=kernel?core->setScope(0,0,0):core->setScope(slot*NativeAdrenoAbiMaxQueues,kClientWindows[slot].start,kClientWindows[slot].bytes);
++        const IOReturn scoped=kernel?core->setScope(0,0,0):space?core->setScope(slot*NativeAdrenoAbiMaxQueues,spaceInfo.va_start,spaceInfo.va_bytes):
++            core->setScope(slot*NativeAdrenoAbiMaxQueues,kClientWindows[slot].start,kClientWindows[slot].bytes);
++        if(space)core->setTable(spaceInfo.root);
+         if(scoped==kIOReturnSuccess) {
+             core_=core;core=nullptr;slot_=slot;kernel_=kernel;live_=true;ok=true;
++            space_=space;space_root_=spaceInfo.root;space=nullptr;
+             if(kernel)g.kernel_client=true;else g.slots[slot]=true;
+             ++g.opened;
+             if(NativeAdrenoClientRecord *record=clientRecord(name_))record->slot=slot;
+@@ -322,6 +344,8 @@
+             core->releaseAll(&g.clock,0);
+         }
+     }
++    /* A space no client took: never submitted to, so the CP never ran on it. */
++    if(space && NativeAdrenoGpuContextDestroySpace(space)!=kIOReturnSuccess)IOLog("NativeAdreno: %s: an unused client space was kept\n",name_);
+     /* The mailbox page and its poller serve the render server's connection only. */
+     if(ok && !kernel && slot==0 && !strncmp(name_,"backboardd",sizeof name_)) {
+         if(!gMailbox) {
+@@ -396,6 +420,17 @@
+     if(live_) {
+         const uint64_t peak=core_->windowPeak();
+         status=core_->releaseAll(&g.clock,2000000);
++        /* The client's table goes once the CP is on another one (a kernel switch to the live table when it may still be on this one). A
++         * space that cannot be left or destroyed is kept (its memory leaks), never freed under the GPU. */
++        if(!status && space_) {
++            IOLog("NativeAdrenoSpace: %s[%d] closing root %llx (CP on %llx)\n",name_,pid_,(unsigned long long)space_root_,
++                (unsigned long long)g.submit->currentRoot());IOSleep(30);
++            IOReturn left=g.submit->leaveTable(space_root_,&g.clock,200000);
++            if(!left)left=NativeAdrenoGpuContextDestroySpace(space_);
++            IOLog("NativeAdrenoSpace: %s[%d] closed -> %x\n",name_,pid_,left);
++            if(left)IOLog("NativeAdrenoSpace: %s[%d] client space kept: %x\n",name_,pid_,left);
++            space_=nullptr;space_root_=0;
++        }
+         /* A failed teardown leaves the objects live and the slot taken: nothing is forced or reused. */
+         if(!status) {
+             live_=false;

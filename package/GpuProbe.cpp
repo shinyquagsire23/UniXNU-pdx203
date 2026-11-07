@@ -103,6 +103,8 @@ NativeAdrenoVm *NativeAdrenoGpuContextVm();
 IOReturn native_adreno_publish(NativeAdrenoVm *, NativeAdrenoSubmit *, NativeAdrenoRing *, const NativeAdrenoRingClock *,
                                const NativeAdrenoTimer *, const NativeAdrenoAbiDeviceInfo *, uint32_t, uint32_t);
 uint32_t native_adreno_publish_stats(uint32_t *);
+extern volatile uint32_t native_adreno_table_switches[4];
+extern volatile uint64_t native_adreno_ib_log_root[4];
 IOService *native_adreno_published_service();
 extern volatile uint32_t native_adreno_pool_stats[8];
 }
@@ -962,14 +964,14 @@ bool cpStart() {
 // across the call and its resumes (tb128fu-022: an unmasked init_image was interrupted 10000 times in a row).
 struct ScmRes {int64_t a0; uint64_t a1;};
 uint32_t gScmResumes;
-ScmRes scmCall(uint64_t fn, uint64_t arginfo, uint64_t p0, uint64_t p1, uint64_t p2) {
+ScmRes scmCall(uint64_t fn, uint64_t arginfo, uint64_t p0, uint64_t p1, uint64_t p2, uint64_t p3 = 0) {
     const boolean_t was = ml_set_interrupts_enabled(FALSE);
     ScmRes out{-1000, 0};
     uint64_t first = fn, a6 = 0;
     gScmResumes = 0;
     for (unsigned resume = 0, busy = 0; resume < 10000; gScmResumes = resume) {
         register uint64_t x0 asm("x0") = first, x1 asm("x1") = arginfo, x2 asm("x2") = p0, x3 asm("x3") = p1;
-        register uint64_t x4 asm("x4") = p2, x5 asm("x5") = 0, x6 asm("x6") = a6, x7 asm("x7") = 0;
+        register uint64_t x4 asm("x4") = p2, x5 asm("x5") = p3, x6 asm("x6") = a6, x7 asm("x7") = 0;
         asm volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
                      :: "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
         if (x0 == 1) {first = 1; a6 = x6; ++resume; continue;}
@@ -1149,6 +1151,89 @@ bool gpuInterrupt() {
     return gIrqAttached && fenced;
 }
 
+// Per-process page tables, step 0 (pdx203, 2026-11-06): can the CP switch the GPU's TTBR0 itself? The driver builds a second table
+// (NativeAdrenoGpuContextTableProbe: the kernel buffers at their addresses, the scratch address on a page of its own); one kernel
+// submission switches to it as a6xx_set_pagetable does for a non-A7XX GPU (protected mode off, RBBM_PERFCTR_SRAM_INIT_CMD,
+// CP_SMMU_TABLE_UPDATE, CACHE_INVALIDATE, the SRAM init wait, protected mode on), writes a marker through the scratch address,
+// switches back to the live table and writes a second marker. The first marker in the probe page (not in the scratch page) and the
+// second in the scratch page is a working switch. Without a result the CP_SMMU_APERTURE secure call (qcom_scm_set_gpu_smmu_aperture,
+// context bank 0, which Linux makes before every GPU start where TrustZone offers it) is made and the probe repeated.
+uint64_t smmuRead64(uint32_t at) {return uint64_t(smmuRead(at)) | uint64_t(smmuRead(at + 4)) << 32;}
+bool pt7(uint32_t *w, size_t &n, uint32_t op, uint32_t count) {return AdrenoPM4Type7(op, count, &w[n++]) == AdrenoPM4Success;}
+bool pt4(uint32_t *w, size_t &n, uint32_t reg, uint32_t count) {return AdrenoPM4Type4(reg, count, &w[n++]) == AdrenoPM4Success;}
+bool ptSwitch(uint32_t *w, size_t &n, uint64_t root, uint32_t lowBits, uint32_t asid) {
+    if (!pt7(w, n, 0x5f, 1)) return false; w[n++] = 0;                       // CP_SET_PROTECTED_MODE 0
+    if (!pt4(w, n, 0x050e, 1)) return false; w[n++] = 1;                     // RBBM_PERFCTR_SRAM_INIT_CMD
+    if (!pt7(w, n, 0x53, 4)) return false;                                   // CP_SMMU_TABLE_UPDATE
+    w[n++] = uint32_t(root) | (lowBits & 0xfff); w[n++] = uint32_t(root >> 32 & 0xffff) | asid << 16; w[n++] = 0; w[n++] = 0;
+    if (!pt7(w, n, 0x46, 1)) return false; w[n++] = 0x31;                    // CP_EVENT_WRITE CACHE_INVALIDATE
+    if (!pt7(w, n, 0x3c, 6)) return false;                                   // CP_WAIT_REG_MEM WRITE_EQ RBBM_PERFCTR_SRAM_INIT_STATUS
+    w[n++] = 3; w[n++] = 0x050f; w[n++] = 0; w[n++] = 1; w[n++] = 1; w[n++] = 0;
+    if (!pt7(w, n, 0x5f, 1)) return false; w[n++] = 1;                       // CP_SET_PROTECTED_MODE 1
+    return true;
+}
+bool ptMarker(uint32_t *w, size_t &n, uint64_t iova, uint32_t value) {
+    if (!pt7(w, n, 0x3d, 3)) return false;                                   // CP_MEM_WRITE
+    w[n++] = uint32_t(iova); w[n++] = uint32_t(iova >> 32); w[n++] = value;
+    return pt7(w, n, 0x12, 0) && pt7(w, n, 0x26, 0);                         // CP_WAIT_MEM_WRITES, CP_WAIT_FOR_IDLE
+}
+// One attempt: 1 switched, 0 not switched, -1 an error (the fence did not come back: the GPU is unusable).
+int ptAttempt(const NativeAdrenoGpuTableProbe &t, uint64_t liveTtbr, unsigned round) {
+    const uint32_t m1 = 0x7ab10000u | round << 4 | 1, m2 = 0x7ab10000u | round << 4 | 2;
+    const uint32_t bank0 = smmuBank0();
+    t.probe[0x200] = 0; t.probe[0x201] = 0; t.scratch[0x200] = 0xdead0000u; t.scratch[0x201] = 0xdead0001u;
+    cleanToPoc(const_cast<uint32_t *>(t.probe + 0x200), 8); cleanToPoc(const_cast<uint32_t *>(t.scratch + 0x200), 8);
+    uint32_t w[96] = {}; size_t n = 0;
+    const uint32_t asid = uint32_t(liveTtbr >> 48), low = uint32_t(liveTtbr);
+    const uint64_t liveRoot = liveTtbr & 0x0000fffffffff000ull;
+    const bool built = ptSwitch(w, n, t.root_physical, low, asid) && ptMarker(w, n, GpuScratchIova + 0x800, m1) &&
+                       ptSwitch(w, n, liveRoot, low, asid) && ptMarker(w, n, GpuScratchIova + 0x804, m2);
+    uint32_t fence = 0, seen = 0;
+    const IOReturn sub = built ? gRing->submit(w, n, &fence) : kIOReturnBadArgument;
+    const IOReturn waited = sub ? sub : gRing->wait(fence, &gClock, 200000, &seen);
+    cleanToPoc(const_cast<uint32_t *>(t.probe + 0x200), 8); cleanToPoc(const_cast<uint32_t *>(t.scratch + 0x200), 8);
+    const uint32_t p0 = t.probe[0x200], p1 = t.probe[0x201], s0 = t.scratch[0x200], s1 = t.scratch[0x201];
+    const uint64_t after = smmuRead64(bank0 + 0x20);
+    const uint32_t fsr = smmuRead(bank0 + 0x58);
+    const int result = waited ? -1 : (p0 == m1 && s0 != m1 && s1 == m2) ? 1 : 0;
+    IOLog("GPUPT round %u words %zu submit %x wait %x | probe %08x %08x scratch %08x %08x | ttbr0 after %llx (live %llx) fsr %x far %08x%08x"
+          " -> %s\n", round, n, sub, waited, p0, p1, s0, s1, (unsigned long long)after, (unsigned long long)liveTtbr, fsr,
+          smmuRead(bank0 + 0x64), smmuRead(bank0 + 0x60), result > 0 ? "SWITCHED" : result ? "ERROR" : "not switched");
+    return result;
+}
+bool gTablesProven;      // the probe switched the CP and back: per-process page tables can be enabled (publish)
+uint64_t gTablesTtbr;    // the live TTBR0 then (its low bits and ASID ride every switch)
+// The context bank's registers the kit compares (ArmSmmu4KValidateContextReadback) plus CONTEXTIDR and ACTLR, and the global SCR0.
+void ptImage(const char *when) {
+    const uint32_t b = smmuBank0(), gr1 = (smmuRead(0x24) >> 31) ? 0x10000u : 0x1000u;
+    NativeAdrenoVm *vm = NativeAdrenoGpuContextVm();
+    IOLog("GPUPT image %s: sctlr %x actlr %x tcr2 %x ttbr0 %llx ttbr1 %llx tcr %x contextidr %x mair %x/%x cbar %x cba2r %x scr0 %x | kit %d\n",
+          when, smmuRead(b), smmuRead(b + 4), smmuRead(b + 0x10), (unsigned long long)smmuRead64(b + 0x20),
+          (unsigned long long)smmuRead64(b + 0x28), smmuRead(b + 0x30), smmuRead(b + 0x34), smmuRead(b + 0x38), smmuRead(b + 0x3c),
+          smmuRead(gr1), smmuRead(gr1 + 0x800), smmuRead(0), vm ? int(vm->verifyContext()) : -1);
+}
+void tableProbe() {
+    native_gpu_step = 145;
+    ptImage("before");
+    NativeAdrenoGpuTableProbe t{};
+    const IOReturn made = NativeAdrenoGpuContextTableProbe(&t);
+    const uint32_t bank0 = smmuBank0();
+    const uint64_t liveTtbr = smmuRead64(bank0 + 0x20);
+    IOLog("GPUPT table %x kit %u pages %u level %u bits %u root %llx live %llx (ttbr0 %llx) mair %llx/%llx ring leaf %llx/%llx\n",
+          made, t.status, t.table_pages, t.start_level, t.input_bits, (unsigned long long)t.root_physical,
+          (unsigned long long)t.live_root_physical, (unsigned long long)liveTtbr, (unsigned long long)t.mair,
+          (unsigned long long)t.live_mair, (unsigned long long)t.ring_leaf, (unsigned long long)t.live_ring_leaf);
+    if (made || (liveTtbr & 0x0000fffffffff000ull) != t.live_root_physical || t.mair != t.live_mair || !t.ring_leaf ||
+        t.ring_leaf != t.live_ring_leaf) {IOLog("GPUPT skipped: the probe table does not match the live one\n"); return;}
+    const int first = ptAttempt(t, liveTtbr, 1);
+    ptImage("after");
+    if (first > 0) {gTablesProven = true; gTablesTtbr = liveTtbr;}
+    if (first != 0) return;
+    const ScmRes r = scmCall(0x42000000u | (0x0cu << 8) | 0x1bu, 4, 0xffff0000u, 0xffffffffu, 0xffffffffu, 0xffffffffu);
+    IOLog("GPUPT CP_SMMU_APERTURE(0) -> %lld %llx\n", (long long)r.a0, (unsigned long long)r.a1);
+    if (ptAttempt(t, liveTtbr, 2) > 0) {gTablesProven = true; gTablesTtbr = liveTtbr;}
+}
+
 // Mode 11. Facts for the Vulkan driver: chip id 0x06050002 (Linux adreno_device.c; Turnip's Darwin backend makes GPU id 650 of
 // it), GMEM 1 MiB + 128 KiB at base 0 as Linux reports it for the a650 family (Turnip reads input attachments through it in GMEM
 // passes; 16 MiB with pipa-gpu-gmem16m=1), the UCHE trap base hw_init writes, the client VA window above the kernel buffers and
@@ -1187,6 +1272,17 @@ bool publish() {
     p[2] = uint32_t(native_adreno_publish(vm, gSubmit, gRing, &gClock, p[1] ? nullptr : gTimer, &kDeviceInfo, 33,
                                           native_gpu_context.output_bits));
     publishRow(p[0] || p[2] ? "failed" : "ok");
+    // Per-process page tables (Adreno650 0021): every user client on its own TTBR0 table once the probe proved the CP's switch.
+    if (!p[0] && !p[2] && gTablesProven && gSubmit) {
+        const uint64_t root = NativeAdrenoGpuContextLiveRoot();
+        if (root && (gTablesTtbr & 0x0000fffffffff000ull) == root) {
+            gSubmit->enableTables(root, uint32_t(gTablesTtbr), uint32_t(gTablesTtbr >> 48));
+            NativeAdrenoGpuContextEnableClientSpaces();
+            ptImage("enabled");
+        }
+        IOLog("GPUPT client tables %s (root %llx ttbr0 %llx)\n", NativeAdrenoGpuContextClientSpaces() ? "ON" : "off",
+              (unsigned long long)root, (unsigned long long)gTablesTtbr);
+    }
     return !p[0] && !p[2];
 }
 
@@ -1526,6 +1622,8 @@ void crashReport(const char *why) {
     printf("GPUCRASH %s | fsr %x far %llx fsynr %x/%x block %s (pf %x) | rbbm %08x %x/%x/%x cpi %x hw %x prot %x | sqe pc %x op %08x\n",
            why, fsr, (unsigned long long)far, fsynr0, fsynr1, crashBlock(fsynr1 & 0xff, pf), pf, gpuRead(0x210), gpuRead(0x211),
            gpuRead(0x212), gpuRead(0x213), gpuRead(0x823), gpuRead(0x821), gpuRead(0x824), pc, op);
+    printf("GPUCRASH tables: ttbr0 %llx tcr %x | submit current root %llx live %llx\n", (unsigned long long)smmuRead64(bank0 + 0x20),
+           smmuRead(bank0 + 0x30), (unsigned long long)(gSubmit ? gSubmit->currentRoot() : 0), (unsigned long long)NativeAdrenoGpuContextLiveRoot());
     printf("GPUCRASH ib1 %llx+%x (%s) ib2 %llx+%x (%s) | rb r%x w%x | sub %u/%u | irq seen %x last %x n%u\n",
            (unsigned long long)ib1, rem1, crashOwner(ib1), (unsigned long long)ib2, rem2, crashOwner(ib2), gpuRead(0x806), gpuRead(0x807),
            st.submissions, st.completed, gIrqSeen, gIrqLast, gIrqCount);
@@ -1550,8 +1648,8 @@ void crashReport(const char *why) {
     int hungSlot = -1;
     for (unsigned i = 0; i < 4; ++i) {
         const uint64_t iova = native_adreno_ib_log[i][1] | uint64_t(native_adreno_ib_log[i][2]) << 32;
-        printf("GPUCRASH job fence %u ib %llx bytes %x (%s)\n", native_adreno_ib_log[i][0], (unsigned long long)iova,
-               native_adreno_ib_log[i][3], crashOwner(iova));
+        printf("GPUCRASH job fence %u ib %llx bytes %x (%s) root %llx\n", native_adreno_ib_log[i][0], (unsigned long long)iova,
+               native_adreno_ib_log[i][3], crashOwner(iova), (unsigned long long)native_adreno_ib_log_root[i]);
         if (native_adreno_ib_log[i][0] == hung) hungSlot = int(i);
     }
     // usb-161: CP_IB1_BASE and CP_IB2_BASE are the IBs' starts (REM_SIZE counts down), so each IB is dumped from its start: the IB that
@@ -1814,6 +1912,7 @@ void gpuThread(void *, wait_result_t) {
     const bool cp = gMode >= 9 && native_gpu_gx.gx_on && gpuContext() && cpStart();
     const bool irq = gMode >= 10 && cp && leaveSecure() && gpuInterrupt();
     if (irq) regDump("init");
+    if (irq) tableProbe();
     if (gMode >= 11 && irq && publish()) {
         if (selfTest() && gMode >= 12) metal();
         native_gpu_step = 99;
@@ -2003,6 +2102,16 @@ void metalRows() {
                  native_adreno_client_stats[2][0], native_adreno_client_stats[2][1], native_adreno_client_stats[3][0],
                  native_adreno_client_stats[3][1], native_adreno_client_stats[4][0], native_adreno_client_stats[4][1]);
         printIfChanged(lastLive, sizeof lastLive, line);
+    }
+    {
+        /* Per-process page tables: client spaces made/destroyed/live, failures and the last status, their table MiB, pool-backed ones, the
+         * peak live count; CP table switches in submissions, the teardown switches and their failures. */
+        static char lastSpace[160];
+        const volatile uint32_t *sp = native_adreno_space_stats;
+        snprintf(line, sizeof line, "GPUSPACE made %u destroyed %u live %u fail %u/%x tables %u MiB pooled %u peak %u | switches %u leave %u/%u",
+                 sp[0], sp[1], sp[2], sp[3], sp[4], sp[5], sp[6], sp[7], native_adreno_table_switches[0], native_adreno_table_switches[1],
+                 native_adreno_table_switches[2]);
+        printIfChanged(lastSpace, sizeof lastSpace, line);
     }
     if (&native_adreno_client_hist) {
         /* The render server's live BOs by size (<=4K 16K 64K 256K 1M 4M 16M, larger), their MiB, and its imports. */

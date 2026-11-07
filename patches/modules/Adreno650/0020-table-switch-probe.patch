@@ -1,0 +1,136 @@
+From: pdx203 <noreply@anthropic.com>
+Subject: gpu: per-process page tables step 0, a probe table for a CP_SMMU_TABLE_UPDATE test
+
+A second TTBR0 table built by ArmSmmu4KBuild in the live table's format: the five kernel buffers at their GPU addresses, the
+scratch address on a page of its own. The board switches the CP to it and back and checks where a write through the scratch
+address landed. The leaf descriptor of the ring in both tables is reported, so the two builders' formats can be compared.
+
+--- a/NativeAdrenoGpuContext.h
++++ b/NativeAdrenoGpuContext.h
+@@ -25,6 +25,7 @@
+ };
+ enum : size_t {GpuSqeBytes=0x13000, GpuRingBytes=0x8000, GpuPageBytes=0x1000, GpuBufferCount=5};
+ struct NativeAdrenoGpuBuffer {uint64_t physical,bytes,iova;};
++struct NativeAdrenoGpuTableProbe;
+ class NativeAdrenoGpuContext final {
+     NativeAdrenoMemory tables_,buffers_[GpuBufferCount];
+     uint64_t handles_[GpuBufferCount]{};
+@@ -33,6 +34,8 @@
+     /* The alias checks' sort scratch: one entry per range of the smaller compared side, at most half the aperture's leaves. */
+     uint32_t alias_scratch_[NativeAdrenoSmmuContext::MaxLeaves/2];
+     bool ready_=false,used_=false;
++    NativeAdrenoMemory probe_;   /* the table probe's tables and page (tableProbe) */
++    unsigned output_bits_=0;
+ public:
+     enum Step : uint32_t {Allocate=1,Prepare,Program,Attach,VmAttach,Map,Ready};
+     enum : size_t {TablePages=4105};   /* 8 GiB of 4 KiB pages from level 1: 1 + 8 + 4096 tables (4 GiB: 2053, 2 GiB: 1027) */
+@@ -44,6 +47,7 @@
+     IOReturn bringUp(const ArmSmmu4KIo *io,unsigned bank,unsigned asid,const ArmSmmu4KStream *routes,size_t route_count,
+         void (*progress)(uint32_t step),NativeAdrenoGmuContextReport *report);
+     bool ready() const {return ready_;}
++    IOReturn tableProbe(NativeAdrenoGpuTableProbe *out);
+     const NativeAdrenoMemory &buffer(unsigned index) const {return buffers_[index];}
+     NativeAdrenoVm *vm() {return ready_?&vm_:nullptr;}
+ };
+@@ -55,6 +59,21 @@
+     const unsigned *slots,const unsigned *sids,unsigned count,void (*progress)(uint32_t),NativeAdrenoGmuContextReport *report);
+ /* sqe, ring, memptrs, pwrup, scratch: physical base, size and GPU address, only after Ready. */
+ extern "C" IOReturn NativeAdrenoGpuContextBuffers(NativeAdrenoGpuBuffer out[5]);
++/* Per-process page tables, step 0 (pdx203): a second TTBR0 table, built by the kit's ArmSmmu4KBuild in the live table's format, that maps
++ * the five kernel buffers at their GPU addresses, except that the scratch page's address leads to a page of its own (probe). The board
++ * switches the CP to it with CP_SMMU_TABLE_UPDATE, writes through the scratch address and switches back: the write landing in the probe
++ * page, and not in the scratch page, is the switch working. Built once; its memory is kept. */
++struct NativeAdrenoGpuTableProbe {
++    uint64_t root_physical;      /* the probe table's root (TTBR0 address bits) */
++    uint64_t live_root_physical; /* the live table's root */
++    uint64_t probe_physical;     /* the page the probe table maps at GpuScratchIova */
++    volatile uint32_t *probe;    /* its kernel mapping (cacheable: invalidate before reading) */
++    volatile uint32_t *scratch;  /* the real scratch page's kernel mapping */
++    uint32_t table_pages,start_level,input_bits,status;
++    uint64_t mair,live_mair;
++    uint64_t ring_leaf,live_ring_leaf;   /* the level-3 descriptor of GpuRingIova in each table (format check; 0: not found) */
++};
++extern "C" IOReturn NativeAdrenoGpuContextTableProbe(NativeAdrenoGpuTableProbe *out);
+ /* The live VM of the ready GPU context (null before Ready), for the user-client core. */
+ extern "C" NativeAdrenoVm *NativeAdrenoGpuContextVm();
+ #endif
+--- a/NativeAdrenoGpuContext.cpp
++++ b/NativeAdrenoGpuContext.cpp
+@@ -42,6 +42,7 @@
+         /* Not fatal: without it each pooled BO changes its pages' attribute itself, as a scattered one does. */
+         if(native_adreno_wc_enabled && NativeAdrenoMemory::poolBytes())native_adreno_pool_wc=(uint32_t)NativeAdrenoMemory::writeCombinePool()|1u<<31;
+     }
++    output_bits_=report->output_bits;
+     if(!status)status=tables_.allocate(TablePages*0x1000,report->output_bits,true,TablePages*0x1000);
+     for(unsigned i=0;!status && i<GpuBufferCount;++i)
+         status=buffers_[i].allocate(kBytes[i],report->output_bits,true,kBytes[i]);
+@@ -88,7 +89,69 @@
+     report->status=status;
+     return status;
+ }
++/* The level-3 descriptor of iova in a table pool of `pages` pages at physical base, through its CPU mapping (0 when absent). */
++static uint64_t leafOf(const uint8_t *cpu,uint64_t base,size_t pages,uint64_t root,unsigned start,unsigned input_bits,uint64_t iova)
++{
++    uint64_t table=root;
++    for(unsigned level=start;level<=3;++level) {
++        if(table<base || table-base>=pages*0x1000)return 0;
++        const unsigned shift=39-9*level;
++        const unsigned width=level==start?input_bits-shift:9;
++        const uint64_t index=(iova>>shift)&((UINT64_C(1)<<width)-1);
++        const uint64_t desc=reinterpret_cast<const volatile uint64_t *>(cpu+(table-base))[index];
++        if(level==3)return desc;
++        if((desc&3)!=3)return 0;
++        table=desc&UINT64_C(0x0000fffffffff000);
++    }
++    return 0;
++}
++IOReturn NativeAdrenoGpuContext::tableProbe(NativeAdrenoGpuTableProbe *out)
++{
++    enum : size_t {TablePagesProbe=6,ProbePage=7,ProbeBytes=8*0x1000};
++    *out={};
++    if(!ready_)return kIOReturnNotReady;
++    if(!probe_.backed()) {
++        IOReturn status=probe_.allocate(ProbeBytes,output_bits_,true,ProbeBytes);
++        if(status)return status;
++    }
++    if(probe_.spanCount()!=1 || !probe_.mapping())return kIOReturnUnsupported;
++    const uint64_t base=probe_.spans()[0].physical;
++    uint8_t *cpu=static_cast<uint8_t *>(probe_.mapping());
++    bzero(cpu,ProbeBytes);
++    ArmSmmu4KRange ranges[GpuBufferCount];
++    for(unsigned i=0;i<GpuBufferCount;++i) {
++        if(buffers_[i].spanCount()!=1)return kIOReturnUnsupported;
++        ranges[i]={kIovas[i],i==GpuBufferCount-1?base+ProbePage*0x1000:buffers_[i].spans()[0].physical,kBytes[i],i?3u:5u,0,2};
++    }
++    const ArmSmmu4KLiveArena *live=smmu_.arena();
++    ArmSmmu4KConfig config=live->config;
++    config.table_physical=base;
++    ArmSmmu4KResult result{};
++    const ArmSmmu4KStatus built=ArmSmmu4KBuild(&config,ranges,GpuBufferCount,reinterpret_cast<uint64_t *>(cpu),TablePagesProbe,&result);
++    out->status=built;out->input_bits=config.input_bits;
++    if(built!=ArmSmmu4KSuccess)return kIOReturnUnsupported;
++    IOReturn status=NativeAdrenoMaintainOwnedPages(cpu,ProbeBytes,NativeAdrenoCleanInvalidate);
++    if(status)return status;
++    out->root_physical=result.root_physical;out->table_pages=uint32_t(result.table_pages);out->start_level=result.start_level;
++    out->mair=result.mair;
++    NativeAdrenoSmmuContext &smmu=smmu_;
++    out->live_root_physical=smmu.stateHandle()->tables.root_physical;out->live_mair=smmu.stateHandle()->tables.mair;
++    out->ring_leaf=leafOf(cpu,base,TablePagesProbe,result.root_physical,result.start_level,config.input_bits,GpuRingIova);
++    if(tables_.spanCount()==1 && tables_.mapping())
++        out->live_ring_leaf=leafOf(static_cast<const uint8_t *>(tables_.mapping()),tables_.spans()[0].physical,TablePages,
++            out->live_root_physical,result.start_level,config.input_bits,GpuRingIova);
++    out->probe_physical=base+ProbePage*0x1000;
++    out->probe=reinterpret_cast<volatile uint32_t *>(cpu+ProbePage*0x1000);
++    out->scratch=static_cast<volatile uint32_t *>(buffers_[GpuBufferCount-1].mapping());
++    return kIOReturnSuccess;
++}
+ static NativeAdrenoGpuContext *board_gpu_context;
++extern "C" IOReturn NativeAdrenoGpuContextTableProbe(NativeAdrenoGpuTableProbe *out)
++{
++    if(!out)return kIOReturnBadArgument;
++    if(!board_gpu_context)return kIOReturnNotReady;
++    return board_gpu_context->tableProbe(out);
++}
+ extern "C" IOReturn NativeAdrenoGpuContextBringupRoutes(volatile uint8_t *smmu,size_t bytes,unsigned bank,unsigned asid,
+     const unsigned *slots,const unsigned *sids,unsigned count,void (*progress)(uint32_t),NativeAdrenoGmuContextReport *report)
+ {

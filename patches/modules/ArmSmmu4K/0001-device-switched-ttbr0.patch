@@ -1,0 +1,42 @@
+From: pdx203 <noreply@anthropic.com>
+Subject: context: accept a TTBR0 the device switched (per-process page tables)
+
+ArmSmmu4KContextConfig.device_switched_ttbr0: the Adreno CP switches TTBR0 itself (CP_SMMU_TABLE_UPDATE), so a readback's
+TTBR0 may hold any root with the config's ASID, and the SQE's table update clears TCR.EPD1 (1 -> 0 accepted).
+
+diff --git a/ArmSmmu4KContext.c b/ArmSmmu4KContext.c
+index 2cc334e..ee87e62 100644
+--- a/ArmSmmu4KContext.c
++++ b/ArmSmmu4KContext.c
+@@ -75,10 +75,15 @@ ArmSmmu4KStatus ArmSmmu4KValidateContextReadback(const ArmSmmu4KContextConfig *c
+      * writes it and never reads it back. A shared ASID namespace is safe because every bank's ASID is the
+      * caller's exclusive lease. Only 1 -> 0 is accepted. */
+     const uint32_t asidpne_clear=expected.sctlr&~observed->sctlr&UINT32_C(0x1000);
++    /* TCR.EPD1 (bit 23): the Adreno SQE's CP_SMMU_TABLE_UPDATE clears it (TTBR1 walks on, as Linux's split tables want) whatever it was;
++     * pdx203 0021 read TCR 0x8000201f for the written 0x8080201f after the first switch. A device-switched context accepts 1 -> 0 only.
++     * TTBR1 then holds no table: only addresses in the upper region (sign-extended, far above the GPU's) would walk it. */
++    const uint32_t epd1_clear=c->device_switched_ttbr0?(expected.tcr&~observed->tcr&UINT32_C(0x800000)):0;
+     if(expected.cbar!=observed->cbar || expected.cba2r!=observed->cba2r ||
+-        expected.tcr!=observed->tcr || ((expected.tcr2^observed->tcr2)&~tbi_set) ||
++        ((expected.tcr^observed->tcr)&~epd1_clear) || ((expected.tcr2^observed->tcr2)&~tbi_set) ||
+         expected.mair0!=observed->mair0 || expected.mair1!=observed->mair1 ||
+-        ((expected.sctlr^observed->sctlr)&~asidpne_clear) || observed->reserved_zero || expected.ttbr0!=observed->ttbr0 ||
++        ((expected.sctlr^observed->sctlr)&~asidpne_clear) || observed->reserved_zero ||
++        (c->device_switched_ttbr0?((expected.ttbr0^observed->ttbr0)>>48)!=0:expected.ttbr0!=observed->ttbr0) ||
+         expected.ttbr1!=observed->ttbr1)return ArmSmmu4KStateMismatch;
+     return ArmSmmu4KSuccess;
+ }
+diff --git a/ArmSmmu4KContext.h b/ArmSmmu4KContext.h
+index 3c2faa4..f3c5d44 100644
+--- a/ArmSmmu4KContext.h
++++ b/ArmSmmu4KContext.h
+@@ -16,6 +16,9 @@ typedef struct {
+     unsigned asid;          /* 0..65535, ownership managed by the caller. */
+     unsigned coherent_walk; /* Explicit: 1=inner WBWA, 0=outer NC. */
+     unsigned stall_on_fault, continue_after_fault; /* Each 0 or 1. */
++    /* 1: the device switches TTBR0 itself (Adreno CP_SMMU_TABLE_UPDATE, per-process tables): a readback's TTBR0 may hold any root
++     * with this ASID, so only its ASID field is compared. Programming still writes this config's own root. 0: exact compare. */
++    unsigned device_switched_ttbr0;
+ } ArmSmmu4KContextConfig;
+ typedef struct {
+     uint32_t cbar, cba2r, tcr, tcr2, mair0, mair1, sctlr, reserved_zero;

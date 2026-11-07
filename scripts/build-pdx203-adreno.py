@@ -52,6 +52,19 @@ def write_synced(path, text):
         os.fsync(stream.fileno())
 
 KITS = Path(os.environ.get('ADRENO650_KITS', str(ROOT / 'kits')))
+# The SMMU kit's changes ride the same way as the driver's: patches/modules/ArmSmmu4K on the submodule's checkout, the applied part
+# the longest prefix whose last patch reverses (0001: per-process page tables accept a TTBR0 the CP switched).
+_kit = KITS / 'ArmSmmu4K'
+_kit_patches = sorted((ROOT / 'patches/modules/ArmSmmu4K').glob('*.patch'))
+_kit_applied = 0
+for _k in range(len(_kit_patches), 0, -1):
+    if _subprocess.run(['git', '-C', str(_kit), 'apply', '--reverse', '--check', str(_kit_patches[_k - 1].resolve())],
+                       capture_output=True).returncode == 0:
+        _kit_applied = _k
+        break
+for _patch in _kit_patches[_kit_applied:]:
+    _subprocess.run(['git', '-C', str(_kit), 'apply', str(_patch.resolve())], check=True)
+    print('applied', _patch.name, 'to kits/ArmSmmu4K')
 sources = sorted(KITS.joinpath('ArmSmmu4K').glob('ArmSmmu4K*.c')) + [KITS / 'AdrenoPM4' / 'AdrenoPM4.c']
 # The HFI kit and the A650 cold start that uses it.
 sources += [KITS / 'AdrenoFirmware' / (name + '.c') for name in ('AdrenoFirmware', 'AdrenoHfi', 'AdrenoHfiStartup', 'AdrenoHfiVotes')]
