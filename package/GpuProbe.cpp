@@ -1119,8 +1119,23 @@ bool leaveSecure() {
 // The GPU interrupt (DT kgsl_3d0_irq: SPI 300, level high = INTID 332). As a6xx_irq: read RBBM_INT_0_STATUS and clear it through
 // RBBM_INT_CLEAR_CMD before anything else, so the level line drops before the EOI; the same status 100000 times in a row masks
 // the GPU interrupts. Each interrupt wakes the fence waiters (naIdle).
+// The first CP_HW_ERROR (RBBM_INT_0 bit 9), caught in the interrupt before anything clears the CP's own fault state (2026-11-07: twice
+// a storm of 190k of them, then the IRQ masked and the CP stopped, the crash report later read CP_INTERRUPT_STATUS 0): its count, the
+// first one's CP_INTERRUPT_STATUS (0x823: opcode 0, ucode 1, hw fault 2, register protection 4, AHB 5, illegal instruction 7),
+// CP_HW_FAULT (0x821), CP_PROTECT_STATUS (0x824), RB read/write pointers, IB1 and IB2 bases and remaining sizes, TTBR0 (lo, hi).
+volatile uint32_t gHwErr[14];
 void gpuIrq(void *) {
     const uint32_t status = gpuRead(0x201);
+    const bool firstHwErr = (status & (1u << 9)) && !gHwErr[0];
+    if (status & (1u << 9)) gHwErr[0] = gHwErr[0] + 1;
+    if (firstHwErr) {
+        gHwErr[1] = gpuRead(0x823); gHwErr[2] = gpuRead(0x821); gHwErr[3] = gpuRead(0x824);
+        gHwErr[4] = gpuRead(0x806); gHwErr[5] = gpuRead(0x807);
+        gHwErr[6] = gpuRead(0x928); gHwErr[7] = gpuRead(0x929); gHwErr[8] = gpuRead(0x92a);
+        gHwErr[9] = gpuRead(0x92b); gHwErr[10] = gpuRead(0x92c); gHwErr[11] = gpuRead(0x92d);
+        const uint32_t bank0 = smmuBank0();
+        gHwErr[12] = smmuRead(bank0 + 0x20); gHwErr[13] = smmuRead(bank0 + 0x24);
+    }
     if (status) gw(0x37, status);
     gIrqRepeat = (status == gIrqLast && !(status & (1u << 20))) ? gIrqRepeat + 1 : 0;
     gIrqLast = status;
@@ -1976,6 +1991,10 @@ extern volatile uint32_t native_adreno_fence_wait[8] __attribute__((weak_import)
 // [12] worst timeouts), and where a submit's CPU time goes in mach ticks ([0] validate [1] sweep [2] wc audit [3] publish [4] coherence [5] ring, [6] count).
 extern volatile uint32_t native_adreno_fence_pending[8] __attribute__((weak_import));
 extern volatile uint64_t native_adreno_ring_timeline[8] __attribute__((weak_import));
+// Adreno650 0022: the timeline per class (render server, other processes) and the per-process outstanding-job limit.
+extern volatile uint64_t native_adreno_ring_class[2][8] __attribute__((weak_import));
+extern volatile int32_t native_adreno_app_depth __attribute__((weak_import));
+extern volatile uint32_t native_adreno_app_throttled[2] __attribute__((weak_import));
 extern volatile uint32_t native_adreno_unstick[15] __attribute__((weak_import));
 extern volatile uint64_t native_adreno_submit_phase[7] __attribute__((weak_import));
 extern volatile uint64_t native_legacy_copy_n __attribute__((weak_import)), native_legacy_copy_last __attribute__((weak_import)),
@@ -2113,6 +2132,13 @@ void metalRows() {
                  native_adreno_table_switches[2]);
         printIfChanged(lastSpace, sizeof lastSpace, line);
     }
+    if (gHwErr[0]) {
+        static char lastHw[200];
+        snprintf(line, sizeof line, "GPUHWERR n %u | cpint %x hwfault %x protect %x | rb r%x w%x | ib1 %x%08x+%x ib2 %x%08x+%x | ttbr0 %x%08x",
+                 gHwErr[0], gHwErr[1], gHwErr[2], gHwErr[3], gHwErr[4], gHwErr[5], gHwErr[7], gHwErr[6], gHwErr[8], gHwErr[10], gHwErr[9],
+                 gHwErr[11], gHwErr[13], gHwErr[12]);
+        printIfChanged(lastHw, sizeof lastHw, line);
+    }
     if (&native_adreno_client_hist) {
         /* The render server's live BOs by size (<=4K 16K 64K 256K 1M 4M 16M, larger), their MiB, and its imports. */
         static char lastHist[160];
@@ -2213,6 +2239,23 @@ void displayRow() {
                    (unsigned long long)(n ? t[1] / n : 0), (unsigned long long)t[2], (unsigned long long)(all ? t[3] / all : 0), (unsigned long long)t[4],
                    (unsigned long long)(t[6] ? t[5] / t[6] : 0), (unsigned long long)t[6], (unsigned long long)t[7]);
             for (int k = 0; k < 8; ++k) t[k] = 0;
+        }
+        // Per class since the last row (Adreno650 0022): jobs, GPU us avg/max, us queued from the WPTR write to the CP's start stamp
+        // avg/max (how many measured / unmeasurable), then the per-process limit, submissions it turned away, and the most outstanding seen.
+        if (&native_adreno_ring_class) {
+            static long long gOrderOffset;
+            char cls[2][120];
+            for (int c = 0; c < 2; ++c) {
+                volatile uint64_t *k = native_adreno_ring_class[c];
+                snprintf(cls[c], sizeof cls[c], "n %llu gpu %llu/%llu queued %llu/%llu (%llu/%llu)", (unsigned long long)k[0],
+                         (unsigned long long)(k[0] ? k[1] / k[0] : 0), (unsigned long long)k[2], (unsigned long long)(k[5] ? k[3] / k[5] : 0),
+                         (unsigned long long)k[4], (unsigned long long)k[5], (unsigned long long)k[6]);
+                if (k[7]) gOrderOffset = (long long)k[7];
+                for (int w = 0; w < 7; ++w) k[w] = 0;
+            }
+            printf("GPUORDER rs %s | app %s | depth %d throttled %u peak %u | offset %lld\n", cls[0], cls[1],
+                   &native_adreno_app_depth ? (int)native_adreno_app_depth : -1, &native_adreno_app_throttled ? native_adreno_app_throttled[0] : 0u,
+                   &native_adreno_app_throttled ? native_adreno_app_throttled[1] : 0u, gOrderOffset);
         }
         if (&native_adreno_unstick)
             printf("UNSTICK kick %u@f%u done@%u/%u | drains %u chalt %u ahalt %u @f%u done@%u | stage1 %u stage2 %u stage3 %u worst %u | poll_us %u\n",

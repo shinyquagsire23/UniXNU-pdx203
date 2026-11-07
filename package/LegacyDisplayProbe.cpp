@@ -1015,6 +1015,8 @@ extern "C" int64_t native_legacy_vsync_phase(uint64_t now, uint64_t interval) {
 extern "C" volatile int32_t pdx203_knob_ddrlow __attribute__((weak)), pdx203_knob_dcvs __attribute__((weak));
 // Adreno650 0021's per-process page tables: 0 every client on the shared table, 1 installed apps on their own (default), 2 every user client.
 extern "C" volatile int32_t native_adreno_space_policy __attribute__((weak));
+// Adreno650 0022: outstanding submissions one process other than the render server may have on the ring (0 no limit).
+extern "C" volatile int32_t native_adreno_app_depth __attribute__((weak));
 // Runtime knobs, set over the USB control channel (KEY:knob.<name>,<value>; Pdx203TouchProbe.cpp). 0 set, -1 no such knob, -2 out of range.
 extern "C" void native_hid_orientation_step(intptr_t step) __attribute__((weak_import));   // ShengHidInput (orientation device)
 extern "C" int pdx203_knob_set(const char *name, size_t length, int value) {
@@ -1030,11 +1032,13 @@ extern "C" int pdx203_knob_set(const char *name, size_t length, int value) {
         }
     static const struct {const char *name; volatile int32_t *knob; int lo, hi;} knobs[] = {
         {"vlock", &pdx203_knob_vlock, 0, 1}, {"vphase", &pdx203_knob_vphase, 0, 166}, {"vgain", &pdx203_knob_vgain, 0, 16},
-        {"eretire", &pdx203_knob_eretire, 0, 1}};
+        {"eretire", &pdx203_knob_eretire, 0, 1}, {"appdepth", &native_adreno_app_depth, 0, 8}};
     for (auto &k : knobs)
         if (length == strlen(k.name) && !strncmp(name, k.name, length)) {
+            if (!k.knob) return -1;
             if (value < k.lo || value > k.hi) return -2;
             *k.knob = value;
+            printf("PDX203 KNOB %s = %d\n", k.name, value);
             return 0;
         }
     // orient 1..4: the orientation device reports that orientation (1 portrait, 2 upside down, 3 landscape left, 4 landscape right),

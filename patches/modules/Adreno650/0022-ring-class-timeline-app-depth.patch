@@ -1,0 +1,139 @@
+From: pdx203 <noreply@anthropic.com>
+Subject: gpu: per-class ring timeline and a per-process outstanding-job limit
+
+The CP runs the one ring in order, so the render server's composition and scanout copy wait behind every job queued before
+them. Framed submissions are tagged with their class (the render server's connection, slot 0, or another process) and the ring
+timeline adds, per class, GPU time and the time from the WPTR write to the CP's start stamp (native_adreno_ring_class). A process
+other than the render server may have at most native_adreno_app_depth submissions outstanding (0 no limit, the default); past it
+its submit is answered kIOReturnBusy and Turnip waits for its own oldest job and submits again.
+
+--- a/NativeAdrenoRing.h
++++ b/NativeAdrenoRing.h
+@@ -56,8 +56,13 @@
+     uint64_t ring_iova_=0,fence_iova_=0;
+     uint32_t next_=0,rptr_shadow_=0,seqno_=0,completed_=0,submissions_=0;
+     /* pdx203 submission timeline (NativeAdrenoRing.cpp native_adreno_ring_timeline) */
+-    struct {uint64_t submitted[64];uint32_t seen;uint64_t lastEnd;} timeline_={};
++    struct {uint64_t submitted[64];uint32_t seen;uint64_t lastEnd;uint64_t ticks[64];uint8_t klass[64];} timeline_={};
++    /* pdx203 (0022): the class of the next framed submission (1 the render server's connection, 2 another process's, 0 none), noted by
++     * NativeAdrenoSubmit, and the submission's raw mach_absolute_time, which counts the same 19.2 MHz global timer the CP's stamps do. */
++    uint8_t next_class_=0;
++    int64_t clock_offset_=INT64_MAX;   /* the least start stamp less submission time seen: the two clocks' offset plus the CP's least delay */
+     static uint64_t hostNow();
++    static uint64_t rawNow();
+     size_t stampWords(uint32_t *words,size_t at,uint32_t seqno,uint32_t half) const;
+     void noteRetired(uint32_t value);
+     unsigned generation_=7;
+@@ -72,6 +77,8 @@
+     IOReturn emitFramedFence(uint32_t at,uint32_t seqno,uint32_t *end);
+     IOReturn submitWords(const uint32_t *words,size_t word_count,uint32_t *fence,bool framed);
+ public:
++    /* pdx203 (0022): the class of the next framed submission, for the per-class timeline (native_adreno_ring_class). */
++    void noteClass(uint8_t klass) {next_class_=klass;}
+     NativeAdrenoRing()=default;
+     ~NativeAdrenoRing()=default;
+     NativeAdrenoRing(const NativeAdrenoRing &)=delete;
+--- a/NativeAdrenoRing.cpp
++++ b/NativeAdrenoRing.cpp
+@@ -97,6 +97,20 @@
+  * [4] largest, [5] GPU idle us before the submission (its start stamp less the previous submission's end stamp), summed, [6] count of
+  * those, [7] submissions without a usable stamp pair. */
+ extern "C" {volatile uint64_t native_adreno_ring_timeline[8];}
++/* pdx203 (0022): the timeline per class of submission ([0] the render server's connection, slot 0; [1] every other process's): [0] count,
++ * [1] GPU us summed, [2] largest, [3] us from the WPTR write to the CP's start stamp (time queued behind earlier submissions), summed,
++ * [4] largest, [5] count of those, [6] submissions not measured (no submission time, or more than a second), [7] the clocks' offset (the
++ * least start stamp less mach_absolute_time at the WPTR write seen since boot, in ticks as int64: the CP's timer and the CPU's count the
++ * same 19.2 MHz but from different origins; the least difference is a submission that found the GPU idle). */
++extern "C" {volatile uint64_t native_adreno_ring_class[2][8];}
++uint64_t NativeAdrenoRing::rawNow()
++{
++#ifdef KERNEL
++    return mach_absolute_time();
++#else
++    return 0;
++#endif
++}
+ uint64_t NativeAdrenoRing::hostNow()
+ {
+ #ifdef KERNEL
+@@ -119,8 +133,9 @@
+     if(value-timeline_.seen>RingStampSlots)timeline_.seen=value-RingStampSlots;
+     while(timeline_.seen!=value) {
+         const uint32_t seq=++timeline_.seen,slot=seq%RingStampSlots;
+-        const uint64_t submitted=timeline_.submitted[slot];
+-        timeline_.submitted[slot]=0;
++        const uint64_t submitted=timeline_.submitted[slot],ticks=timeline_.ticks[slot];
++        const uint8_t klass=timeline_.klass[slot];
++        timeline_.submitted[slot]=0;timeline_.klass[slot]=0;
+         if(!submitted)continue;   /* a kernel submission: no stamps */
+         const volatile uint32_t *w=fence_+(RingStampOffset+slot*16)/4;
+         const uint64_t start=(uint64_t)w[1]<<32|w[0],end=(uint64_t)w[3]<<32|w[2];
+@@ -130,6 +145,17 @@
+         if(!(end>start && end-start<19200000ull)) {t[7]=t[7]+1;timeline_.lastEnd=0;continue;}
+         const uint64_t gpu=(end-start)*10/192;
+         t[0]=t[0]+1;t[1]=t[1]+gpu;if(gpu>t[2])t[2]=gpu;
++        if(klass==1 || klass==2) {
++            volatile uint64_t *c=native_adreno_ring_class[klass-1];
++            c[0]=c[0]+1;c[1]=c[1]+gpu;if(gpu>c[2])c[2]=gpu;
++            const int64_t delta=(int64_t)(start-ticks);
++            if(ticks && delta<clock_offset_)clock_offset_=delta;
++            if(ticks && (uint64_t)(delta-clock_offset_)<19200000ull) {
++                const uint64_t queued=(uint64_t)(delta-clock_offset_)*10/192;
++                c[3]=c[3]+queued;if(queued>c[4])c[4]=queued;c[5]=c[5]+1;
++            } else c[6]=c[6]+1;
++            c[7]=(uint64_t)clock_offset_;
++        }
+         if(timeline_.lastEnd && start>timeline_.lastEnd && start-timeline_.lastEnd<19200000ull) {t[5]=t[5]+(start-timeline_.lastEnd)*10/192;t[6]=t[6]+1;}
+         timeline_.lastEnd=end;
+     }
+@@ -402,7 +428,11 @@
+     if(io_.barrier(io_.cookie))return poison();
+     if(writeWptr(end))return kIOReturnIOError;
+     next_=end;*fence=++seqno_;++submissions_;
+-    if(framed)timeline_.submitted[seqno_%RingStampSlots]=hostNow();
++    if(framed) {
++        const uint32_t slot=seqno_%RingStampSlots;
++        timeline_.submitted[slot]=hostNow();timeline_.ticks[slot]=rawNow();timeline_.klass[slot]=next_class_;
++    }
++    next_class_=0;
+     if(reset)reset_pending_=false;
+     return kIOReturnSuccess;
+ }
+--- a/NativeAdrenoSubmit.cpp
++++ b/NativeAdrenoSubmit.cpp
+@@ -1,5 +1,12 @@
+ /* SPDX-License-Identifier: MIT */
+ #include "NativeAdrenoSubmit.h"
++#include "NativeAdrenoABI.h"
++/* pdx203 (0022): how many submissions of one process other than the render server's (slot 0) may be outstanding on the one ring at once;
++ * 0 no limit. The CP runs the ring in order, so the render server's composition and scanout copy wait behind every job queued before
++ * them: a game with a frame or two queued (Dusklight) holds the display's frame back by that much. A process at its limit is answered
++ * kIOReturnBusy, and Turnip waits for its own oldest job and submits again (darwin_submit_chunk). [0] submissions answered so, [1] the
++ * most outstanding of one process seen at a submission of it. */
++extern "C" {volatile int32_t native_adreno_app_depth=0;volatile uint32_t native_adreno_app_throttled[2];}
+ #include "AdrenoPM4.h"
+ #include <IOKit/IOLib.h>
+ 
+@@ -213,6 +220,14 @@
+     phase[1]=mach_absolute_time();
+     IOReturn swept=retireCompleted();
+     if(swept)return swept;
++    const uint32_t client=queue/NativeAdrenoAbiMaxQueues;
++    if(client) {
++        uint32_t mine=0;
++        for(const Job &j:jobs_)if(j.active && j.queue/NativeAdrenoAbiMaxQueues==client)++mine;
++        if(mine>native_adreno_app_throttled[1])native_adreno_app_throttled[1]=mine;
++        const int32_t depth=native_adreno_app_depth;
++        if(depth>0 && mine>=(uint32_t)depth) {native_adreno_app_throttled[0]=native_adreno_app_throttled[0]+1;return kIOReturnBusy;}
++    }
+     Job *job=free();
+     if(!job)return kIOReturnBusy;
+     for(size_t i=0;i<handle_count;++i) {
+@@ -299,6 +314,7 @@
+         for(unsigned i=0;i<28;++i)native_adreno_ib_log[slot][4+i]=head[i];
+         native_adreno_ib_log_count=native_adreno_ib_log_count+1;
+     }
++    ring_->noteClass(client?2:1);
+     status=ring_->submitFramed(words,word_count,&value);
+     if(status) {
+         /* A poisoned ring may already have consumed the WPTR write, so the
