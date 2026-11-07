@@ -1,0 +1,37 @@
+From: pdx203 <noreply@anthropic.com>
+Subject: bridge: metal2vulkan patch 0035, timing switches on only when their file holds 1
+
+Carries bridge/patches/0035-timing-switches-hold-one.patch. The addon installs files under /private/var/ngpu and removes none, so lsc13c's
+rot-skip-back stayed behind and skipped every landscape copy back on the next image (lsc14: "skipped 307").
+
+diff --git a/bridge/patches/0035-timing-switches-hold-one.patch b/bridge/patches/0035-timing-switches-hold-one.patch
+new file mode 100644
+--- /dev/null
++++ b/bridge/patches/0035-timing-switches-hold-one.patch
+@@ -0,0 +1,26 @@
++diff --git a/crates/metal2vulkan-runtime/src/rotated.rs b/crates/metal2vulkan-runtime/src/rotated.rs
++--- a/crates/metal2vulkan-runtime/src/rotated.rs
+++++ b/crates/metal2vulkan-runtime/src/rotated.rs
++@@ -159,13 +159,19 @@
++     }
++ }
++ 
++-/// pdx203 timing switches (bridge 0033), read once: `/private/var/ngpu/debug/rot-skip-in` skips
++-/// every copy into a rotated texture's frame, `rot-skip-back` every copy back. Each leaves the
+++/// pdx203 timing switches (bridge 0033; holding `1`, bridge 0035), read once:
+++/// `/private/var/ngpu/debug/rot-skip-in` skips every copy into a rotated texture's frame,
+++/// `rot-skip-back` every copy back. Each leaves the
++ /// display wrong while it is on; they only measure what each turn costs a frame.
++ fn skips() -> [bool; 2] {
++     static SKIPS: std::sync::OnceLock<[bool; 2]> = std::sync::OnceLock::new();
++     *SKIPS.get_or_init(|| {
++-        let on = |name: &str| std::path::Path::new("/private/var/ngpu/debug").join(name).exists();
+++        // On only where the file holds `1`: the addon installs files under /private/var/ngpu and
+++        // removes none, so a switch a measurement shipped stays behind; an empty or other file is off.
+++        let on = |name: &str| {
+++            std::fs::read_to_string(std::path::Path::new("/private/var/ngpu/debug").join(name))
+++                .is_ok_and(|text| text.trim() == "1")
+++        };
++         [on("rot-skip-in"), on("rot-skip-back")]
++     })
++ }

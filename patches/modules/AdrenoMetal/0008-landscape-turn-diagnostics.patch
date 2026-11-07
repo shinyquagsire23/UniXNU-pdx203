@@ -1,0 +1,113 @@
+From: pdx203 <noreply@anthropic.com>
+Subject: diagnostics: rotated framebuffer turns (PDX203ROT row) and timing switches
+
+The pass profile's poll prints the runtime's rotated-texture turns since its last row: copies into the frame by load and
+by keep, copies back, turns a timing switch skipped, and first uses that took the image's lasting standing (bridge 0032).
+Carries bridge/patches/0033-rotated-turn-counters-and-timing-switches.patch (the counters and the switches rot-skip-in / rot-skip-back under
+/private/var/ngpu/debug, which only measure: each leaves the landscape display wrong).
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -2599,6 +2599,7 @@
+ 
+ @interface NBBlitEncoder : NBEncoder
+ @end
++extern "C" void metal2vulkan_rotated_turns(uint64_t *) __attribute__((weak_import));   // the runtime (bridge 0033)
+ // Profile (NBPassPoll's PDX203BLIT row): blit operations by kind, [kind][0] count, [1] thousands of bytes or texels: 0 buffer to buffer, 1 fill,
+ // 2 texture to texture, 3 buffer to texture, 4 texture to buffer, 5 mipmap generation.
+ static std::atomic<uint64_t> gBlitOps[6][2];
+@@ -3485,6 +3486,18 @@
+    (unsigned long long)(now6[3][0]-last[3][0]),(unsigned long long)(now6[3][1]-last[3][1]),(unsigned long long)(now6[4][0]-last[4][0]),
+    (unsigned long long)(now6[4][1]-last[4][1]),(unsigned long long)(now6[5][0]-last[5][0]),(unsigned long long)(dispatches-lastDispatches),
+    (unsigned long long)(passes-lastPasses));
++ // pdx203 (bridge 0033): the rotated textures' turns since the last row: into by load / into by keep / back / skipped by a timing
++ // switch / first uses that took the image's lasting standing instead of a copy in (landscape frames).
++ {
++  static uint64_t lastTurns[5];uint64_t turns[5]={};
++  if(&metal2vulkan_rotated_turns) {
++   metal2vulkan_rotated_turns(turns);
++   os_log(OS_LOG_DEFAULT,"PDX203ROT load %llu keep %llu back %llu skipped %llu carried %llu",
++    (unsigned long long)(turns[0]-lastTurns[0]),(unsigned long long)(turns[1]-lastTurns[1]),(unsigned long long)(turns[2]-lastTurns[2]),
++    (unsigned long long)(turns[3]-lastTurns[3]),(unsigned long long)(turns[4]-lastTurns[4]));
++   memcpy(lastTurns,turns,sizeof turns);
++  }
++ }
+   memcpy(last,now6,sizeof last);lastDispatches=dispatches;lastPasses=passes;
+  }
+  if(tl.n || tl.unmatched)
+diff --git a/bridge/patches/0033-rotated-turn-counters-and-timing-switches.patch b/bridge/patches/0033-rotated-turn-counters-and-timing-switches.patch
+new file mode 100644
+--- /dev/null
++++ b/bridge/patches/0033-rotated-turn-counters-and-timing-switches.patch
+@@ -0,0 +1,70 @@
++diff --git a/crates/metal2vulkan-runtime/src/rotated.rs b/crates/metal2vulkan-runtime/src/rotated.rs
++--- a/crates/metal2vulkan-runtime/src/rotated.rs
+++++ b/crates/metal2vulkan-runtime/src/rotated.rs
++@@ -136,6 +136,36 @@
++     pub(super) touched: u64,
++     pub(super) held: Option<[u32; 4]>,
++     pub(super) stale: Option<[u32; 4]>,
+++}
+++
+++/// pdx203 diagnostics (bridge 0033): the rotated textures' turns recorded, by kind (into by
+++/// Metal's load, into by the inverse of the store, back, skipped by a switch below), and the
+++/// first uses that took the image's lasting standing ([`LastStanding`]) instead of a copy in.
+++/// The frontend reads them through [`metal2vulkan_rotated_turns`] (its PDX203ROT row).
+++pub(super) static TURNS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+++
+++/// The turns' counters as `TURNS` holds them: `out` takes five words.
+++///
+++/// # Safety
+++///
+++/// `out` points at five writable `u64`.
+++#[unsafe(no_mangle)]
+++pub unsafe extern "C" fn metal2vulkan_rotated_turns(out: *mut u64) {
+++    for (i, turn) in TURNS.iter().enumerate() {
+++        // SAFETY: the caller's five words.
+++        unsafe { *out.add(i) = turn.load(std::sync::atomic::Ordering::Relaxed) };
+++    }
+++}
+++
+++/// pdx203 timing switches (bridge 0033), read once: `/private/var/ngpu/debug/rot-skip-in` skips
+++/// every copy into a rotated texture's frame, `rot-skip-back` every copy back. Each leaves the
+++/// display wrong while it is on; they only measure what each turn costs a frame.
+++fn skips() -> [bool; 2] {
+++    static SKIPS: std::sync::OnceLock<[bool; 2]> = std::sync::OnceLock::new();
+++    *SKIPS.get_or_init(|| {
+++        let on = |name: &str| std::path::Path::new("/private/var/ngpu/debug").join(name).exists();
+++        [on("rot-skip-in"), on("rot-skip-back")]
+++    })
++ }
++ 
++ /// One direction of the kernel's moves: its shape, where it lies in the shape buffer, and the
++@@ -332,6 +362,16 @@
++         back: Option<&RowCopies>,
++     ) {
++         let into = turn != Turn::Store;
+++        let kind = match turn {
+++            Turn::Load => 0,
+++            Turn::Keep => 1,
+++            Turn::Store => 2,
+++        };
+++        TURNS[kind].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+++        if skips()[usize::from(!into)] {
+++            TURNS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+++            return;
+++        }
++         let (step, shape, set) = match turn {
++             Turn::Load => (&self.moves[0], &self.moves[0].shape, self.sets.sets[0]),
++             Turn::Keep => (&self.moves[0], &self.keep, self.sets.sets[0]),
++diff --git a/crates/metal2vulkan-runtime/src/shadow.rs b/crates/metal2vulkan-runtime/src/shadow.rs
++--- a/crates/metal2vulkan-runtime/src/shadow.rs
+++++ b/crates/metal2vulkan-runtime/src/shadow.rs
++@@ -2707,6 +2707,9 @@
++                     met,
++                     carried: carried.is_some() || lasting.is_some(),
++                 });
+++                if lasting.is_some() {
+++                    super::rotated::TURNS[4].fetch_add(1, Ordering::Relaxed);
+++                }
++                 self.entries.len() - 1
++             }
++         }
