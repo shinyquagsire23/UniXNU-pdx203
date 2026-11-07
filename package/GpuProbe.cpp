@@ -119,7 +119,7 @@ enum {kRowSummary, kRowGcc, kRowGpucc, kRowSmmu, kRowClk, kRowClk2, kRowGmu, kRo
       kRowContext = kRowLevels + 3, kRowLoad, kRowHfi, kRowAfter, kRowGx, kRowGpuCtx, kRowCp, kRowCpState, kRowZap, kRowIrq,
       kRowPublish, kRowMetal, kRowLive, kRowHang, kRowHang2, kRowFaults, kRowUche, kRowTiling, kRows};
 extern "C" {
-char native_gpu_rows[kRows][120];
+char native_gpu_rows[kRows][160];
 volatile uint32_t native_gpu_changes;
 volatile uint32_t native_gpu_step;
 struct gpb_result native_gpu_result;
@@ -835,7 +835,9 @@ extern "C" volatile uint64_t native_adreno_cache_stats[5] __attribute__((weak_im
 extern "C" volatile uint32_t native_adreno_wc_distrusted __attribute__((weak_import));
 // NativeAdrenoVm.cpp (NativeAdreno 0004): the write-combine walks done, skipped (no attribute event since the last), and the pages a
 // timed walk found reset with no event (attributes that changed by themselves); and the read-only imports' cleaning period.
-extern "C" volatile uint64_t native_adreno_wc_walks[3] __attribute__((weak_import));
+extern "C" volatile uint64_t native_adreno_wc_walks[5] __attribute__((weak_import));
+extern "C" volatile uint64_t native_adreno_wc_pinned[4] __attribute__((weak_import));
+extern "C" uint64_t native_pmap_wc_kept __attribute__((weak_import));   // patches/xnu zzzzzzzzzs-pmap-pinned-wc
 extern "C" volatile uint32_t native_adreno_wc_audit[6] __attribute__((weak_import));
 void submitRow() {
     if (!&native_adreno_submit_phase) return;
@@ -850,12 +852,19 @@ void submitRow() {
     char line[sizeof native_gpu_rows[0]];
     uint64_t maintained_ns = 0;
     if (&native_adreno_cache_stats) absolutetime_to_nanoseconds(native_adreno_cache_stats[0], &maintained_ns);
-    snprintf(line, sizeof line, "SUBT n%llu us check %llu sweep %llu wc %llu pub %llu tlb %llu ring %llu | wk %llu/%llu/%llu %lluMB %llums d%u r%u",
+    snprintf(line, sizeof line, "SUBT n%llu us check %llu sweep %llu wc %llu pub %llu tlb %llu ring %llu | wk %llu/%llu/%llu sw%llu pg%llu pin %llu/%llu kept %llu %lluMB %llums d%u r%u",
              (unsigned long long)n, (unsigned long long)us[0], (unsigned long long)us[1], (unsigned long long)us[2],
              (unsigned long long)us[3], (unsigned long long)us[4], (unsigned long long)us[5],
              &native_adreno_wc_walks ? (unsigned long long)native_adreno_wc_walks[0] : 0ull,
              &native_adreno_wc_walks ? (unsigned long long)native_adreno_wc_walks[1] : 0ull,
              &native_adreno_wc_walks ? (unsigned long long)native_adreno_wc_walks[2] : 0ull,
+             // Adreno650 0023: pages the sweep of never-viewed BOs found reset, and pages walked per walk.
+             &native_adreno_wc_walks ? (unsigned long long)native_adreno_wc_walks[3] : 0ull,
+             &native_adreno_wc_walks && native_adreno_wc_walks[0] ? (unsigned long long)(native_adreno_wc_walks[4] / native_adreno_wc_walks[0]) : 0ull,
+             // Pages pinned write-combined / refused, and the VM requests the pins overrode.
+             &native_adreno_wc_pinned ? (unsigned long long)native_adreno_wc_pinned[0] : 0ull,
+             &native_adreno_wc_pinned ? (unsigned long long)native_adreno_wc_pinned[1] : 0ull,
+             &native_pmap_wc_kept ? (unsigned long long)native_pmap_wc_kept : 0ull,
              &native_adreno_cache_stats ? (unsigned long long)(native_adreno_cache_stats[1] >> 20) : 0ull,
              (unsigned long long)(maintained_ns / 1000000), &native_adreno_wc_distrusted ? native_adreno_wc_distrusted : 0u,
              &native_adreno_wc_audit ? native_adreno_wc_audit[5] : 0u);
@@ -2027,7 +2036,7 @@ extern volatile uint64_t native_adreno_import_diag[10] __attribute__((weak_impor
 extern "C" void pdx203_dpu_dump(void) __attribute__((weak_import));
 extern volatile uint32_t pdx203_gpu_idle_stats[4];   // defined below, with pdx203_gpu_wait_idle
 namespace {
-char gPrinted[kRows][120];
+char gPrinted[kRows][sizeof native_gpu_rows[0]];
 char gMetalPrinted[48][96], gMetalLine[4][200], gClientPrinted[8][96], gTextPrinted[4][2][64];
 void printIfChanged(char *last, size_t cap, const char *now) {
     if (strncmp(last, now, cap)) {strlcpy(last, now, cap); printf("%s\n", now);}

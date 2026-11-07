@@ -1,0 +1,107 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -10748,6 +10748,68 @@
+ 		 * this in a CAS loop to avoid losing simultaneous updates to other bits like refmod.
+ 		 */
+ 	} while (!OSCompareAndSwap16(pp_attr_current, pp_attr_template, &pp_attr_table[pai]));
++}
++
++/*
++ * pdx203 (patches/xnu/zzzzzzzzzs-pmap-pinned-wc.patch): pages a driver pinned write-combined. The page attribute is one per
++ * physical page here, and the VM rewrites it on its own: a device-pager view's object that drops a page sets it back to the
++ * default (vm_page_remove, also later from the object reaper), and a view that maps one sets its own mode. The Adreno driver's
++ * BOs are write-combined because the GPU reads them uncached; a page put back to the default had every CPU mapping cacheable
++ * again, and lines its client wrote stayed in a CPU cache the GPU never sees (int-100: an IB the CP read stale, the CP stopped).
++ * The driver walked every page of its BOs before submissions to put them back (up to 2 ms a walk, pdx203 usb-459/462). A pinned
++ * page keeps VM_WIMG_WCOMB whatever is asked for, until the driver unpins it (before it gives the page back to the VM).
++ * native_pmap_wc_kept counts the requests a pin overrode.
++ */
++static uint32_t *pmap_wc_pinned_map;
++uint64_t native_pmap_wc_kept;
++static inline bool
++pmap_wc_pinned(unsigned int pai)
++{
++	uint32_t *map = os_atomic_load(&pmap_wc_pinned_map, acquire);
++	return map != NULL && (os_atomic_load(&map[pai >> 5], relaxed) & (1u << (pai & 31))) != 0;
++}
++static inline unsigned int
++pmap_wc_pinned_attr(unsigned int pai, unsigned int cacheattr)
++{
++	if ((cacheattr & VM_WIMG_MASK) != VM_WIMG_WCOMB && pmap_wc_pinned(pai)) {
++		os_atomic_inc(&native_pmap_wc_kept, relaxed);
++		return VM_WIMG_WCOMB;
++	}
++	return cacheattr;
++}
++/* 0 done, -1 not a managed page, -2 no memory for the map. Pin after making the page write-combined, unpin before restoring it. */
++int native_pmap_pin_wc(ppnum_t pn, int pin);
++int
++native_pmap_pin_wc(ppnum_t pn, int pin)
++{
++	const pmap_paddr_t pa = ptoa(pn);
++	if (!pa_valid(pa)) {
++		return -1;
++	}
++	uint32_t *map = os_atomic_load(&pmap_wc_pinned_map, acquire);
++	if (map == NULL) {
++		if (!pin) {
++			return 0;
++		}
++		const size_t bytes = ((size_t)((vm_last_phys - vm_first_phys) >> PAGE_SHIFT) / 32 + 1) * sizeof(uint32_t);
++		uint32_t *fresh = kalloc_data(bytes, Z_WAITOK | Z_ZERO);
++		if (fresh == NULL) {
++			return -2;
++		}
++		if (!os_atomic_cmpxchg(&pmap_wc_pinned_map, NULL, fresh, acq_rel)) {
++			kfree_data(fresh, bytes);
++		}
++		map = os_atomic_load(&pmap_wc_pinned_map, acquire);
++	}
++	const unsigned int pai = pa_index(pa);
++	pvh_lock(pai);
++	if (pin) {
++		os_atomic_or(&map[pai >> 5], 1u << (pai & 31), relaxed);
++	} else {
++		os_atomic_andnot(&map[pai >> 5], 1u << (pai & 31), relaxed);
++	}
++	pvh_unlock(pai);
++	return 0;
+ }
+ 
+ /**
+@@ -10814,13 +10876,14 @@
+ 			}
+ #endif /* XNU_MONITOR */
+ 			const pp_attr_t pp_attr_current = pp_attr_table[pai];
++			const unsigned int page_cacheattr = pmap_wc_pinned_attr(pai, cacheattr);   /* pdx203: a pinned page stays write-combined */
+ 
+ 			unsigned int wimg_bits_prev = VM_WIMG_DEFAULT;
+ 			if (pp_attr_current & PP_ATTR_WIMG_MASK) {
+ 				wimg_bits_prev = pp_attr_current & PP_ATTR_WIMG_MASK;
+ 			}
+ 
+-			const pp_attr_t pp_attr_template = (pp_attr_current & ~PP_ATTR_WIMG_MASK) | PP_ATTR_WIMG(cacheattr);
++			const pp_attr_t pp_attr_template = (pp_attr_current & ~PP_ATTR_WIMG_MASK) | PP_ATTR_WIMG(page_cacheattr);
+ 
+ 			unsigned int wimg_bits_new = VM_WIMG_DEFAULT;
+ 			if (pp_attr_template & PP_ATTR_WIMG_MASK) {
+@@ -10829,8 +10892,8 @@
+ 
+ 			/* Update the cache attributes in PTE and PP_ATTR table. */
+ 			if (wimg_bits_new != wimg_bits_prev) {
+-				tlb_flush_pass_needed |= pmap_update_cache_attributes_locked(pn, cacheattr, false);
+-				pmap_update_pp_attr_wimg_bits_locked(pai, cacheattr);
++				tlb_flush_pass_needed |= pmap_update_cache_attributes_locked(pn, page_cacheattr, false);
++				pmap_update_pp_attr_wimg_bits_locked(pai, page_cacheattr);
+ 			}
+ 
+ 			if (wimg_bits_new == VM_WIMG_RT && wimg_bits_prev != VM_WIMG_RT) {
+@@ -11029,6 +11092,7 @@
+ 	pai = pa_index(paddr);
+ 
+ 	pvh_lock(pai);
++	cacheattr = pmap_wc_pinned_attr(pai, cacheattr);   /* pdx203: a pinned page stays write-combined */
+ 
+ #if XNU_MONITOR
+ 	if (external && ppattr_pa_test_monitor(paddr)) {

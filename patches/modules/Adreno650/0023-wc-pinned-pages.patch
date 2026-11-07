@@ -1,0 +1,233 @@
+From: pdx203 <noreply@anthropic.com>
+Subject: gpu: pin write-combined BO pages in the pmap; walk them only without the pin
+
+Before every submission the write-combine re-assertion looked at every page of every scattered write-combined BO of the VM, whenever
+one global epoch had moved (any client's allocation, GPU map or free anywhere) or 100 ms had passed. With the 768 MiB pool full
+(usb-459: Dusklight, then Safari) that was 2 ms a walk on every other submission. The pages moved because XNU keeps one cache
+attribute per physical page and a device-pager view's teardown sets it back to the default (vm_page_remove, also from the object
+reaper later). The kernel now pins a page's write-combined attribute (patches/xnu zzzzzzzzzs-pmap-pinned-wc): NativeAdrenoSetPagesCacheMode
+pins each page it makes write-combined and unpins it before restoring the default. Once a pin holds, no submission walks; a timed
+sweep (1024 pages each 100 ms per VM) checks every BO and counts what it finds ([3]).
+
+Without the pin (an older kernel) the walk is narrower than before: a BO at the next submission after its own CPU view changed
+(BoCpuMap, BoCpuUnmap, a view made or torn down), every viewed BO each 100 ms ([2] counts what those find), and never-viewed BOs
+in the sweep. The walk state is per VM (one static served every per-process VM); [4] counts pages walked.
+
+--- a/NativeAdrenoCpu.cpp
++++ b/NativeAdrenoCpu.cpp
+@@ -14,6 +14,10 @@
+ extern "C" {volatile uint64_t native_adreno_cache_stats[5];}
+ /* Time spent checking and re-asserting write-combined page attributes (NativeAdrenoReassertWriteCombined), for the board page. */
+ extern "C" {volatile uint64_t native_adreno_reassert_ticks;}
++/* 0023: the kernel's pin on a page's write-combined attribute (patches/xnu zzzzzzzzzs-pmap-pinned-wc), absent from older kernels.
++ * native_adreno_wc_pinned: pins made and refused [0] [1], unpins [2]; [3] is 1 once a pin held, and the submissions' walk stands down. */
++extern "C" int native_pmap_pin_wc(ppnum_t pn,int pin) __attribute__((weak_import));
++extern "C" volatile uint64_t native_adreno_wc_pinned[4];   /* NativeAdrenoVm.cpp */
+ static void noteMaintenance(uint64_t began,size_t bytes)
+ {
+     const uint64_t ticks=mach_absolute_time()-began;
+@@ -120,8 +124,16 @@
+         pages+=span.bytes/4096;
+     }
+     for(size_t i=0;i<count;++i)
+-        for(uint64_t offset=0;offset<spans[i].bytes;offset+=4096)
+-            pmap_set_cache_attributes((ppnum_t)((spans[i].physical+offset)>>12),write_combined?VM_WIMG_WCOMB:VM_WIMG_USE_DEFAULT);
++        for(uint64_t offset=0;offset<spans[i].bytes;offset+=4096) {
++            const ppnum_t pn=(ppnum_t)((spans[i].physical+offset)>>12);
++            /* 0023: unpinned before the default goes back (the pin would keep it write-combined), pinned once write-combined. */
++            if(!write_combined && native_pmap_pin_wc) {(void)native_pmap_pin_wc(pn,0);native_adreno_wc_pinned[2]=native_adreno_wc_pinned[2]+1;}
++            pmap_set_cache_attributes(pn,write_combined?VM_WIMG_WCOMB:VM_WIMG_USE_DEFAULT);
++            if(write_combined && native_pmap_pin_wc) {
++                if(!native_pmap_pin_wc(pn,1)) {native_adreno_wc_pinned[0]=native_adreno_wc_pinned[0]+1;native_adreno_wc_pinned[3]=1;}
++                else native_adreno_wc_pinned[1]=native_adreno_wc_pinned[1]+1;
++            }
++        }
+     if(write_combined)__atomic_fetch_add(&native_adreno_cache_stats[4],pages,__ATOMIC_RELAXED);
+     else __atomic_fetch_sub(&native_adreno_cache_stats[4],pages,__ATOMIC_RELAXED);
+     return kIOReturnSuccess;
+--- a/NativeAdrenoMemory.h
++++ b/NativeAdrenoMemory.h
+@@ -40,6 +40,8 @@
+     size_t bytes_=0,span_count_=0,span_capacity_=0;
+     uint32_t device_references_=0;
+     bool prepared_=false,quarantined_=false,write_combined_=false,pooled_=false;
++    bool cpu_viewed_=false;   /* 0023: a client has had a CPU view of this BO (cleared when the next BO starts in this object) */
++    mutable uint32_t wc_suspect_=0;   /* 0023: a view of this BO changed since the last walk looked at it */
+     size_t pool_offset_=0;
+     IOReturn maintainImported(size_t offset,size_t bytes,NativeAdrenoCacheOperation);
+ public:
+@@ -85,6 +87,17 @@
+      * 1280 submissions, while walking the pool's pages took 0.65 ms of each). The submissions' line audit still covers every object. */
+     IOReturn reassertWriteCombined(uint32_t *reset) const
+     {return write_combined_ && span_count_ && !pooled_?NativeAdrenoReassertWriteCombined(spans_,span_count_,reset):kIOReturnSuccess;}
++    /* 0023: only a client's CPU view can take a BO's pages off the write-combined attribute (XNU's view machinery populating or tearing
++     * down a device-pager view, int-100); a BO only the GPU and the kernel's own write-combined mapping touch keeps it. The VM's walk
++     * covers a BO whose view changed at the next submission, every viewed BO each 100 ms, and the others in a bounded sweep
++     * (NativeAdrenoVm::reassertWriteCombined). */
++    void noteCpuView() {cpu_viewed_=true;noteViewChange();}
++    /* A view of this BO was made, populated or taken down (CPU map or unmap, a view torn down): the next submission walks it. */
++    void noteViewChange() {__atomic_store_n(&wc_suspect_,1u,__ATOMIC_RELEASE);}
++    bool takeViewChange() const {return __atomic_exchange_n(&wc_suspect_,0u,__ATOMIC_ACQ_REL)!=0;}
++    bool cpuViewed() const {return cpu_viewed_;}
++    /* Pages reassertWriteCombined would look at (0 when it would not walk this object). */
++    size_t reassertPages() const {return write_combined_ && span_count_ && !pooled_?bytes_/4096:0;}
+     bool backed() const {return descriptor_ || imported_ || pooled_;}
+     /* Refuses device references/quarantine; only clears ownership after real
+      * descriptor complete() succeeds. No automatic reset or resource recycling. */
+--- a/NativeAdrenoMemory.cpp
++++ b/NativeAdrenoMemory.cpp
+@@ -127,6 +127,7 @@
+ IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous,size_t budget,bool pooled)
+ {
+     if(descriptor_ || spans_ || quarantined_)return kIOReturnBusy;
++    cpu_viewed_=false;__atomic_store_n(&wc_suspect_,0u,__ATOMIC_RELAXED);
+     if(!bytes || (bytes&4095) || !outputWidth(bits) || !budget || budget>256u*1024u*1024u)
+         return kIOReturnBadArgument;
+     if(bytes>budget)return kIOReturnNoResources;
+--- a/NativeAdrenoVm.h
++++ b/NativeAdrenoVm.h
+@@ -53,6 +53,10 @@
+     NativeAdrenoHandleIndex<NativeAdrenoVmMaxObjects> index_;   /* live handle -> its mappings_ slot */
+     size_t free_hint_=0;   /* no free mappings_ slot below it */
+     size_t high_=0;   /* no live mappings_ slot at or above it: the walks over every mapping stop there */
++    /* 0023: reassertWriteCombined's state, per VM (one static for every VM let one process's walk stand in for another's): when the
++     * last full walk of the viewed BOs ran, and where the sweep of the unviewed ones is. */
++    mutable uint64_t walked_at_=0;
++    mutable size_t sweep_at_=0;
+     size_t class_spans_[16]{};   /* ranges_ per alias class, so a map counts the other classes without a walk */
+     size_t import_spans_[16]{};   /* the imported mappings' ranges per alias class */
+     NativeAdrenoVmRegion regions_[2]{};
+--- a/NativeAdrenoVm.cpp
++++ b/NativeAdrenoVm.cpp
+@@ -24,7 +24,10 @@
+ /* pdx203: bumped by anything that may change a page's attributes (a GPU map or unmap here, a client's allocation, free or CPU view:
+  * NativeAdrenoUserClient.cpp). reassertWriteCombined walks every page only when it moved, or 100 ms after its last walk; [0] walks,
+  * [1] skipped, [2] pages a timed walk reset with no event since the last (attributes that moved by themselves). */
+-volatile uint32_t native_adreno_wc_epoch;volatile uint64_t native_adreno_wc_walks[3];}
++volatile uint32_t native_adreno_wc_epoch;volatile uint64_t native_adreno_wc_walks[5];}
++/* 0023: the kernel pins on write-combined pages (NativeAdrenoCpu.cpp NativeAdrenoSetPagesCacheMode): [0] made, [1] refused, [2] unpins,
++ * [3] 1 once one held. */
++extern "C" {volatile uint64_t native_adreno_wc_pinned[4];}
+ static bool coherentMapping(unsigned writeback) {return writeback && native_adreno_io_coherent;}
+ /* GPU-written imports (render targets) are mapped non-coherent (the GPU stopped inside its end-of-pass clean writing them through
+  * write-back mappings), and the CPU never touches their pixels while the GPU owns them: they were cleaned when mapped and need no
+@@ -528,29 +531,57 @@
+ {
+     if(!reset)return kIOReturnBadArgument;
+     if(!attached_ || poisoned_)return kIOReturnNotReady;
+-    /* pdx203 usb-179: the walk looked at every page of every BO at every submission, 0.86 ms each. */
+-    static uint32_t walked_epoch=~0u;static uint64_t walked_at;
+-    const uint32_t epoch=native_adreno_wc_epoch;
++    /* pdx203 usb-179: the walk looked at every page of every BO at every submission, 0.86 ms each. usb-459 (0023): with the 768 MiB pool
++     * full (Dusklight, then Safari) the scattered BOs grew past 200k pages and the walk ran on every other submission (any client's
++     * allocation or GPU map anywhere moved one global epoch): 2 ms a walk, about 1 ms of every submission. Only a client's CPU view
++     * moves a page's attribute, so now a submission walks the BOs whose view changed since (NativeAdrenoMemory::noteViewChange), every
++     * 100 ms all the viewed BOs ([2] counts pages found reset there, which no view change named), and on those timed walks a slice of
++     * the never-viewed BOs ([3] pages found reset; usb-461: none). [4] counts the pages walked. */
+     bool timed=false;
+ #ifdef KERNEL
+     uint64_t period=0;nanoseconds_to_absolutetime(100ull*1000*1000,&period);
+     const uint64_t now=mach_absolute_time();
+-    timed=now-walked_at>=period;
++    timed=now-walked_at_>=period;
+ #else
+     const uint64_t now=0;timed=true;
+ #endif
+-    if(epoch==walked_epoch && !timed) {native_adreno_wc_walks[1]=native_adreno_wc_walks[1]+1;return kIOReturnSuccess;}
+-    const bool quiet=epoch==walked_epoch;
+-    walked_epoch=epoch;walked_at=now;
+-    native_adreno_wc_walks[0]=native_adreno_wc_walks[0]+1;
+-    const uint32_t before=*reset;
+-    for(size_t i=0;i<high_;++i) {
+-        const Mapping &m=mappings_[i];
+-        if(!m.memory)continue;
++    size_t pages=0;
++    bool walked=false;
++    /* With the kernel's pins (NativeAdrenoCpu.cpp) no view can move a pinned page: nothing to walk per submission, and the timed
++     * sweep takes every BO, viewed or not, so [3] checks that the pins hold. */
++    const bool pinned=native_adreno_wc_pinned[3]!=0;
++    for(size_t i=0;i<high_ && !pinned;++i) {
++        const Mapping &m=mappings_[i];
++        if(!m.memory || !m.memory->cpuViewed())continue;
++        const bool changed=m.memory->takeViewChange();
++        if(!changed && !timed)continue;
++        const uint32_t was=*reset;
++        pages+=m.memory->reassertPages();walked=true;
+         const IOReturn status=m.memory->reassertWriteCombined(reset);
+         if(status)return status;
+-    }
+-    if(quiet && *reset!=before)native_adreno_wc_walks[2]=native_adreno_wc_walks[2]+(*reset-before);
++        if(!changed)native_adreno_wc_walks[2]=native_adreno_wc_walks[2]+(*reset-was);
++    }
++    if(timed) {
++        walked_at_=now;
++        /* The unviewed BOs, from where the last slice stopped, until a slice's worth of pages (whole BOs) or one lap. */
++        /* With the pins a slice is only a check (usb-463: 160k pages pinned, the VM's 131k requests to move them refused, nothing
++         * found): 1024 pages, about 50 us. Without them, 8192 bound how long a reset a view change did not name could last. */
++        const size_t SweepPages=pinned?1024:8192;
++        const uint32_t swept=*reset;
++        size_t slice=0;
++        for(size_t n=0;n<high_ && slice<SweepPages;++n) {
++            if(sweep_at_>=high_)sweep_at_=0;
++            const Mapping &m=mappings_[sweep_at_++];
++            if(!m.memory || (m.memory->cpuViewed() && !pinned))continue;
++            slice+=m.memory->reassertPages();
++            const IOReturn status=m.memory->reassertWriteCombined(reset);
++            if(status)return status;
++        }
++        pages+=slice;walked=true;
++        native_adreno_wc_walks[3]=native_adreno_wc_walks[3]+(*reset-swept);
++    }
++    native_adreno_wc_walks[walked?0:1]=native_adreno_wc_walks[walked?0:1]+1;
++    native_adreno_wc_walks[4]=native_adreno_wc_walks[4]+pages;
+     return kIOReturnSuccess;
+ }
+ IOReturn NativeAdrenoVm::auditRange(uint64_t iova,size_t bytes,uint32_t *lines,uint32_t *dirty,uint32_t *stale) const
+--- a/NativeAdrenoUserClient.cpp
++++ b/NativeAdrenoUserClient.cpp
+@@ -676,6 +676,7 @@
+     if(entry->memory.imported())return kIOReturnUnsupported;
+     if(entry->mapping_leases==UINT32_MAX)return kIOReturnNoResources;
+     ++entry->mapping_leases;
++    entry->memory.noteViewChange();   /* 0023 */
+     reply->token=entry->token;reply->bytes=entry->memory.bytes();
+     return kIOReturnSuccess;
+ }
+@@ -689,6 +690,7 @@
+     if(request->token!=entry->token)return kIOReturnBadArgument;
+     if(!entry->mapping_leases)return kIOReturnBusy;
+     --entry->mapping_leases;
++    entry->memory.noteViewChange();   /* 0023: Turnip unmaps its view before this call */
+     return kIOReturnSuccess;
+ }
+ IOReturn NativeAdrenoUserClient::createQueue(NativeAdrenoAbiQueueReply *reply)
+--- a/NativeAdrenoPublish.cpp
++++ b/NativeAdrenoPublish.cpp
+@@ -409,6 +409,11 @@
+         }
+         view->release();
+     }
++    /* 0023: the teardown may have moved the BO's pages off write-combined; while the BO lives, its next submission walks it. */
++    IOLockLock(g.lock);
++    if(live_ && token && handle && core_->handleForToken(token)==handle)
++        if(NativeAdrenoMemory *viewed=core_->memoryForToken(token))viewed->noteViewChange();
++    IOLockUnlock(g.lock);
+ }
+ IOReturn AGXDeviceUserClient::clientClose()
+ {
+@@ -502,6 +507,7 @@
+     if(!views_) {IOLockUnlock(g.lock);return kIOReturnNoMemory;}
+     View *v=viewSlot(type);
+     if(v && v->descriptor && v->token==type) {
++        if(NativeAdrenoMemory *viewed=live_?core_->memoryForToken(type):nullptr)viewed->noteCpuView();   /* 0023 */
+         v->descriptor->retain();*memory=v->descriptor;*options=kIOMapAnywhere|kIOMapInhibitCache;
+         native_adreno_view_diag[2]=native_adreno_view_diag[2]+1;
+         IOLockUnlock(g.lock);
+@@ -509,6 +515,7 @@
+     }
+     NativeAdrenoMemory *backing=live_?core_->memoryForToken(type):nullptr;
+     if(backing) {
++        backing->noteCpuView();   /* 0023: its pages are walked from now on (NativeAdrenoVm::reassertWriteCombined) */
+         /* The BO's pages are cached in the kernel and the GPU's PTEs are non-cacheable, so the client needs an uncached
+          * view. A mapping of the buffer descriptor with a different cache mode is not reliable, so describe the same raw
+          * physical spans (the ones the SMMU maps) and ask for kIOMapInhibitCache, exactly how the board code maps the
