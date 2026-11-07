@@ -2034,6 +2034,8 @@ extern volatile uint32_t native_adreno_mount_fail[4] __attribute__((weak_import)
 // NativeAdrenoUserClient.cpp: per method [0] calls, [1] failures, [2] last status; per window {overflows, last KiB, last end MiB}; per
 // client slot (4 = the kernel's) [2] refused BoAllocs, [3] last refusal, [4] its bytes; BoImport failures [1] count [2] status [3] stage
 extern volatile uint32_t native_adreno_method_stats[20][4] __attribute__((weak_import));
+extern volatile uint64_t native_adreno_vm_phase_us[2][8] __attribute__((weak_import));   // Adreno650 NativeAdrenoVm.cpp
+extern volatile uint64_t native_adreno_vm_kind_us[5][3] __attribute__((weak_import));
 extern volatile uint32_t native_adreno_window_overflow[4][3] __attribute__((weak_import));
 extern volatile uint32_t native_adreno_client_stats[5][6] __attribute__((weak_import));
 extern volatile uint32_t native_adreno_client_hist[5][10] __attribute__((weak_import));
@@ -2130,6 +2132,26 @@ void metalRows() {
             lastCalls[m] = calls; lastUs[m] = us;
         }
         if (any) printf("%s\n", line);
+    }
+    if (&native_adreno_vm_phase_us && &native_adreno_vm_kind_us) {
+        // Since the last row, the VM's table transactions per phase (NativeAdrenoVm.cpp PhaseClock), us: map n | preflight observe
+        // publish(cache) table insert | unmap n | observe acquire(cache) table erase retire, then {count, us, spans} per kind (driver
+        // memory map, import map, import map with aliases, unmap by page TLBIs, unmap by ASID).
+        static uint64_t lastP[2][8], lastK[5][3];
+        uint64_t p[2][8], k[5][3];
+        for (int r = 0; r < 2; ++r) for (int i = 0; i < 8; ++i) p[r][i] = native_adreno_vm_phase_us[r][i];
+        for (int r = 0; r < 5; ++r) for (int i = 0; i < 3; ++i) k[r][i] = native_adreno_vm_kind_us[r][i];
+        if (p[0][0] != lastP[0][0] || p[1][0] != lastP[1][0]) {
+            auto d = [&](int r, int i) {return (unsigned long long)(p[r][i] - lastP[r][i]);};
+            auto e = [&](int r, int i) {return (unsigned long long)(k[r][i] - lastK[r][i]);};
+            // Three short rows: a 28-argument printf stopped this thread for good (vp1, usb-477).
+            printf("VMPHASE map %llu | %llu %llu %llu %llu %llu\n", d(0, 0), d(0, 5), d(0, 1), d(0, 2), d(0, 3), d(0, 4));
+            printf("VMPHASE unmap %llu | %llu %llu %llu %llu %llu\n", d(1, 0), d(1, 1), d(1, 2), d(1, 3), d(1, 4), d(1, 5));
+            printf("VMPHASE kinds %llu/%llu/%llu %llu/%llu/%llu %llu/%llu/%llu\n", e(0, 0), e(0, 1), e(0, 2), e(1, 0), e(1, 1), e(1, 2),
+                   e(2, 0), e(2, 1), e(2, 2));
+            printf("VMPHASE unmaps %llu/%llu/%llu %llu/%llu/%llu\n", e(3, 0), e(3, 1), e(3, 2), e(4, 0), e(4, 1), e(4, 2));
+            memcpy(lastP, p, sizeof p); memcpy(lastK, k, sizeof k);
+        }
     }
     if (&native_adreno_window_overflow && &native_adreno_client_stats && &native_adreno_import_diag) {
         static char last[200];

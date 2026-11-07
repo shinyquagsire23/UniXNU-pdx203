@@ -1,0 +1,42 @@
+From: pdx203 <noreply@anthropic.com>
+Subject: gpu: count and sample host-memory imports
+
+BoImport bypasses the core's dispatch, so the per-method tally never saw it. It now counts there (MTIME m16, calls and us), and
+every 16th import is logged (GPUIMPORT) with the calling process, its range and cost, and whether the same range was imported in
+the last 64 imports. usb-465 showed about 100 imports a second in landscape TestUFO, each mapped and freed again (0.8 + 1.4 ms of
+kernel time): this names who makes them, and whether they are new memory or the same surface again.
+
+--- a/NativeAdrenoPublish.cpp
++++ b/NativeAdrenoPublish.cpp
+@@ -559,6 +559,7 @@
+ /* Fence waits as the callers see them (int-147; method 6's own statistics count every poll): [0] waits, [1] us waited in total, [2] pauses
+  * taken outside the connection lock, [3] the longest wait in us. */
+ extern "C" {volatile uint64_t native_adreno_wait_outer[4];}
++extern "C" volatile uint32_t native_adreno_method_stats[20][4];   /* NativeAdrenoUserClient.cpp */
+ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const void *input,size_t input_size,void *output,size_t output_size)
+ {
+     if(method==NativeAdrenoMethodSetMetadata && input && input_size==sizeof(NativeAdrenoAbiMetadata)) {
+@@ -651,8 +652,23 @@
+         NativeAdrenoAbiBoAllocReply reply{};
+         native_adreno_metal_diag.inflight=method+1;
+         IOLockLock(g.lock);
++        const uint64_t import_began=g.clock.now_us?g.clock.now_us(g.clock.cookie):0;
+         const IOReturn status=live_?core_->importBo(&request,current_task(),&reply):kIOReturnNotReady;
++        const uint64_t import_us=g.clock.now_us?g.clock.now_us(g.clock.cookie)-import_began:0;
++        /* 0024: imports in the per-method tally (MTIME m16; this path bypasses the core's dispatch), and every 16th one logged with its
++         * caller, range and cost, and whether the same range was imported in the last 64 imports (a re-import, not a new surface). */
++        native_adreno_method_stats[NativeAdrenoMethodBoImport][0]=native_adreno_method_stats[NativeAdrenoMethodBoImport][0]+1;
++        native_adreno_method_stats[NativeAdrenoMethodBoImport][3]=native_adreno_method_stats[NativeAdrenoMethodBoImport][3]+uint32_t(import_us);
++        static struct {uint64_t address,bytes;} recent[64];static uint32_t recent_at,import_count,repeats;
++        bool again=false;
++        for(const auto &r:recent)if(r.address==request.address && r.bytes==request.bytes) {again=true;break;}
++        if(again)++repeats;
++        recent[recent_at++%64]={request.address,request.bytes};
+         IOLockUnlock(g.lock);
++        if(!(import_count++%16))
++            IOLog("GPUIMPORT %s[%d] #%u addr 0x%llx bytes 0x%llx %llu us %s | repeats %u\n",name_,pid_,import_count,
++                (unsigned long long)request.address,(unsigned long long)request.bytes,(unsigned long long)import_us,
++                again?"again":"new",repeats);
+         native_adreno_metal_diag.inflight=0;
+         native_adreno_metal_diag.calls=native_adreno_metal_diag.calls+1;
+         native_adreno_metal_diag.last_selector=method;
