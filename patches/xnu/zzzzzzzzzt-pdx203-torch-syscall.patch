@@ -1,0 +1,37 @@
+--- a/bsd/kern/syscalls.master
++++ b/bsd/kern/syscalls.master
+@@ -844,7 +844,7 @@
+ #endif // CONFIG_COALITIONS
+ 533     AUE_NULL        ALL     { int log_data(unsigned int tag, unsigned int flags, void *buffer, unsigned int size) NO_SYSCALL_STUB; }
+ 534 AUE_NULL	ALL	{ uint64_t memorystatus_available_memory(void) NO_SYSCALL_STUB; }
+-535 AUE_NULL	ALL { int enosys(void); }
++535	AUE_NULL	ALL	{ int pdx203_torch(int level) NO_SYSCALL_STUB; }
+ 536	AUE_NULL	ALL	{ int shared_region_map_and_slide_2_np(uint32_t files_count, const struct shared_file_np *files, uint32_t mappings_count, const struct shared_file_mapping_slide_np *mappings) NO_SYSCALL_STUB; }
+ 537	AUE_NULL	ALL { int pivot_root(const char *new_rootfs_path_before, const char *old_rootfs_path_after); }
+ 538 AUE_TASKINSPECTFORPID	ALL { int task_inspect_for_pid(mach_port_name_t target_tport, int pid, mach_port_name_t *t); }
+--- a/bsd/kern/kern_xxx.c
++++ b/bsd/kern/kern_xxx.c
+@@ -284,5 +284,23 @@
+ 		return usrctl_full();
+ 	} else {
+ 		return usrctl_logout((uid_t)uap->flags);
++	}
++}
++
++/*
++ * UniXNU pdx203: the flashlight. The board's text fixups turn the camera daemon's FigFlashlight device call into this syscall;
++ * level 0 (off) .. 1000 (full) goes to the board package's PM8150L torch driver (package/Pdx203Torch.cpp).
++ */
++extern int pdx203_torch_set(int level) __attribute__((weak_import));
++
++int
++pdx203_torch(__unused struct proc *p, struct pdx203_torch_args *uap, __unused int32_t *retval)
++{
++	if (!pdx203_torch_set) {
++		return ENOSYS;
+ 	}
++	if (uap->level < 0 || uap->level > 1000) {
++		return EINVAL;
++	}
++	return pdx203_torch_set(uap->level) ? EIO : 0;
+ }

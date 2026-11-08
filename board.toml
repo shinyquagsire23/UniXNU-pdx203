@@ -260,6 +260,21 @@ text_fixups = [
   # socket (Pdx203BtTty.c registers both names) carries the H4 stream with read/write. launchd runs the signed job cache, so the
   # BT_HCI_TRANSPORT environment cannot be set instead. 2026-11-05.
   "bluetoothd,ddd20,a0050034,1f2003d5",
+  # The flashlight (2026-11-07): the camera daemon's FigFlashlight (CMCapture FigFlashlight.m, subcache .13 = vaddr - 0x1a67c8000) runs
+  # with no capture device, as this board has no camera stack: flashlight_IsAvailable (0x1a69e4ac4) answers 1, flashlight_setupDevice
+  # (0x1a69e4ecc) succeeds at once (no device or stream), and flashlight_setLevelInternal's stream setProperty TorchLevel
+  # (0x1a69e5128..0x1a69e515c) becomes syscall 535 pdx203_torch(level * 1000) (zzzzzzzzzt-pdx203-torch-syscall.patch,
+  # package/Pdx203Torch.cpp); the level store and its FlashlightLevel notification after it are unchanged.
+  "dyld_shared_cache_arm64.13,21cac4,f44fbea9fd7b01a9,20008052c0035fd6",
+  "dyld_shared_cache_arm64.13,21cecc,ffc301d1fa6702a9,00008052c0035fd6",
+  "dyld_shared_cache_arm64.13,21d128,c01e40f9800100b428642290089540f9,097d80522101221e0109211e2000381e",
+  "dyld_shared_cache_arm64.13,21d138,020140f9e30313aa103f1594f70300aa,f04280d2011000d4070000141f2003d5",
+  "dyld_shared_cache_arm64.13,21d148,e00315aa0041201ee10317aaa907ff97,1f2003d51f2003d51f2003d51f2003d5",
+  "dyld_shared_cache_arm64.13,21d158,57020035,1f2003d5",
+  # flashlight_NotifyForCurrentState (0x1a69e4df4) posts FlashlightAvailable = [vendor activeDefaultDeviceEquals:nil device], NO here, and
+  # AVFlashlight's isAvailable is that cached notification (Control Center's tile stayed disabled, fl1): the query becomes mov w0, #1.
+  "dyld_shared_cache_arm64.13,21ce54,e8d920b000cd46f9a1561594821a40f9,200080521f2003d51f2003d51f2003d5",
+  "dyld_shared_cache_arm64.13,21ce64,af941494,1f2003d5",
 ]
 
 [payload.adt]
@@ -296,6 +311,11 @@ artwork-display-gamut = "sRGB"
 
 [adt.product.u32]
 thin-bezel = 1
+
+# MobileGestalt's camera-flash is "IODeviceTree:/product/camera has a flash property" (libMobileGestalt 0x1a0219fac): AVFlashlight's
+# hasFlashlight and Control Center's flashlight module ask it. The torch is package/Pdx203Torch.cpp.
+[adt.product.camera.u32]
+flash = 1
 
 # home-button-type 2 is the gesture-only case: the lock screen offers the swipe-to-unlock gesture
 [adt.buttons.string]

@@ -1023,6 +1023,7 @@ extern "C" volatile int32_t pdx203_knob_idle_us __attribute__((weak));
 extern "C" volatile int32_t pdx203_knob_gputrip __attribute__((weak)), pdx203_knob_hottrip __attribute__((weak));
 // Runtime knobs, set over the USB control channel (KEY:knob.<name>,<value>; Pdx203TouchProbe.cpp). 0 set, -1 no such knob, -2 out of range.
 extern "C" void native_hid_orientation_step(intptr_t step) __attribute__((weak_import));   // ShengHidInput (orientation device)
+extern "C" int pdx203_torch_set(int level) __attribute__((weak_import));                // Pdx203Torch.cpp
 extern "C" int pdx203_knob_set(const char *name, size_t length, int value) {
     static const struct {const char *name; volatile int32_t *knob;} governor[] = {{"ddrlow", &pdx203_knob_ddrlow}, {"dcvs", &pdx203_knob_dcvs},
                                                                                  {"spaces", &native_adreno_space_policy}};
@@ -1048,6 +1049,14 @@ extern "C" int pdx203_knob_set(const char *name, size_t length, int value) {
         }
     // orient 1..4: the orientation device reports that orientation (1 portrait, 2 upside down, 3 landscape left, 4 landscape right),
     // as the volume up + down chord steps it (ButtonProbe.cpp): the rig drives landscape (injected keys never reach the chord's poll).
+    // torch 0..1000: the flashlight's level (Pdx203Torch.cpp), as Control Center sets it through the camera daemon.
+    if (length == 5 && !strncmp(name, "torch", 5)) {
+        if (value < 0 || value > 1000) return -2;
+        if (!&pdx203_torch_set) return -1;
+        const int rc = pdx203_torch_set(value);
+        printf("PDX203 KNOB torch = %d (rc %d)\n", value, rc);
+        return 0;
+    }
     if (length == 6 && !strncmp(name, "orient", 6)) {
         if (value < 1 || value > 4) return -2;
         if (!&native_hid_orientation_step) return -1;

@@ -53,3 +53,6 @@ zzzzzzzzzr-xpc-user-endpoints.patch
 # Pages a driver pinned write-combined keep the attribute whatever the VM asks (a device-pager view's teardown set the Adreno BOs'
 # pages back to cacheable), so the driver no longer walks its BOs' pages before submissions (Adreno650 0023).
 zzzzzzzzzs-pmap-pinned-wc.patch
+# The flashlight: syscall 535 (enosys in xnu-10063) pdx203_torch(level 0..1000) into the board's PM8150L torch driver; the camera
+# daemon's patched FigFlashlight (board.toml text fixups) calls it.
+zzzzzzzzzt-pdx203-torch-syscall.patch
