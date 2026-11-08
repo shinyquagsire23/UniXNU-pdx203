@@ -644,6 +644,8 @@ extern "C" void pdx203_backlight_probe(void);
 // (package/Pdx203Audio.cpp; pdx203-audio=<bits>): their own threads, nothing without the arguments
 extern "C" void sheng_adsp_probe(void);
 extern "C" void pdx203_audio_probe(void);
+// the motion sensors behind the SLPI (package/Pdx203Sensors.cpp; pdx203-sns=0 turns it off): FastRPC file server, SSC client, auto-rotate
+extern "C" void pdx203_sensors_probe(void);
 // the QCA6390 WiFi chip on PCIe0 (package/Pdx203Wifi.cpp; pdx203-wifi=<stage>): its rails go through the ADSP thread's RPMh helper
 extern "C" void pdx203_wifi_probe(void);
 // the QCA6390's Bluetooth on QUP SE6 (package/Pdx203Bluetooth.cpp; pdx203-blue=<mode>): waits for the WiFi bring-up's rails, then the UART,
@@ -663,6 +665,7 @@ void native_legacy_display_late_probe(void) {
     pdx203_rtc_probe();
     pdx203_backlight_probe();
     sheng_adsp_probe();
+    pdx203_sensors_probe();
     pdx203_audio_probe();
     pdx203_wifi_probe();
     pdx203_bluetooth_probe();
@@ -1021,6 +1024,7 @@ extern "C" volatile int32_t native_adreno_app_depth __attribute__((weak));
 extern "C" volatile int32_t pdx203_knob_idle_us __attribute__((weak));
 // GpuProbe's GPU thermal cap: the gpuss trip and the hottest-sensor trip, in C.
 extern "C" volatile int32_t pdx203_knob_gputrip __attribute__((weak)), pdx203_knob_hottrip __attribute__((weak));
+extern "C" volatile int32_t pdx203_knob_autorotate __attribute__((weak));   // Pdx203Sensors.cpp: the IMU turns the screen
 // Runtime knobs, set over the USB control channel (KEY:knob.<name>,<value>; Pdx203TouchProbe.cpp). 0 set, -1 no such knob, -2 out of range.
 extern "C" void native_hid_orientation_step(intptr_t step) __attribute__((weak_import));   // ShengHidInput (orientation device)
 extern "C" int pdx203_torch_set(int level) __attribute__((weak_import));                // Pdx203Torch.cpp
@@ -1038,7 +1042,7 @@ extern "C" int pdx203_knob_set(const char *name, size_t length, int value) {
     static const struct {const char *name; volatile int32_t *knob; int lo, hi;} knobs[] = {
         {"vlock", &pdx203_knob_vlock, 0, 1}, {"vphase", &pdx203_knob_vphase, 0, 166}, {"vgain", &pdx203_knob_vgain, 0, 16},
         {"eretire", &pdx203_knob_eretire, 0, 1}, {"appdepth", &native_adreno_app_depth, 0, 8}, {"idleus", &pdx203_knob_idle_us, 20, 20000},
-        {"gputrip", &pdx203_knob_gputrip, 50, 95}, {"hottrip", &pdx203_knob_hottrip, 50, 95}};
+        {"gputrip", &pdx203_knob_gputrip, 50, 95}, {"hottrip", &pdx203_knob_hottrip, 50, 95}, {"autorotate", &pdx203_knob_autorotate, 0, 1}};
     for (auto &k : knobs)
         if (length == strlen(k.name) && !strncmp(name, k.name, length)) {
             if (!k.knob) return -1;

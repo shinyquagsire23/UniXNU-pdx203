@@ -45,6 +45,10 @@ extern "C" int armcpu_spi_attach(uint32_t, bool, void (*)(void *), void *, uint3
 // up (bit per client) | version agreed << 14 | link broken << 15, [12] channel opens nobody serves, [13] last SCM x0, [14] its x1,
 // [15] votes: lcx index | lmx index << 8 | RSC done interrupts << 16
 extern "C" {volatile int32_t native_adsp_stats[16]; char native_adsp_text[96];}
+// The SLPI: [0] stage (Stage values; negative: the failed step), [1] last error, [2] slave-kernel bits (-1 no item), [3] slpi KiB, [4] ms to
+// ready, [5] GLINK messages in, [6] out, [7] channels up | version agreed << 14 | broken << 15, [8] channel opens nobody serves,
+// [9] IPCC doorbells from it
+extern "C" {volatile int32_t pdx203_slpi_stats[12]; char pdx203_slpi_text[96];}
 
 namespace {
 enum Stage {
@@ -59,7 +63,14 @@ constexpr uint32_t kItemGlinkDesc = 478, kItemGlinkTx = 479, kItemGlinkRx = 480,
 constexpr uint32_t kSpiIpcc = 229, kSpiRsc = 5;
 constexpr uint32_t kFatal = 1u << 0, kReady = 1u << 1, kHandover = 1u << 2;
 constexpr uint32_t kEvSmp2p = 1, kEvGlink = 2, kEvAop = 4, kEvRsc = 8, kEvSend = 16;
-constexpr unsigned kClients = 4, kQueue = 8;
+constexpr unsigned kClients = 6, kQueue = 8;  // the ADSP's IPCRTR and APR, the SLPI's IPCRTR and FastRPC
+// The sensor DSP (SLPI, "dsps"), booted by this thread after the ADSP (2026-11-07): pdx203.dtb qcom,ssc@5c00000 (pil-tz-generic, PAS 12,
+// split image slpi.mdt/.bNN in modem_a, AOSS load_state "slpi", proxy rails lcx/lmx as the ADSP), pil_slpi_region 0x88c00000 + 0x1500000,
+// qcom,smp2p-dsps (items 481 in / 430 out, remote pid 3), glink dsps (remote pid 3, IPCC client 4: signal 0 GLINK, 2 SMP2P; channels
+// IPCRTR and fastrpcglink-apps-dsp). The IMU (LSM6DSM on SSC SPI 3) is only reachable through it. pdx203-slpi=0 leaves it off.
+constexpr uint64_t kSlpiBase = 0x88c00000, kSlpiSize = 0x1500000;
+constexpr uint32_t kPasSlpi = 12, kSlpiPid = 3, kSlpiItemIn = 481, kSlpiItemOut = 430, kIpccSlpi = 4;
+constexpr uint32_t kEvSlpiSmp2p = 32, kEvSlpiGlink = 64;
 
 struct Window {IOMemoryMap *map; volatile uint8_t *va;};
 bool mapWindow(Window &w, uint64_t base, uint64_t size, IOOptionBits cache = kIOMapInhibitCache) {
@@ -104,6 +115,8 @@ struct ShengAdspChannel {
     ShengAdspClient client;
     void *context;
     uint8_t *storage;
+    unsigned edge;  // 0 the ADSP, 1 the SLPI
+    int lastRc;     // the last send's QcomGlink result, for the sensors row
     QcomGlinkChannel *glink;
     Message *queue;  // kQueue slots
     uint32_t head, count;
@@ -128,6 +141,8 @@ void ipccIrq(void *) {
         if (id == qcom_ipcc_id(QCOM_IPCC_CLIENT_LPASS, QCOM_IPCC_SIGNAL_SMP2P)) bits |= kEvSmp2p;
         else if (id == qcom_ipcc_id(QCOM_IPCC_CLIENT_LPASS, QCOM_IPCC_SIGNAL_GLINK_QMP)) bits |= kEvGlink;
         else if (id == qcom_ipcc_id(QCOM_IPCC_CLIENT_AOP, QCOM_IPCC_SIGNAL_GLINK_QMP)) bits |= kEvAop;
+        else if (id == qcom_ipcc_id(kIpccSlpi, QCOM_IPCC_SIGNAL_SMP2P)) {bits |= kEvSlpiSmp2p; pdx203_slpi_stats[9] = pdx203_slpi_stats[9] + 1;}
+        else if (id == qcom_ipcc_id(kIpccSlpi, QCOM_IPCC_SIGNAL_GLINK_QMP)) {bits |= kEvSlpiGlink; pdx203_slpi_stats[9] = pdx203_slpi_stats[9] + 1;}
     }
     native_adsp_stats[2] = native_adsp_stats[2] + 1;
     if (bits) wake(bits);
@@ -231,6 +246,7 @@ bool readCmdDb(uint8_t *copy) {
     return true;
 }
 QcomRpmhResource gLcx, gLmx;
+uint32_t gLcxTop, gLmxTop;  // the proxy vote's indices, kept for the SLPI's start
 int gTcs = -1;
 // TCS 1 is shared with the WiFi bring-up's rail votes (pdx203_rpmh_send below; the GPU's bus votes take whichever of TCS 0/1 is idle):
 // one request at a time. Recursive: vote() services the DSP's events while it waits.
@@ -310,7 +326,7 @@ struct Image {  // plain data, zero at start: the two live in static storage (a 
     QcomMdtImage mdt;
     IOBufferMemoryDescriptor *meta;
 };
-Image gAdspImage;
+Image gAdspImage, gSlpiImage;
 int fileRead(void *context, uint64_t offset, void *to, size_t length) {return sheng_fw_read(context, offset, to, length);}
 void release(Image &image) {
     if (image.file) sheng_fw_close(image.file);
@@ -404,10 +420,80 @@ void serviceGlink() {
     if (gGlink.version_agreed && native_adsp_stats[0] >= StReady && native_adsp_stats[0] < StGlink) stage(StGlink);
     if (up && native_adsp_stats[0] >= StGlink) stage(StChannel);
 }
+// ---- the SLPI edge ----
+QcomSmemPartition gSlpiPart;
+bool gSlpiPartOk;
+QcomSmp2p gSlpiP2p;
+QcomGlink gSlpiGlink;
+bool gSlpiGlinkStarted, gSlpiHandedOver;
+uint32_t gSlpiSlave;
+void slpiStage(int value, int error = 0) {
+    pdx203_slpi_stats[0] = value;
+    if (error) pdx203_slpi_stats[1] = error;
+    printf("PDX203 SLPI stage %d err %d slave %x ipcc %d | %s\n", value, error, (unsigned)gSlpiSlave, (int)pdx203_slpi_stats[9], pdx203_slpi_text);
+}
+void slpiNote(const char *prefix, const char *text) {
+    size_t at = 0;
+    for (; prefix[at] && at < sizeof pdx203_slpi_text - 1; ++at) pdx203_slpi_text[at] = prefix[at];
+    for (size_t i = 0; text[i] && at < sizeof pdx203_slpi_text - 1; ++i) pdx203_slpi_text[at++] = text[i];
+    pdx203_slpi_text[at] = 0;
+}
+volatile uint8_t *slpiItem(uint16_t id, uint32_t *size) {
+    uint32_t at = 0, bytes = 0;
+    if (!gSlpiPartOk || qcom_smem_find(&gSmem, &gSlpiPart, id, &at, &bytes)) return nullptr;
+    if (size) *size = bytes;
+    return gSmemW.va + at;
+}
+int slpiAllocItem(uint16_t id, uint32_t size) {
+    if (!lockSmem()) return -16;
+    const int rc = qcom_smem_alloc(&gSmem, &gSlpiPart, id, size);
+    unlockSmem();
+    return rc == QcomSmemExists ? 0 : rc;
+}
+void kickSlpiGlink(void *) {ring(kIpccSlpi, QCOM_IPCC_SIGNAL_GLINK_QMP);}
+void kickSlpiSmp2p() {ring(kIpccSlpi, QCOM_IPCC_SIGNAL_SMP2P);}
+void serviceSlpiSmp2p() {
+    if (!gSlpiP2p.out) return;
+    if (!gSlpiP2p.in) {
+        if (volatile uint8_t *in = slpiItem(kSlpiItemIn, nullptr)) gSlpiP2p.in = reinterpret_cast<volatile uint32_t *>(in);
+        else return;
+    }
+    uint32_t value = 0, changed = 0;
+    if (qcom_smp2p_service(&gSlpiP2p, "slave-kernel", &value, &changed)) kickSlpiSmp2p();
+    if (value != gSlpiSlave) printf("PDX203 SLPI slave-kernel %x -> %x\n", (unsigned)gSlpiSlave, (unsigned)value);
+    gSlpiSlave = value;
+    pdx203_slpi_stats[2] = (int32_t)value;
+    if ((changed & value & kFatal)) {readCrashReason(); slpiNote("crash: ", native_adsp_text);}
+    if ((value & kHandover) && !gSlpiHandedOver) {
+        gSlpiHandedOver = true;
+        vote(0, 0);  // the SLPI holds its own votes now (the ADSP handed over before the SLPI started)
+    }
+}
+void serviceSlpiGlink() {
+    if (!gSlpiGlinkStarted) return;
+    if (!gSlpiGlink.rx.data) {
+        uint32_t size = 0;
+        if (volatile uint8_t *rx = slpiItem(kItemGlinkRx, &size)) qcom_glink_set_rx(&gSlpiGlink, rx, size);
+    }
+    qcom_glink_poll(&gSlpiGlink);
+    pumpSends();
+    uint32_t up = 0;
+    for (unsigned i = 0; i < gClientCount; ++i) if (gClients[i].edge == 1 && gClients[i].glink && gClients[i].glink->up) up |= 1u << i;
+    const int32_t before = pdx203_slpi_stats[8];
+    pdx203_slpi_stats[5] = (int32_t)gSlpiGlink.rx_messages;
+    pdx203_slpi_stats[6] = (int32_t)gSlpiGlink.tx_messages;
+    pdx203_slpi_stats[7] = (int32_t)(up | (uint32_t)gSlpiGlink.version_agreed << 14 | (uint32_t)gSlpiGlink.broken << 15);
+    pdx203_slpi_stats[8] = (int32_t)gSlpiGlink.unknown_opens;
+    if (gSlpiGlink.unknown_opens != (uint32_t)before) {slpiNote("open: ", gSlpiGlink.unknown_names); printf("PDX203 SLPI %s\n", pdx203_slpi_text);}
+    if (gSlpiGlink.version_agreed && pdx203_slpi_stats[0] == StReady) slpiStage(StGlink);
+    if (up && pdx203_slpi_stats[0] == StGlink) slpiStage(StChannel);
+}
 void service(uint32_t bits) {
     if (bits & kEvAop) qcom_qmp_step(&gQmp);
     if (bits & (kEvSmp2p | kEvGlink)) serviceSmp2p();
     if (bits & (kEvGlink | kEvSend)) {applyClients(); serviceGlink();}
+    if (bits & (kEvSlpiSmp2p | kEvSlpiGlink)) serviceSlpiSmp2p();
+    if (bits & (kEvSlpiGlink | kEvSend)) {applyClients(); serviceSlpiGlink();}
 }
 // Runs events until done() holds or ms pass; returns done().
 template <typename F> bool waitUntil(uint32_t ms, F done) {
@@ -438,7 +524,8 @@ void applyClients() {
     IOLockLock(gClientLock);
     for (unsigned i = 0; i < gClientCount; ++i) {
         ShengAdspChannel &c = gClients[i];
-        if (!c.glink) c.glink = qcom_glink_channel(&gGlink, c.name, c.intent_size, c.intent_count, c.storage, &glue, &c, c.initiator);
+        QcomGlink *edge = c.edge ? (gSlpiGlinkStarted ? &gSlpiGlink : nullptr) : &gGlink;
+        if (!c.glink && edge) c.glink = qcom_glink_channel(edge, c.name, c.intent_size, c.intent_count, c.storage, &glue, &c, c.initiator);
     }
     IOLockUnlock(gClientLock);
 }
@@ -467,7 +554,8 @@ void pumpSends() {
             Message *m = &c.queue[c.head];
             IOLockUnlock(gClientLock);
             // Only this thread takes messages off the queue, so m stays valid while the lock is dropped for the send.
-            const int rc = qcom_glink_send(&gGlink, c.glink, m->data, m->length);
+            const int rc = qcom_glink_send(c.edge ? &gSlpiGlink : &gGlink, c.glink, m->data, m->length);
+            c.lastRc = rc;
             noteChannel(c, rc, m->length);
             if (rc != QcomGlinkOk) break;
             IOLockLock(gClientLock);
@@ -557,6 +645,7 @@ bool start() {
         fail(StRails, -2); release(adsp); return false;
     }
     if ((rc = vote(lcx, lmx))) {fail(StRails, rc); release(adsp); return false;}
+    gLcxTop = lcx; gLmxTop = lmx;
     stage(StRails);
 
     if ((rc = authenticateHeader(adsp, kPasAdsp, kAdspBase)) || (rc = loadSegments(adsp, kAdspBase, kAdspSize))) {
@@ -600,6 +689,81 @@ bool startGlink() {
     return true;
 }
 
+// The SLPI, once the ADSP is up: its SMP2P item, its doorbells, load_state over the AOSS link the ADSP opened, the proxy vote again, the
+// image into its carveout, auth and reset, then "ready" (5 s) and its GLINK edge. Every wait services both DSPs' events.
+bool startSlpi() {
+    Image &img = gSlpiImage;
+    slpiStage(StMapped);
+    if (qcom_smem_partition(&gSmem, QCOM_SMEM_HOST_APPS, kSlpiPid, &gSlpiPart)) {slpiStage(-StSurveyed, -2); return false;}
+    gSlpiPartOk = true;
+    if (volatile uint8_t *in = slpiItem(kSlpiItemIn, nullptr)) {
+        QcomSmp2p view = {};
+        view.in = reinterpret_cast<volatile uint32_t *>(in);
+        view.local_pid = 0; view.remote_pid = kSlpiPid;
+        const int index = qcom_smp2p_check_in(view.in, 0, kSlpiPid) ? -1 : qcom_smp2p_find_in(&view, "slave-kernel");
+        if (index >= 0 && qcom_smp2p_in_value(&view, index)) {slpiStage(-StSurveyed, -114); return false;}  // running already
+    }
+    slpiStage(StSurveyed);
+    int rc = openImage(img, "modem:slpi");
+    if (rc) {slpiNote("fw: ", "modem:slpi"); slpiStage(-StFirmware, rc); return false;}
+    pdx203_slpi_stats[3] = (int32_t)(img.size >> 10);
+    slpiStage(StFirmware);
+    if ((rc = slpiAllocItem(kSlpiItemOut, QCOM_SMP2P_ITEM_BYTES))) {slpiStage(-StSmp2p, rc); release(img); return false;}
+    qcom_smp2p_init_out(&gSlpiP2p, reinterpret_cast<volatile uint32_t *>(slpiItem(kSlpiItemOut, nullptr)), 0, kSlpiPid);
+    qcom_smp2p_add_entry(&gSlpiP2p, "master-kernel");
+    slpiStage(StSmp2p);
+    wr(gIpcc, QCOM_IPCC_RECV_ENABLE, qcom_ipcc_id(kIpccSlpi, QCOM_IPCC_SIGNAL_SMP2P));
+    wr(gIpcc, QCOM_IPCC_RECV_ENABLE, qcom_ipcc_id(kIpccSlpi, QCOM_IPCC_SIGNAL_GLINK_QMP));
+    kickSlpiSmp2p();
+    slpiStage(StDoorbells);
+    if (gQmp.state != QcomQmpOpen) {slpiStage(-StLoadState, gQmp.state); release(img); return false;}
+    qcom_qmp_send(&gQmp, "{class: image, res: load_state, name: slpi, val: on}");
+    if (!waitUntil(1000, [] {return qcom_qmp_step(&gQmp) == QcomQmpOpen;})) {
+        qcom_qmp_abandon(&gQmp);
+        slpiStage(-StLoadState, -60); release(img); return false;
+    }
+    slpiStage(StLoadState);
+    if ((rc = vote(gLcxTop, gLmxTop))) {slpiStage(-StRails, rc); release(img); return false;}
+    slpiStage(StRails);
+    auto stop = [] {scm(QCOM_SCM_PAS_SHUTDOWN, qcom_scm_args(1, 0, 0, 0), kPasSlpi, 0, 0);};
+    if ((rc = authenticateHeader(img, kPasSlpi, kSlpiBase)) || (rc = loadSegments(img, kSlpiBase, kSlpiSize))) {
+        slpiStage(-StLoaded, rc); stop(); vote(0, 0); release(img); return false;
+    }
+    slpiStage(StLoaded);
+    const uint64_t began = mach_absolute_time();
+    if (!scmOk(scm(QCOM_SCM_PAS_AUTH_AND_RESET, qcom_scm_args(1, 0, 0, 0), kPasSlpi, 0, 0))) {
+        slpiStage(-StStarted, (int)native_adsp_stats[13]); stop(); vote(0, 0); release(img); return false;
+    }
+    slpiStage(StStarted);
+    const bool ready = waitUntil(5000, [] {serviceSlpiSmp2p(); return (gSlpiSlave & (kReady | kFatal)) != 0;});
+    uint64_t ns = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+    pdx203_slpi_stats[4] = (int32_t)(ns / 1000000);
+    release(img);
+    if (!ready || (gSlpiSlave & kFatal)) {
+        slpiStage(-StReady, ready ? -5 : -60);
+        stop();
+        if (!gSlpiHandedOver) vote(0, 0);
+        return false;
+    }
+    slpiStage(StReady);
+    return true;
+}
+bool startSlpiGlink() {
+    int rc = slpiAllocItem(kItemGlinkDesc, 32);
+    if (!rc) rc = slpiAllocItem(kItemGlinkTx, kGlinkFifo);
+    uint32_t size = 0;
+    volatile uint8_t *desc = slpiItem(kItemGlinkDesc, nullptr), *txf = slpiItem(kItemGlinkTx, &size);
+    if (rc || !desc || !txf) {slpiStage(-StGlink, rc ? rc : -2); return false;}
+    volatile uint32_t *d = reinterpret_cast<volatile uint32_t *>(desc);
+    const QcomGlinkFifo tx = {&d[1], &d[0], txf, size}, rx = {&d[3], &d[2], nullptr, 0};
+    qcom_glink_init(&gSlpiGlink, tx, rx, kickSlpiGlink, nullptr);
+    gSlpiGlinkStarted = true;
+    applyClients();
+    serviceSlpiGlink();
+    return true;
+}
+
 void adspThread(void *, wait_result_t) {
     thread_set_thread_name(current_thread(), "pdx203-adsp");
     unsigned mode = 0;
@@ -617,6 +781,9 @@ void adspThread(void *, wait_result_t) {
     survey();
     stage(StSurveyed);
     if (mode < 2 || !start() || !startGlink()) return;
+    unsigned slpi = 1;
+    PE_parse_boot_argn("pdx203-slpi", &slpi, sizeof slpi);
+    if (slpi && startSlpi()) startSlpiGlink();
     // From here on the thread only answers doorbells and client sends; with nothing pending it sleeps without a deadline, except while
     // a send waits for an intent or FIFO room (then it looks again every second).
     for (;;) {
@@ -627,7 +794,7 @@ void adspThread(void *, wait_result_t) {
 }
 }  // namespace
 
-extern "C" ShengAdspChannel *sheng_adsp_channel(const char *name, uint32_t intent_size, uint32_t intent_count, int initiator,
+extern "C" ShengAdspChannel *pdx203_dsp_channel(unsigned edge, const char *name, uint32_t intent_size, uint32_t intent_count, int initiator,
                                                 const ShengAdspClient *client, void *context) {
     if (!gClientLock || !name || !client || !intent_size || !intent_count || intent_count > QCOM_GLINK_MAX_LOCAL_INTENTS) return nullptr;
     uint8_t *storage = static_cast<uint8_t *>(IOMallocData((vm_size_t)intent_size * intent_count));
@@ -638,7 +805,7 @@ extern "C" ShengAdspChannel *sheng_adsp_channel(const char *name, uint32_t inten
         bzero(c, sizeof *c);
         strlcpy(c->name, name, sizeof c->name);
         c->intent_size = intent_size; c->intent_count = intent_count; c->initiator = initiator;
-        c->client = *client; c->context = context; c->storage = storage; c->queue = queue;
+        c->client = *client; c->context = context; c->storage = storage; c->queue = queue; c->edge = edge ? 1 : 0;
         __atomic_store_n(&gClientCount, gClientCount + 1, __ATOMIC_RELEASE);
     }
     IOLockUnlock(gClientLock);
@@ -649,6 +816,44 @@ extern "C" ShengAdspChannel *sheng_adsp_channel(const char *name, uint32_t inten
     }
     wake(kEvSend);
     return c;
+}
+
+// The SLPI edge's channels for the sensors row: per channel its name, up, remote intents valid/busy, local intents advertised/busy, and
+// how many sends wait in its queue. Read without the DSP thread's lock (a snapshot for the log).
+extern "C" unsigned pdx203_slpi_glink_summary(char *out, unsigned cap) {
+    unsigned at = 0;
+    if (!cap) return 0;
+    out[0] = 0;
+    for (unsigned i = 0; i < QCOM_GLINK_MAX_CHANNELS && gSlpiGlinkStarted; ++i) {
+        const QcomGlinkChannel &c = gSlpiGlink.channel[i];
+        if (!c.used) continue;
+        unsigned rv = 0, rb = 0, la = 0, lb = 0, queued = 0, big = 0, small = ~0u, pending = 0;
+        int last = 0;
+        for (unsigned k = 0; k < QCOM_GLINK_MAX_REMOTE_INTENTS; ++k) {
+            rv += c.remote[k].valid; rb += c.remote[k].busy;
+            if (c.remote[k].valid && c.remote[k].size > big) big = c.remote[k].size;
+            if (c.remote[k].valid && c.remote[k].size < small) small = c.remote[k].size;
+        }
+        for (unsigned k = 0; k < c.intent_count; ++k) {la += c.local[k].advertised; lb += c.local[k].busy;}
+        for (unsigned k = 0; k < gClientCount; ++k)
+            if (gClients[k].glink == &c) {queued = gClients[k].count; last = gClients[k].lastRc; if (queued) pending = gClients[k].queue[gClients[k].head].length;}
+        const int n = snprintf(out + at, cap - at, "%s%s up%d r%u/%u (%u..%u) l%u/%u q%u (%u B) rc %d ask%d", at ? " | " : "", c.name, c.up, rv, rb,
+                               rv ? small : 0, big, la, lb, queued, pending, last, c.intent_asked);
+        if (n < 0 || (unsigned)n >= cap - at) break;
+        at += (unsigned)n;
+    }
+    if (gSlpiGlinkStarted) {
+        const int n = snprintf(out + at, cap - at, " | tx free %u head %u tail %u, rx head %u tail %u", qcom_glink_tx_avail(&gSlpiGlink.tx),
+                               (unsigned)*gSlpiGlink.tx.head, (unsigned)*gSlpiGlink.tx.tail, (unsigned)*gSlpiGlink.rx.head, (unsigned)*gSlpiGlink.rx.tail);
+        if (n > 0 && (unsigned)n < cap - at) at += (unsigned)n;
+    }
+    return at;
+}
+
+// The ADSP's channels (ShengAdsp.h); pdx203_dsp_channel(1, ...) opens one on the SLPI's edge.
+extern "C" ShengAdspChannel *sheng_adsp_channel(const char *name, uint32_t intent_size, uint32_t intent_count, int initiator,
+                                                const ShengAdspClient *client, void *context) {
+    return pdx203_dsp_channel(0, name, intent_size, intent_count, initiator, client, context);
 }
 
 extern "C" int sheng_adsp_send(ShengAdspChannel *c, const void *data, uint32_t length) {

@@ -57,7 +57,7 @@ int qcom_qrtr_add_service(QcomQrtr *q, uint32_t service, uint32_t instance, uint
     const unsigned i = q->local_count++;
     q->local[i].service = service; q->local[i].instance = instance; q->local[i].port = port;
     q->local[i].receive = receive; q->local[i].context = context;
-    if (q->hello_received) announce(q, i);
+    if (q->hello_received && service) announce(q, i);  /* service 0: a client port, never announced */
     return 0;
 }
 
@@ -102,9 +102,15 @@ int qcom_qrtr_receive(QcomQrtr *q, const uint8_t *packet, uint32_t length)
         while (i < q->local_count && q->local[i].port != dst_port) ++i;
         if (i < q->local_count) q->local[i].receive(q->local[i].context, q, dst_port, src_node, src_port, data, size);
         else q->rx_unrouted++;
-        if (confirm) {  /* the sender waits for this before it sends more to the port */
-            const uint32_t words[4] = {src_node, src_port, 0, 0};
-            if (!control(q, QCOM_QRTR_RESUME_TX, words)) q->resumes_sent++;
+        if (confirm) {
+            /* The sender waits for this before it sends more to the port. As Linux's qrtr_send_resume_tx: from the port the data came to,
+             * to the sending port, naming our node and port (the sender keys its flow state by destination). Sent from the control port
+             * and naming the sender, as before 2026-11-08, it matched nothing: the SLPI's sensor core went quiet after 5 packets. */
+            uint8_t pkt[CTRL_BYTES] = {0};
+            put32(pkt, QCOM_QRTR_RESUME_TX);
+            put32(pkt + 4, q->local_node);
+            put32(pkt + 8, dst_port);
+            if (!emit(q, QCOM_QRTR_RESUME_TX, dst_port, src_node, src_port, pkt, sizeof pkt)) q->resumes_sent++;
         }
         return 0;
     }
@@ -115,7 +121,7 @@ int qcom_qrtr_receive(QcomQrtr *q, const uint8_t *packet, uint32_t length)
         q->remote_node = src_node;
         if (!q->hello_sent) qcom_qrtr_start(q);
         q->hello_received = 1;
-        for (unsigned i = 0; i < q->local_count; ++i) announce(q, i);
+        for (unsigned i = 0; i < q->local_count; ++i) if (q->local[i].service) announce(q, i);
         break;
     case QCOM_QRTR_NEW_SERVER:
     case QCOM_QRTR_DEL_SERVER:

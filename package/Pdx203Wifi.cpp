@@ -220,11 +220,11 @@ void endpoint(volatile uint32_t *a, volatile uint32_t *c, volatile uint32_t *d) 
 void print(const char *what);
 // ---- stage 4: the WiFi module (Ath11kWifi) on this board, as sheng's stage 6. The board gives it the endpoint's registers and configuration
 // space, DMA memory, firmware files, a clock and a log; the module does the chip's power-up, the MHI firmware boot, QRTR/QMI and ath11k. ----
-// DMA: 32 MiB of the PIL CDSP + SLPI carve-outs (0x87800000, 20 + 21 MiB, reserved in the UEFI memory map; this board never starts either
-// DSP), below 4 GiB as ath11k's 32-bit coherent mask wants, mapped normal non-cacheable (write-combine: a device mapping faults bzero's
+// DMA: 32 MiB of the PIL NPU + video + CVP + CDSP carve-outs (0x86c00000..0x88c00000, reserved in the UEFI memory map; this board starts
+// none of them; until 2026-11-07 it was 0x87800000, CDSP + SLPI, and the SLPI now boots for the sensors), below 4 GiB as ath11k's 32-bit coherent mask wants, mapped normal non-cacheable (write-combine: a device mapping faults bzero's
 // DC ZVA and unaligned accesses, pdx203-wifi2 panic); the endpoint's SMMU stream (BDF 1:0.0 -> 0x1c01, the BDF->SID
 // table set in stage 2) passes through to physical addresses (SmmuBypass.h, as the audio buffer's stream). The first page is the MSI sink.
-constexpr uint64_t kArenaPhys = 0x87800000, kArenaBytes = 32u << 20, kSmmu = 0x15000000;
+constexpr uint64_t kArenaPhys = 0x86c00000, kArenaBytes = 32u << 20, kSmmu = 0x15000000;
 constexpr uint16_t kStream = 0x1c01;
 constexpr unsigned kArenaBlocks = 16384;
 struct Arena {uint8_t *va; uint64_t iova; size_t bytes; struct Block {uint32_t off, size; bool used;} *blocks; unsigned count;} gArena;

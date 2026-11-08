@@ -329,6 +329,8 @@ adsp_c.append(board_c('AdspFirmware.c','bsd/DEVELOPMENT/kern_exec.o.json'))
 blue_src,blue_obj=board_cpp('Pdx203Bluetooth.cpp')
 # the flashlight (PM8150L flash module, torch mode over SPMI; the rig knob torch and the pdx203_torch syscall)
 torch_src,torch_obj=board_cpp('Pdx203Torch.cpp')
+# the motion sensors behind the SLPI (FastRPC file server for the sensors domain, the SSC client, auto-rotate)
+sns_src,sns_obj=board_cpp('Pdx203Sensors.cpp')
 adsp_c.append(board_c('Pdx203BtTty.c','bsd/DEVELOPMENT/kern_exec.o.json'))
 print(run(['python3',ROOT/'scripts/build-arm-driver.py','AppleKeyStoreState'],text=True),end='')
 keyevents=ROOT/'build/apple-key-store-state';keyevents_late=keyevents/'NativeKeyStoreEvents.late.o'
@@ -338,10 +340,10 @@ require(code((keyevents/'NativeKeyStoreEvents.o').read_bytes(),macho((keyevents/
         code(keyevents_late.read_bytes(),macho(keyevents_late.read_bytes())),'Owned keystore instructions unchanged by late init staging')
 archive=OUT/'libNativeLegacyDisplay.late.a';archive.unlink(missing_ok=True)
 run(['xcrun','ar','rcs',archive,late,OUT/'original-bindings.o',probe,hid_probe,touch_probe,hid/'NativeHidInput.late.o',hid/'hid-original-bindings.o',
-     keystore_probe,keyevents_late,cpufreq_probe,buttons_probe,battery_late,battery_probe,rtc_late,rtc_probe,backlight_late,adsp_probe,audio_probe,hph_obj,wifi_obj,wifinet_late,*wifi_module_objs,blue_obj,torch_obj,audio_svc_late,*[o for _,o in adsp_c]])
+     keystore_probe,keyevents_late,cpufreq_probe,buttons_probe,battery_late,battery_probe,rtc_late,rtc_probe,backlight_late,adsp_probe,audio_probe,hph_obj,wifi_obj,wifinet_late,*wifi_module_objs,blue_obj,torch_obj,sns_obj,audio_svc_late,*[o for _,o in adsp_c]])
 sources=[ROOT/'drivers/GopFramebuffer/NativeLegacyDisplay.cpp',ROOT/'drivers/GopFramebuffer/NativeLegacyRequest.h',source,
          hid_src,touch_src,ROOT/'drivers/ShengHidInput/NativeHidInput.cpp',keystore_src,ROOT/'drivers/AppleKeyStoreState/NativeKeyStoreEvents.cpp',cpufreq_src,buttons_src,
-         ROOT/'kits/pdx203/ButtonsCore.h',battery_src,battery_probe_src,rtc_src,rtc_probe_src,backlight_src,adsp_src,audio_src,hph_src,wifi_src,wifinet_src,audio_svc_src,blue_src,torch_src,*[c for c,_ in adsp_c]]
+         ROOT/'kits/pdx203/ButtonsCore.h',battery_src,battery_probe_src,rtc_src,rtc_probe_src,backlight_src,adsp_src,audio_src,hph_src,wifi_src,wifinet_src,audio_svc_src,blue_src,torch_src,sns_src,*[c for c,_ in adsp_c]]
 print(run(['python3',ROOT/'scripts/build-arm-driver.py','NativeGOPPresenter'],text=True),end='')
 gop=ROOT/'build/native-gop-presenter';gop_late=gop/'NativeGOPPresenter.late.o'
 run([llvm/'llvm-objcopy','--remove-section=__DATA,__mod_init_func','--globalize-symbol=__GLOBAL__sub_I_NativeGOPPresenter.cpp',
