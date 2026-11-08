@@ -27,6 +27,7 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <pexpert/pexpert.h>
+#include <kern/clock.h>
 
 extern "C" {
 char native_cpufreq_row[120];
@@ -61,7 +62,7 @@ IOLock *gLock;
 // monitor (TM) blocks at 0x0c263000 (TSENS0) and 0x0c265000 (TSENS1), each with up to 16 sensors. Per-sensor status register at
 // TM + 0xa0 + 4*n: bit 21 = valid, bits[11:0] = a signed temperature code (sign-extend from bit 11), 0.1 C per LSB -- the mainline
 // qcom tsens driver converts v2 as sign_extend(code,11)*100 mC with no per-sensor slope. Only the NS-readable TM block is touched
-// (never SROT). Report each controller's hottest valid sensor and the overall max; no throttling yet (this is iteration 1).
+// (never SROT). readThermal reports the hottest sensor of each kind and the overall max (the CPU and GPU throttles read it).
 constexpr uint64_t kTsensTmBase[2] = {0x0c263000, 0x0c265000};
 constexpr uint32_t kTsensSnStatus = 0xa0;   // Sn_STATUS = 0xa0 + 4*n
 constexpr unsigned kTsensSensors = 16;
@@ -137,35 +138,48 @@ void refreshRow() {
 
 }
 
+// What each sensor sits on, from this board's DTB thermal-zones (the <name>-usr zones and their thermal-sensors): TSENS0 s0 aoss0,
+// s1-4 the Cortex-A55s, s5-6 cpuss, s7-14 the Cortex-A77s, s15 gpuss-0; TSENS1 s0 aoss-1, s1 wlan, s2 video, s3 ddr, s4 q6-hvx,
+// s5 camera, s6 cmpss, s7 npu, s8 gpuss-1. Qualcomm's gpuss-max-step zone (both gpuss sensors) starts stepping the GPU down at 95 C.
+enum SensorClass : uint8_t {kOther, kA55, kCpuss, kA77, kGpu, kDdr, kClasses};
+constexpr SensorClass kSensorClass[2][kTsensSensors] = {
+    {kOther, kA55, kA55, kA55, kA55, kCpuss, kCpuss, kA77, kA77, kA77, kA77, kA77, kA77, kA77, kA77, kGpu},
+    {kOther, kOther, kOther, kDdr, kOther, kOther, kOther, kOther, kGpu, kOther, kOther, kOther, kOther, kOther, kOther, kOther}};
+constexpr const char *kClassName[kClasses] = {"soc", "a55", "cpuss", "a77", "gpu", "ddr"};
+
+// One sensor, -100000 if its controller is unmapped or it has no valid sample yet.
+int sensorMilliC(unsigned t, unsigned s) {
+    if (!gTsens[t].va) return -100000;
+    uint32_t status = rd32(gTsens[t].va, kTsensSnStatus + s * 4);
+    return ((status >> 21) & 1) ? tsensMilliC(status) : -100000;
+}
+
 void readThermal() {
+    int cls[kClasses], gmax = -100000; unsigned hotT = 0, hotS = 0;
+    for (auto &c : cls) c = -100000;
+    for (unsigned t = 0; t < 2; ++t)
+        for (unsigned s = 0; s < kTsensSensors; ++s) {
+            int mC = sensorMilliC(t, s);
+            if (mC <= -100000) continue;
+            if (mC > cls[kSensorClass[t][s]]) cls[kSensorClass[t][s]] = mC;
+            if (mC > gmax) {gmax = mC; hotT = t; hotS = s;}
+        }
     char *out = native_thermal_row;
     const size_t cap = sizeof(native_thermal_row);
     unsigned n = (unsigned)snprintf(out, cap, "THERMAL");
-    int gmax = -100000;
-    for (unsigned t = 0; t < 2 && n < cap; ++t) {
-        Window &w = gTsens[t];
-        if (!w.va) {n += (unsigned)snprintf(out + n, cap - n, " t%u:nomap", t); continue;}
-        int tmax = -100000; unsigned valid = 0;
-        for (unsigned s = 0; s < kTsensSensors; ++s) {
-            uint32_t status = rd32(w.va, kTsensSnStatus + s * 4);
-            if (!((status >> 21) & 1)) continue;   // not valid / not yet sampled
-            ++valid;
-            int mC = tsensMilliC(status);
-            if (mC > tmax) tmax = mC;
-            if (mC > gmax) gmax = mC;
-        }
-        if (valid) n += (unsigned)snprintf(out + n, cap - n, " t%u %d.%dC/%u", t, tmax / 1000, (tmax % 1000) / 100, valid);
-        else n += (unsigned)snprintf(out + n, cap - n, " t%u:none", t);
-    }
+    for (unsigned c = kA55; c < kClasses && n < cap; ++c)
+        if (cls[c] > -100000) n += (unsigned)snprintf(out + n, cap - n, " %s %d.%d", kClassName[c], cls[c] / 1000, (cls[c] % 1000) / 100);
     native_thermal_max_mc = gmax;
-    if (gmax > -100000 && n < cap) snprintf(out + n, cap - n, " max %d.%dC", gmax / 1000, (gmax % 1000) / 100);
+    if (gmax > -100000 && n < cap)
+        snprintf(out + n, cap - n, " max %d.%dC %s t%us%u", gmax / 1000, (gmax % 1000) / 100, kClassName[kSensorClass[hotT][hotS]], hotT, hotS);
+    else if (n < cap) snprintf(out + n, cap - n, " none");
 }
 
 // Thermal governor: we pin the CPU domains at their highest non-turbo level for 60 fps, which cooks the SoC to ~88 C even on the
 // idle lock screen (TSENS). Step a frequency cap down when the hottest sensor crosses the high mark and re-vote every domain; step
-// it back up (toward uncapped) below the low mark. One step per poll with hysteresis. CPU only for now -- the GPU clock is pinned
-// separately (GpuProbe); if idle stays hot after this, a GPU step is the next iteration. Thresholds baked (the kernel command line
-// is at its 1000-byte limit, no room for boot-args); they stay mutable globals so a runtime knob can tune them later.
+// it back up (toward uncapped) below the low mark, rate-limited (thermalGovern). The hottest sensor is an A77 core under load (a game:
+// A77s 84-87 C while the gpuss sensors read ~72 C); GpuProbe caps the GPU on its own sensors. Thresholds baked (the kernel command
+// line is at its 1000-byte limit, no room for boot-args); they stay mutable globals so a runtime knob can tune them later.
 int gThermHighMc = 83000, gThermLowMc = 73000;
 constexpr uint32_t kThrottleCapKHz[] = {0, 2400000, 2000000, 1612800, 1305600};  // step 0 = uncapped; higher step = cooler
 constexpr unsigned kThrottleSteps = sizeof(kThrottleCapKHz) / sizeof(kThrottleCapKHz[0]);
@@ -189,18 +203,41 @@ void revoteAll() {
     }
     gCapKHz = saved;
 }
+// Called on every TSENS read: every 100 ms from cpufreqThread's ticks once the interactive governor runs, every poll before. One step
+// down at most every 500 ms while above the high mark, one step up at most every 3 s below the low mark. (Read every 5 s, the A77s
+// went from 64 to 88 C between two reads while a game loaded, and the cap hunted a step per read.)
+constexpr uint64_t kThermDownMs = 500, kThermUpMs = 3000;
+uint64_t gThermChangedMs;
 void thermalGovern() {
     int t = native_thermal_max_mc;
     if (t <= -100000) return;              // no reading yet
+    uint64_t ns = 0;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+    const uint64_t nowMs = ns / 1000000, since = nowMs - gThermChangedMs;
     unsigned old = gThermStep;
-    if (t > gThermHighMc && gThermStep + 1 < kThrottleSteps) ++gThermStep;
-    else if (t < gThermLowMc && gThermStep > 0) --gThermStep;
+    if (t > gThermHighMc && gThermStep + 1 < kThrottleSteps && since >= kThermDownMs) ++gThermStep;
+    else if (t < gThermLowMc && gThermStep > 0 && since >= kThermUpMs) --gThermStep;
     if (gThermStep != old) {
+        gThermChangedMs = nowMs;
         revoteAll();
         uint32_t cap = effectiveCapKHz();
         printf("PDX203 THROTTLE step %u cap %uMHz at %d.%dC\n", gThermStep, cap ? cap / 1000 : 0, t / 1000, (t % 1000) / 100);
     }
 }
+}
+
+// GpuProbe's thermal cap reads the two gpuss sensors every 50 ms (a few register reads, no lock: TSENS updates them by itself) and
+// the hottest sensor overall. Returns the hotter gpuss sensor in milliCelsius, -100000 before the TSENS windows are mapped.
+extern "C" int pdx203_gpu_temp_mc(int *hottestMc) {
+    int gpu = -100000, hot = -100000;
+    for (unsigned t = 0; t < 2; ++t)
+        for (unsigned s = 0; s < kTsensSensors; ++s) {
+            int mC = sensorMilliC(t, s);
+            if (mC > hot) hot = mC;
+            if (kSensorClass[t][s] == kGpu && mC > gpu) gpu = mC;
+        }
+    if (hottestMc) *hottestMc = hot;
+    return gpu;
 }
 
 extern "C" void sheng_cpufreq_poll(void) {
@@ -305,9 +342,11 @@ void cpufreqThread(void *, wait_result_t)
         if (gMode >= 5 && round >= 60) {
             // Between the governor's rounds: 25 ms ticks for the next 5 s.
             for (unsigned t = 0; t < 5000 / kTickMs; ++t) {
-                if (interactiveTick(inter)) {
+                const bool changed = interactiveTick(inter), thermal = (t & 3) == 0;
+                if (changed || thermal) {
                     IOLockLock(gLock);
-                    revoteAll();
+                    if (changed) revoteAll();
+                    if (thermal) {readThermal(); thermalGovern();}   // the throttle's 100 ms read
                     IOLockUnlock(gLock);
                 }
                 // SWAPT <b|i><GPU level> t<ms> <gap>/<done> ...: every finished swap (pdx203_swap_trace), every 100 ms.

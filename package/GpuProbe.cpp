@@ -1803,19 +1803,54 @@ void memBench() {
 // ticks while the GPU works, as the heartbeat does), turns it into the MHz of work done and picks the lowest level that would run it
 // at most 70 % busy: up at once, down only after 300 ms of wanting less. While CpuFreqProbe's interactive boost holds (a touch or an
 // animation, pdx203_ui_boosted) the GPU runs at perf 7 (670 MHz) and the DDR at its top level; otherwise the floor is perf 1
-// (305 MHz) and the DDR vote drops to kDdrIdleVote. Above 85 C the GPU stays at perf 5 or below. The level changes go through the GMU
+// (305 MHz) and the DDR vote drops to kDdrIdleVote. A thermal cap (gpuThermal below) bounds the level. The level changes go through the GMU
 // (A650GmuSetPerf, Linux's runtime GX_BW_PERF_VOTE); the DDR votes through AdspProbe's locked RSC sender (pdx203_rpmh_send), the same
 // BCM commands rpmhVoteDdr sends at boot. pipa-gpu-dcvs=0 keeps the old fixed levels.
 // "PDX203 GPUDCVS" every 10 s: 50 ms ticks at each level, changes, failures, DDR high share, mean busy.
 extern "C" {
 extern volatile uint32_t pdx203_ui_boosted __attribute__((weak));
-extern volatile int native_thermal_max_mc __attribute__((weak));
+int pdx203_gpu_temp_mc(int *hottestMc) __attribute__((weak_import));   // CpuFreqProbe: the gpuss sensors, and the hottest of all
 int pdx203_rpmh_send(const uint32_t *addresses, const uint32_t *values, unsigned count) __attribute__((weak_import));
 volatile uint32_t pdx203_gpu_dcvs_stats[6];   // level, changes, GMU failures, DDR failures, DDR high, last busy permille
 // Rig knobs (LegacyDisplayProbe pdx203_knob_set): ddrlow 0 keeps the DDR at its top level, dcvs 0 pins the GPU at perf 7.
 volatile int32_t pdx203_knob_ddrlow = 1, pdx203_knob_dcvs = 1;
+// gputrip <C>: the gpuss temperature the cap steps down above; hottrip <C>: the same for the hottest sensor anywhere (the die is one
+// piece of silicon: a hot CPU heats the GPU and the other way round). Both step back up kThermCoolC below their trip.
+volatile int32_t pdx203_knob_gputrip = 82, pdx203_knob_hottrip = 88;
 }
 constexpr uint32_t kGpuMHz[8] = {0, 305, 400, 441, 490, 525, 587, 670};
+
+// GPU thermal cap (2026-11-07). Nothing bounded the GPU before but a fixed perf 5 above 85 C read every 5 s, and the die can climb
+// from 65 to 88 C in 10 s while a game loads. Every 50 ms tick reads the two gpuss sensors and the hottest sensor of the die. Above a
+// trip the highest allowed level drops by one at most every 200 ms (down to perf 1, 305 MHz); once both read kThermCoolC under their
+// trips it rises by one at most every second. A step-wise cap like the gpuss-max-step zone Qualcomm's kernel runs (trip 95 C, the
+// silicon's own limit); ours trips lower and steps back slowly, so it settles a level or two under the hot one rather than hunting.
+constexpr int kThermCoolC = 5;
+constexpr unsigned kThermDownTicks = 4, kThermUpTicks = 20;
+struct GpuThermal {
+    unsigned cap = 7, sinceChange = 0, capTicks[8] = {}, cuts = 0, raises = 0;
+    int gpuMc = -100000, hotMc = -100000, gpuPeakMc = -100000, hotPeakMc = -100000;
+};
+// Returns the level cap for this tick.
+unsigned gpuThermal(GpuThermal &g) {
+    if (!pdx203_gpu_temp_mc) return 7;
+    g.gpuMc = pdx203_gpu_temp_mc(&g.hotMc);
+    if (g.gpuMc > g.gpuPeakMc) g.gpuPeakMc = g.gpuMc;
+    if (g.hotMc > g.hotPeakMc) g.hotPeakMc = g.hotMc;
+    ++g.sinceChange;
+    const int gpuTrip = pdx203_knob_gputrip * 1000, hotTrip = pdx203_knob_hottrip * 1000;
+    const unsigned old = g.cap;
+    if ((g.gpuMc > gpuTrip || g.hotMc > hotTrip) && g.cap > 1 && g.sinceChange >= kThermDownTicks) {--g.cap; ++g.cuts;}
+    else if (g.gpuMc < gpuTrip - kThermCoolC * 1000 && g.hotMc < hotTrip - kThermCoolC * 1000 && g.cap < 7 &&
+             g.sinceChange >= kThermUpTicks) {++g.cap; ++g.raises;}
+    if (g.cap != old) {
+        g.sinceChange = 0;
+        printf("PDX203 GPUTHERM cap %u (%u MHz) at gpu %d.%dC hot %d.%dC\n", g.cap, kGpuMHz[g.cap], g.gpuMc / 1000,
+               (g.gpuMc % 1000) / 100, g.hotMc / 1000, (g.hotMc % 1000) / 100);
+    }
+    ++g.capTicks[g.cap];
+    return g.cap;
+}
 // BCM vote units: MC0's cmd-db unit 2700000 and width 16 make vote = peak kB/s / 2700, so about 5.9 per MHz of DDR clock (top
 // 0x3fff = 2736 MHz). 0x11ca asks for ~768 MHz; the BCM takes the lowest level at or above it (or what other voters keep).
 uint32_t gDdrIdleVote = 0x11ca;
@@ -1837,6 +1872,7 @@ void dcvsThread(void *, wait_result_t) {
     bool ddrHigh = true, dead = false;
     unsigned down = 0, downWant = 0, ticks[8] = {}, changes = 0, gmuFail = 0, ddrFail = 0, ddrTicks = 0;
     uint64_t busySum = 0, lastBusy = 0, lastNs = 0;
+    GpuThermal therm;
     for (unsigned t = 1;; ++t) {
         IOSleep(kTickMs);
         uint32_t lo = 0, hi = 0, hi2 = 0;
@@ -1852,13 +1888,12 @@ void dcvsThread(void *, wait_result_t) {
         if (permille > 1000) permille = 1000;
         lastBusy = busy; lastNs = ns;
         const bool boosted = &pdx203_ui_boosted ? pdx203_ui_boosted != 0 : true;
-        const int hot = &native_thermal_max_mc ? native_thermal_max_mc : 0;
+        const unsigned thermCap = gpuThermal(therm);
         // MHz of work this tick, and the level that does it at <= 70 % busy.
         const uint32_t needMHz = kGpuMHz[perf] * permille / 700;
         unsigned want = 1;
         while (want < 7 && kGpuMHz[want] < needMHz) ++want;
         if (boosted || !pdx203_knob_dcvs) want = 7;   // dv1 floored at 4 (490 MHz) and felt less responsive (user, 2026-11-06)
-        if (hot > 85000 && want > 5) want = 5;
         unsigned next = perf;
         if (!pdx203_knob_dcvs) {next = 7; down = 0;}
         else if (want > perf) {next = want; down = 0;}
@@ -1866,7 +1901,7 @@ void dcvsThread(void *, wait_result_t) {
             downWant = down ? (want > downWant ? want : downWant) : want;
             if (++down >= kDownTicks) {next = downWant; down = 0;}
         } else down = 0;
-        if (hot > 85000 && next > 5) next = 5;
+        if (next > thermCap) next = thermCap;
         if (next != perf && !dead) {
             uint32_t error = 0;
             const A650GmuStatus st = A650GmuSetPerf(&gDevice, next, 0, &error);
@@ -1894,6 +1929,14 @@ void dcvsThread(void *, wait_result_t) {
                    "busy %llu.%llu%%%s\n", perf, kGpuMHz[perf], ticks[1], ticks[2], ticks[3], ticks[4], ticks[5], ticks[6], ticks[7],
                    changes, gmuFail, ddrTicks * 100 / kReportTicks, ddrFail, busySum / kReportTicks / 10, busySum / kReportTicks % 10,
                    dead ? " DEAD" : "");
+            // GPUTHERM row: the cap now, 50 ms ticks spent under each cap below 7, steps, and the window's peak temperatures.
+            printf("PDX203 GPUTHERM cap %u | capped 1:%u 2:%u 3:%u 4:%u 5:%u 6:%u | cuts %u raises %u | gpu %d.%dC peak %d.%dC hot peak %d.%dC"
+                   " | trip %d/%d\n", therm.cap, therm.capTicks[1], therm.capTicks[2], therm.capTicks[3], therm.capTicks[4], therm.capTicks[5],
+                   therm.capTicks[6], therm.cuts, therm.raises, therm.gpuMc / 1000, (therm.gpuMc % 1000) / 100, therm.gpuPeakMc / 1000,
+                   (therm.gpuPeakMc % 1000) / 100, therm.hotPeakMc / 1000, (therm.hotPeakMc % 1000) / 100, (int)pdx203_knob_gputrip,
+                   (int)pdx203_knob_hottrip);
+            for (auto &c : therm.capTicks) c = 0;
+            therm.cuts = therm.raises = 0; therm.gpuPeakMc = therm.hotPeakMc = -100000;
             for (unsigned i = 0; i < 8; ++i) ticks[i] = 0;
             changes = gmuFail = ddrFail = ddrTicks = 0; busySum = 0;
         }

@@ -1019,6 +1019,8 @@ extern "C" volatile int32_t native_adreno_space_policy __attribute__((weak));
 extern "C" volatile int32_t native_adreno_app_depth __attribute__((weak));
 // GpuProbe: the longest a fence waiter sleeps between GPU interrupts, in us (default 2000; 100 before).
 extern "C" volatile int32_t pdx203_knob_idle_us __attribute__((weak));
+// GpuProbe's GPU thermal cap: the gpuss trip and the hottest-sensor trip, in C.
+extern "C" volatile int32_t pdx203_knob_gputrip __attribute__((weak)), pdx203_knob_hottrip __attribute__((weak));
 // Runtime knobs, set over the USB control channel (KEY:knob.<name>,<value>; Pdx203TouchProbe.cpp). 0 set, -1 no such knob, -2 out of range.
 extern "C" void native_hid_orientation_step(intptr_t step) __attribute__((weak_import));   // ShengHidInput (orientation device)
 extern "C" int pdx203_knob_set(const char *name, size_t length, int value) {
@@ -1034,7 +1036,8 @@ extern "C" int pdx203_knob_set(const char *name, size_t length, int value) {
         }
     static const struct {const char *name; volatile int32_t *knob; int lo, hi;} knobs[] = {
         {"vlock", &pdx203_knob_vlock, 0, 1}, {"vphase", &pdx203_knob_vphase, 0, 166}, {"vgain", &pdx203_knob_vgain, 0, 16},
-        {"eretire", &pdx203_knob_eretire, 0, 1}, {"appdepth", &native_adreno_app_depth, 0, 8}, {"idleus", &pdx203_knob_idle_us, 20, 20000}};
+        {"eretire", &pdx203_knob_eretire, 0, 1}, {"appdepth", &native_adreno_app_depth, 0, 8}, {"idleus", &pdx203_knob_idle_us, 20, 20000},
+        {"gputrip", &pdx203_knob_gputrip, 50, 95}, {"hottrip", &pdx203_knob_hottrip, 50, 95}};
     for (auto &k : knobs)
         if (length == strlen(k.name) && !strncmp(name, k.name, length)) {
             if (!k.knob) return -1;
