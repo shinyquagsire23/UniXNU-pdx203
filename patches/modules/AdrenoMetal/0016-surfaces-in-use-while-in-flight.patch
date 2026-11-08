@@ -1,0 +1,183 @@
+From: pdx203 <noreply@anthropic.com>
+Subject: bridge: count surfaces in use while command buffers use them, not while textures live
+
+The render server counted a surface in use (IOSurfaceIncrementUseCount) for as long as a texture over it lived, and Core Animation keeps
+a client surface's texture about four frames after its last use (64 ms on average in landscape TestUFO). Every buffer WebKit had handed
+over still looked in use, so its pool could reuse none: it made a new 6 MB surface for nearly every frame, which its GPU process and the
+render server each imported, mapped and let go again (about 95 imports a second, 2 s of kernel time in 10 s). Apple's GPU driver marks a
+surface in use while submitted work references it; a command buffer of the render server now counts each distinct surface its textures
+lie over from its commit to its completion (2-8 ms on average). Steady TestUFO makes no surface import at all (920-1070 map/unmap calls
+in 10 s before), total CPU 210% -> ~150%.
+
+The import diagnostics that found it: every 2 s at most, at an import of 1 MiB or more, a GPUNOTE line through Turnip's tu_darwin_note
+(Adreno650 0026) with such imports, held imports let go and how long surfaces stayed counted in use.
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 23dc43e..62266d4 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -934,11 +934,19 @@ static void waitForResource(id resource);
+ @property(nonatomic,strong) id<MTLTexture> parent;
+ @property(nonatomic,strong) id<MTLHeap> parentHeap;
+ @property(nonatomic) NSUInteger heapOffset;
+-@property(nonatomic) BOOL counted;   // its surface counted in use (countUse)
+-- (void)countUse;
+ @end
+-// The render server counts the surfaces it textures in use while the textures live (countUse).
++// The render server counts the surfaces its command buffers use in use (IOSurfaceIncrementUseCount) from their commit to their completion, as
++// Apple's GPU driver marks a surface in use while submitted work references it (countSurfacesInUse). pdx203: a texture used to count its
++// surface for as long as it lived, and Core Animation keeps a client surface's texture about four frames after its last use (64 ms on
++// average in landscape TestUFO): every buffer WebKit had handed over still looked in use, its pool could reuse none, and it made a new 6 MB
++// surface for nearly every frame, which both processes imported, mapped and let go again (about 2 s of kernel time in 10 s).
+ static const bool gCountsSurfaceUse=!strcmp(getprogname(),"backboardd");
++// Surfaces of 1 MiB or more counted in use now, and of those whose count ended since the last import note how many, their total and longest
++// time counted in ms (noteBigImport).
++static std::atomic<uint32_t> gUseLive,gUseEnded,gUseMax;static std::atomic<uint64_t> gUseTotal;
++static void noteUseEnded(uint64_t ms) {
++ gUseLive--;gUseEnded++;gUseTotal+=ms;uint32_t m=gUseMax.load();while(ms>m && !gUseMax.compare_exchange_weak(m,(uint32_t)ms)){}
++}
+ // A no-copy import keeps its pages until the runtime frees it, which can be after the buffer object goes (a command buffer still using
+ // it). The owner's release (Metal's deallocator, an IOSurface's mapping) waits for that, as Metal's does: run earlier, the owner could
+ // unmap or reuse pages the GPU still reads or writes.
+@@ -995,11 +1003,46 @@ struct HeldImport {NBBuffer *buffer;IOSurfaceRef surface;};
+ // Under gSurfaceImportLock. Never destroyed: a completion thread may still trim it while the process exits.
+ static auto &gHeldImports=*new std::map<std::tuple<uint64_t,uint64_t,uint64_t>,HeldImport>;
+ static NSUInteger gSurfaceImportsPruned=64;     // the table size at which dead associations are next pruned
++// pdx203: held imports let go because only the import still retained the surface (under gSurfaceImportLock).
++static uint32_t gHeldPruned;
++// pdx203: at most every 2 s, at a surface import of 1 MiB or more, a line for the kernel's log (GPUNOTE, through Turnip's tu_darwin_note,
++// kind 3 text): such imports made since the last line, of them writable, held imports let go, and how long the surfaces of 1 MiB or more
++// that command buffers counted in use stayed counted (countSurfacesInUse). Steady drawing makes no such import, so no line. Under
++// gSurfaceImportLock.
++struct ImportNote {uint32_t made,writable;uint64_t since;char text[124];bool pending;};
++static ImportNote gImportNote;
++static void noteBigImport(size_t bytes,bool readOnly) {
++ if(bytes<(1u<<20))return;
++ ImportNote &c=gImportNote;
++ c.made++;if(!readOnly)c.writable++;
++ const uint64_t now=clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1000000;
++ if(!c.since)c.since=now;
++ if(now-c.since<2000 || c.pending)return;
++ const uint32_t ended=gUseEnded.exchange(0);const uint64_t total=gUseTotal.exchange(0);
++ snprintf(c.text,sizeof c.text,"SURF %llums imports %u rw %u let-go %u | in use: %u ended avg %llu max %u ms, %u live",
++  (unsigned long long)(now-c.since),c.made,c.writable,gHeldPruned,ended,(unsigned long long)(ended?total/ended:0),gUseMax.exchange(0),
++  gUseLive.load());
++ c.pending=true;c.made=c.writable=0;gHeldPruned=0;c.since=now;
++}
++// Sends the line noteBigImport left, outside gSurfaceImportLock.
++static void sendImportNote() {
++ char text[124];
++ {std::lock_guard<std::mutex> lock(gSurfaceImportLock);if(!gImportNote.pending)return;memcpy(text,gImportNote.text,sizeof text);gImportNote.pending=false;}
++ static bool (*note)(uint32_t,const uint32_t *,uint32_t);static dispatch_once_t once;
++ dispatch_once(&once,^{
++  if(gLoaderPath.empty())return;
++  void *t=dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
++  if(t){note=(bool (*)(uint32_t,const uint32_t *,uint32_t))dlsym(t,"tu_darwin_note");dlclose(t);}
++ });
++ if(!note)return;
++ uint32_t words[30]={};const size_t n=strnlen(text,120);memcpy(words,text,n);
++ (void)note(3,words,(uint32_t)((n+3)/4));
++}
+ // Drops (into `gone`, released by the caller outside the lock) every held import whose surface only the import still retains, or every
+ // one when `all`.
+ static void pruneHeldImports(bool all,std::vector<NBBuffer *> &gone) {
+  for(auto it=gHeldImports.begin();it!=gHeldImports.end();) {
+-  if(all || CFGetRetainCount(it->second.surface)<=1){gone.push_back(it->second.buffer);it=gHeldImports.erase(it);}
++  if(all || CFGetRetainCount(it->second.surface)<=1){if(!all)gHeldPruned++;gone.push_back(it->second.buffer);it=gHeldImports.erase(it);}
+   else ++it;
+  }
+ }
+@@ -1070,6 +1113,7 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes,bool
+   [gSurfaceImports setObject:buffer forKey:[NSValue valueWithBytes:&made objCType:@encode(Key)]];
+   holdImport(made.identity,made.address,made.bytes,buffer,gone);
+  }
++ noteBigImport(bytes,madeReadOnly);
+  return buffer;
+ }
+ // PVRTC (PowerVR's compressed formats, MTLPixelFormatPVRTC_* 160-167) has no Vulkan format on Adreno, and metal2vulkan keeps such a
+@@ -1195,8 +1239,7 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
+  const uint64_t s=_descriptor.swizzle;
+  return MTLTextureSwizzleChannelsMake((MTLTextureSwizzle)(s&255),(MTLTextureSwizzle)((s>>8)&255),(MTLTextureSwizzle)((s>>16)&255),(MTLTextureSwizzle)((s>>24)&255));
+ }
+-- (void)dealloc {DetailSpan timing(5,(uintptr_t)_handle);nmb_texture_release(_handle);if(_surface){if(_counted)IOSurfaceDecrementUseCount(_surface);CFRelease(_surface);}}
+-- (void)countUse {if(_surface && !_counted && gCountsSurfaceUse){IOSurfaceIncrementUseCount(_surface);_counted=YES;}}
++- (void)dealloc {DetailSpan timing(5,(uintptr_t)_handle);nmb_texture_release(_handle);if(_surface)CFRelease(_surface);}
+ - (MTLTextureType)textureType {return (MTLTextureType)_descriptor.type;}
+ - (MTLPixelFormat)pixelFormat {return (MTLPixelFormat)(_pvrtc?_pvrtc:_descriptor.format);}
+ - (NSUInteger)width {return _descriptor.width;}
+@@ -1228,7 +1271,7 @@ NB_RESOURCE_SPI
+  if(!handle){NBLOG(@"native-metal: texture view refused: %@",lastError());return nil;}
+  NBTexture *view=[NBTexture new];view.handle=handle;NmbTextureDescriptor descriptor;nmb_texture_describe(handle,&descriptor);view.descriptor=descriptor;
+  view.parent=(id<MTLTexture>)self;view.buffer=_buffer;view.offset=_offset;view.rowBytes=_rowBytes;
+- if(_surface){view.surface=(IOSurfaceRef)CFRetain(_surface);[view countUse];}
++ if(_surface)view.surface=(IOSurfaceRef)CFRetain(_surface);
+  return (id<MTLTexture>)view;
+ }
+ - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format {
+@@ -1876,6 +1919,8 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
+ @property(nonatomic) uint32_t commitIndex;
+ @property(nonatomic,strong) NSMutableArray *scheduledHandlers,*completedHandlers;
+ @property(nonatomic,strong) NSMutableSet *surfaces;
++// pdx203: the surfaces this command buffer counted in use from its commit to its completion (countSurfacesInUse), each retained.
++@property(nonatomic,strong) NSArray *surfacesInUse;
+ // Runtime handles retain GPU storage, but only the Objective-C owner retains
+ // a no-copy deallocator, its memory owner and texture/heap ancestry.
+ @property(nonatomic,strong) NSMutableSet *resourceOwners;
+@@ -3186,6 +3231,7 @@ static char kUserDictionaryKey;
+ - (void)finish {
+  DetailCommandScope commandScope(traceNumber);
+  traceThread(3);
++ [self endSurfacesInUse];
+  frontStage(traceNumber,self.commitIndex,8);
+  const uint64_t flushed=flushSurfaces(_surfaces);
+  frontStage(traceNumber,self.commitIndex,9,flushed,(uint32_t)_surfaces.count);
+@@ -3286,6 +3332,7 @@ static char kUserDictionaryKey;
+   const uint64_t flushed=flushSurfaces(_surfaces);
+   frontStage(traceNumber,self.commitIndex,5,flushed,(uint32_t)_surfaces.count);
+   if(gLogTextures)dumpSurfacesOnce(_surfaces,_resourceOwners);
++  [self countSurfacesInUse];
+   for(WatchedSource &source:watched){source.hash=hashSource(source.bytes,source.length);gSourcesWatched[source.surface]++;}
+   // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
+   void *context=(__bridge_retained void *)self;
+@@ -3306,6 +3353,27 @@ static char kUserDictionaryKey;
+  self.submitted=YES;
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT,0),^{[self finish];});
+ }
++// pdx203: each distinct surface the command buffer's textures lie over is counted in use until it completes (gCountsSurfaceUse).
++- (void)countSurfacesInUse {
++ if(!gCountsSurfaceUse || !_surfaces.count || self.surfacesInUse)return;
++ NSMutableArray *counted=[NSMutableArray arrayWithCapacity:_surfaces.count];
++ for(NBTexture *texture in _surfaces) {
++  IOSurfaceRef surface=texture.surface;if(!surface)continue;
++  id object=(__bridge id)surface;if([counted indexOfObjectIdenticalTo:object]!=NSNotFound)continue;
++  IOSurfaceIncrementUseCount(surface);[counted addObject:object];
++  if(IOSurfaceGetAllocSize(surface)>=(1u<<20))gUseLive++;
++ }
++ self.surfacesInUse=counted;
++}
++- (void)endSurfacesInUse {
++ NSArray *counted;@synchronized(self){counted=self.surfacesInUse;self.surfacesInUse=@[];}
++ const uint64_t lifeMs=(nowUs()-self.committedUs)/1000;
++ for(id object in counted) {
++  IOSurfaceRef surface=(__bridge IOSurfaceRef)object;
++  if(IOSurfaceGetAllocSize(surface)>=(1u<<20))noteUseEnded(lifeMs);
++  IOSurfaceDecrementUseCount(surface);
++ }
++}
+ - (void)fireEarly {
+  if(!earlyEligible || encodedWork.passes==0 || !earlyOn())return;
+  NSArray *handlers;
+@@ -4512,11 +4580,11 @@ static NSUInteger iosurfaceRowAlignment(id device) {
+  static const bool readOnlyImports=[]{const char *v=getenv("PDX203_SURFACE_RO");return !v || strcmp(v,"0");}();
+  const MTLTextureUsage usage=d.usage;
+  const bool readOnly=readOnlyImports && usage && !(usage&(MTLTextureUsageShaderWrite|MTLTextureUsageRenderTarget|(MTLTextureUsage)0x20 /* ShaderAtomic */));
+- NBBuffer *buffer=surfaceBuffer(surface,base,bytes,readOnly);if(!buffer){refuseSurface(4,surface,d,plane,start-(uintptr_t)base,row);return nil;}
++ NBBuffer *buffer=surfaceBuffer(surface,base,bytes,readOnly);sendImportNote();if(!buffer){refuseSurface(4,surface,d,plane,start-(uintptr_t)base,row);return nil;}
+  NBTexture *texture=planes>=2?textureOnSurface(buffer,d,surface,plane,start-(uintptr_t)base,row):textureOnBuffer(buffer,d,start-(uintptr_t)base,row,true);
+  if(!texture){refuseSurface(5,surface,d,plane,start-(uintptr_t)base,row);return nil;}
+  if(gLogTextures)logTexture("iosurface",d,surface,plane,base,start-(uintptr_t)base,row,texture!=nil);
+- gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);[texture countUse];return (id<MTLTexture>)texture;
++ gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);return (id<MTLTexture>)texture;
+ }
+ - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
+  const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map(data,&bytes,&size);
