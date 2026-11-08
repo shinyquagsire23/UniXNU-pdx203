@@ -1,0 +1,76 @@
+From: pdx203 <noreply@anthropic.com>
+Subject: gpu: name a re-import by the pages it pins
+
+The import sample (0024) calls an import "again" when the same address and size came in the last 64 imports, but a read-only view
+or a new surface can be given an address a freed one had. Each import now records its first physical page; GPUIMPORT says whether
+the process imported the same pages (same size) in its last 256 imports and how long before, or none of them had them (a new
+surface), with running counts of each.
+
+--- a/NativeAdrenoMemory.cpp
++++ b/NativeAdrenoMemory.cpp
+@@ -13,7 +13,10 @@
+ {return bits==32 || bits==36 || bits==40 || bits==42 || bits==44 || bits==48;}
+ /* Where the last import stopped (10..19, 19 = done), and for a refused page the physical address and offset: the board log shows them. */
+ enum : IOReturn {kNativeAdrenoProtectionFailure=2};   /* KERN_PROTECTION_FAILURE, as prepare() reports a range that cannot be wired for writing */
+-extern "C" {volatile uint32_t native_adreno_pool_mib=0,native_adreno_pool_status=0;volatile uint32_t native_adreno_import_stage;volatile uint64_t native_adreno_import_fail_pa,native_adreno_import_fail_offset;}
++extern "C" {volatile uint32_t native_adreno_pool_mib=0,native_adreno_pool_status=0;volatile uint32_t native_adreno_import_stage;volatile uint64_t native_adreno_import_fail_pa,native_adreno_import_fail_offset;
++/* 0025: the first physical page of the latest import that succeeded (0 after one that failed), bit 0 set where it was pinned read-only;
++ * read under the publish lock right after the import (GPUIMPORT). */
++volatile uint64_t native_adreno_import_first_pa;}
+ /* The pool (see reservePool): a free list of page extents over one contiguous block; best fit, neighbours merged on release. */
+ extern "C" {volatile uint32_t native_adreno_pool_stats[8];}
+ /* The pool's write-combine (writeCombinePool): bit 31 once tried, the low bits its status. */
+@@ -206,7 +209,7 @@
+ }
+ IOReturn NativeAdrenoMemory::importTask(void *task,uint64_t address,size_t bytes,unsigned bits,size_t budget)
+ {
+-    native_adreno_import_stage=10;
++    native_adreno_import_stage=10;native_adreno_import_first_pa=0;
+     if(descriptor_ || imported_ || spans_ || quarantined_)return kIOReturnBusy;
+     native_adreno_import_stage=11;
+     if(!task || !address || (address&4095) || !bytes || (bytes&4095) || address>UINT64_MAX-bytes || !outputWidth(bits) ||
+@@ -251,6 +254,7 @@
+         else spans_[span_count_++]={offset,physical,4096};
+     }
+     native_adreno_import_stage=19;
++    native_adreno_import_first_pa=spans_[0].physical|(read_only_?1:0);
+     native_adreno_pool_stats[7]=native_adreno_pool_stats[7]+(uint32_t)span_count_;
+     return kIOReturnSuccess;
+ failed:
+--- a/NativeAdrenoPublish.cpp
++++ b/NativeAdrenoPublish.cpp
+@@ -560,6 +560,7 @@
+  * taken outside the connection lock, [3] the longest wait in us. */
+ extern "C" {volatile uint64_t native_adreno_wait_outer[4];}
+ extern "C" volatile uint32_t native_adreno_method_stats[20][4];   /* NativeAdrenoUserClient.cpp */
++extern "C" volatile uint64_t native_adreno_import_first_pa;   /* NativeAdrenoMemory.cpp (0025) */
+ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const void *input,size_t input_size,void *output,size_t output_size)
+ {
+     if(method==NativeAdrenoMethodSetMetadata && input && input_size==sizeof(NativeAdrenoAbiMetadata)) {
+@@ -664,11 +665,23 @@
+         for(const auto &r:recent)if(r.address==request.address && r.bytes==request.bytes) {again=true;break;}
+         if(again)++repeats;
+         recent[recent_at++%64]={request.address,request.bytes};
++        /* 0025: whether the import pins the same pages as one of the last 256 imports of this process (the same surface imported again,
++         * whatever address it came at) or pages none of them had (a new surface at a reused address), and how long ago they were imported. */
++        static struct {uint64_t first_pa,bytes,at_us;int pid;} pages[256];static uint32_t pages_at,same_pages,fresh_pages;
++        const uint64_t first_pa=status==kIOReturnSuccess?native_adreno_import_first_pa:0;
++        int64_t pages_gap_us=-1;
++        if(first_pa) {
++            for(const auto &r:pages)if(r.first_pa==(first_pa&~UINT64_C(1)) && r.bytes==request.bytes && r.pid==pid_) {
++                pages_gap_us=(int64_t)(import_began-r.at_us);break;}
++            if(pages_gap_us>=0)++same_pages;else ++fresh_pages;
++            pages[pages_at++%256]={first_pa&~UINT64_C(1),request.bytes,import_began,pid_};
++        }
+         IOLockUnlock(g.lock);
+         if(!(import_count++%16))
+-            IOLog("GPUIMPORT %s[%d] #%u addr 0x%llx bytes 0x%llx %llu us %s | repeats %u\n",name_,pid_,import_count,
+-                (unsigned long long)request.address,(unsigned long long)request.bytes,(unsigned long long)import_us,
+-                again?"again":"new",repeats);
++            IOLog("GPUIMPORT %s[%d] #%u addr 0x%llx bytes 0x%llx %llu us %s | repeats %u | pa 0x%llx%s %s gap %lld ms | same %u fresh %u\n",name_,pid_,
++                import_count,(unsigned long long)request.address,(unsigned long long)request.bytes,(unsigned long long)import_us,
++                again?"again":"new",repeats,(unsigned long long)(first_pa&~UINT64_C(1)),first_pa&1?" ro":"",pages_gap_us>=0?"same":"fresh",
++                (long long)(pages_gap_us>=0?pages_gap_us/1000:-1),same_pages,fresh_pages);
+         native_adreno_metal_diag.inflight=0;
+         native_adreno_metal_diag.calls=native_adreno_metal_diag.calls+1;
+         native_adreno_metal_diag.last_selector=method;

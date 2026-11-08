@@ -1,0 +1,37 @@
+From: pdx203 <noreply@anthropic.com>
+Subject: gpu: log a process's text notes
+
+Turnip's tu_darwin_note (Adreno740's NativeAdrenoMethodNote, selector 18) reaches this driver too: a note of kind 3 carries up to 120
+bytes of text, logged as GPUNOTE with the calling process. The frontend's surface import probe reports through it: only the
+process knows which surface it imported, and the render server's and WebKit's files are out of reach of the USB log.
+
+--- a/NativeAdrenoPublish.cpp
++++ b/NativeAdrenoPublish.cpp
+@@ -618,6 +618,18 @@
+ {
+     if(method>=NativeAdrenoHandoffBase && method<=NativeAdrenoHandoffLast)
+         return native_gop_handoff_call(method-NativeAdrenoHandoffBase,current_task(),input,input_size,output,output_size);
++    if(method==18 /* NativeAdrenoMethodNote, Adreno740's ABI */) {
++        /* 0026: a text note from a process's frontend (Turnip's tu_darwin_note, kind 3: the words are up to 120 bytes of text), logged as
++         * GPUNOTE with the caller. Kinds 1 and 2 (Adreno740's pass and pipeline rows) have no table here and are refused. */
++        struct Note {uint32_t kind,count,words[30];};
++        if(!input || input_size!=sizeof(Note) || output_size)return kIOReturnBadArgument;
++        Note note{};memcpy(&note,input,sizeof(note));
++        if(note.kind!=3 || note.count>30)return kIOReturnBadArgument;
++        char text[121]={};memcpy(text,note.words,note.count*4);
++        for(char &c:text)if(c && (c<32 || c>126))c='?';
++        IOLog("GPUNOTE %s[%d] %s\n",name_,pid_,text);
++        return kIOReturnSuccess;
++    }
+     if(method==NativeAdrenoExportMethod) {
+         struct Piece {uint32_t generation,total,offset,bytes;};
+         char caller[20]={};proc_selfname(caller,sizeof caller);
+@@ -764,6 +776,8 @@
+     native_adreno_metal_diag.ext_selector=selector;
+     native_adreno_metal_diag.ext_in=arguments?arguments->structureInputSize:0xffff;
+     native_adreno_metal_diag.ext_out=arguments?arguments->structureOutputSize:0xffff;
++    if(selector==18 && arguments)   /* 0026: a text note (run() checks its record) */
++        return run(selector,arguments->structureInput,arguments->structureInputSize,arguments->structureOutput,arguments->structureOutputSize);
+     if(selector<1 || selector>sizeof(table)/sizeof(table[0])) {
+         native_adreno_metal_diag.ext_status=uint32_t(kIOReturnUnsupported);
+         return kIOReturnUnsupported;
